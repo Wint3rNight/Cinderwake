@@ -742,15 +742,17 @@ bool FPlayerActions::TryStartChained(EPlayerInput Input, const FPlayerFrame& Fra
 {
 	if (Input == EPlayerInput::Heavy)
 	{
-		// The normal heavy started early, out of anything. Never the slam, even inside the dodge-attack window.
-		if (!TryStartAttack(Costs.Heavy, Out))
+		// Out of heavy 1, the charged heavy or the slam it's heavy 2 (the rising uppercut), out of anything else heavy 1,
+		// so a heavy never follows itself. Never the slam, even inside the dodge-attack window. Only heavy 1 charges.
+		const bool bSecond = Line == EAttackLine::Heavy || Line == EAttackLine::Slam;
+		if (!TryStartAttack(bSecond ? Costs.Heavy2 : Costs.Heavy, Out))
 		{
 			return false;
 		}
-		Out.Add(EPlayerCommand::ChainHeavy);
-		Line = EAttackLine::Heavy;
+		Out.Add(bSecond ? EPlayerCommand::ChainHeavyTwo : EPlayerCommand::ChainHeavy);
+		Line = bSecond ? EAttackLine::Heavy2 : EAttackLine::Heavy;
 		bChainQueued = false;
-		bChargeable = Frame.bHeavyHeld; // still down since the press: it can charge
+		bChargeable = !bSecond && Frame.bHeavyHeld; // heavy 1 still down since the press can charge
 		Enter(EPlayerState::Attacking);
 		return true;
 	}

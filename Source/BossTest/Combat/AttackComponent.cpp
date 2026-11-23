@@ -144,7 +144,8 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	PrevPoints.Reset();
 	bLungeDone = false;
 	bAtBranch = false;
-	bBranchResolved = false;
+	// A branch whose variant can't play (no clip) counts as already decided, so the attack never waits there.
+	bBranchResolved = !(Definition->BranchVariant && Definition->BranchVariant->Clip);
 	BranchWait = 0.f;
 
 	Montage = PlayPaused(Definition->Clip, BlendIn, bEasedBlend);
@@ -264,13 +265,20 @@ bool UAttackComponent::SwitchTo(UAttackDefinition* Definition)
 	}
 	if (!bSameClip)
 	{
-		UAnimMontage* Crossfaded = PlayPaused(Definition->Clip, SwitchBlend, true);
+		UAnimMontage* Crossfaded = PlayPaused(Definition->Clip, FMath::Max(SwitchBlend, Definition->BlendIn), true);
 		if (!Crossfaded)
 		{
 			return false;
 		}
 		Montage = Crossfaded;
 		Elapsed = 0.f;
+		if (USkeletalMeshComponent* Mesh = GetOwnerMesh())
+		{
+			if (UAnimInstance* Anim = Mesh->GetAnimInstance())
+			{
+				Anim->Montage_SetPosition(Montage, EvaluateAttack(Definition->GetTiming(), 0.f).ClipTime); // from its trim
+			}
+		}
 		PrevPoints.Reset();
 		bAtBranch = false;
 		bBranchResolved = true; // the variant has no branch of its own to wait at

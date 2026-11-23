@@ -17,6 +17,7 @@ struct FAttackTiming
 	float ChainFrom = -1.f;  // the next attack may start from here (-1 = never)
 
 	// Clip seconds (measured markers)
+	float ClipStartAt = 0.f; // the windup starts here (a borrowed clip trimmed at its start); 0 = the clip's start
 	float ClipHoldAt = 0.f;  // the pose held during the hold (<= ClipActiveStart)
 	float ClipActiveStart = 0.f;
 	float ClipActiveEnd = 0.f;

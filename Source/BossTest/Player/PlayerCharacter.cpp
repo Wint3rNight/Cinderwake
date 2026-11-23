@@ -106,6 +106,7 @@ void APlayerCharacter::BeginPlay()
 		Actions.Costs.Lights.Add(Light ? Light->StaminaCost : 0.f);
 	}
 	Actions.Costs.Heavy = HeavyAttack ? HeavyAttack->StaminaCost : 0.f;
+	Actions.Costs.Heavy2 = Heavy2Attack ? Heavy2Attack->StaminaCost : Actions.Costs.Heavy;
 	Actions.Costs.DodgeLights.Reset();
 	for (const UAttackDefinition* DodgeLight : DodgeLightAttacks)
 	{
@@ -124,6 +125,21 @@ void APlayerCharacter::BeginPlay()
 	if (!LightRiseAttack)
 	{
 		UE_LOG(LogTemp, Error, TEXT("BossTest: %s is missing its Step 4d data (the stand-up Light 1); run Docs/tools/setup_player.py"), *GetName());
+	}
+	if (!Heavy2Attack)
+	{
+		UE_LOG(LogTemp, Error, TEXT("BossTest: %s is missing its Step 4e data (the second heavy); run Docs/tools/setup_player.py"), *GetName());
+	}
+	// The borrowed clips live in the git-ignored /Game/Retargeted: without them these attacks would swing nothing.
+	TArray<const UAttackDefinition*> All = { HeavyAttack, Heavy2Attack, ChargedHeavyAttack, DodgeHeavyAttack, SprintAttack, LightRiseAttack };
+	for (const UAttackDefinition* Light : LightAttacks) { All.Add(Light); }
+	for (const UAttackDefinition* Light : DodgeLightAttacks) { All.Add(Light); }
+	for (const UAttackDefinition* Attack : All)
+	{
+		if (Attack && !Attack->Clip)
+		{
+			UE_LOG(LogTemp, Error, TEXT("BossTest: %s has no clip; borrowed clips come from Scripts/build_borrowed_clips.py (needs Paragon Kwang and Aurora)"), *Attack->GetName());
+		}
 	}
 	if (!ChargedHeavyAttack || !SprintAttack || !GuardRaiseClip || !GuardLoopClip || !BlockClip || !GuardBreakClip)
 	{
@@ -254,6 +270,10 @@ void APlayerCharacter::Execute(const FPlayerCommands& Commands)
 		case EPlayerCommand::ChainHeavy:
 			// Out of another attack's follow-through: a longer, eased blend turns it into the heavy's windup.
 			StartAttack(HeavyAttack, ChainedHeavyBlend, true);
+			break;
+		case EPlayerCommand::ChainHeavyTwo:
+			// Its own blend (in its data): out of the slam's crouch the pose travels far.
+			StartAttack(Heavy2Attack ? Heavy2Attack.Get() : HeavyAttack.Get(), ChainedHeavyBlend, true);
 			break;
 		case EPlayerCommand::StartLightRise:
 			StartAttack(LightRiseAttack ? LightRiseAttack.Get() : (LightAttacks.IsValidIndex(0) ? LightAttacks[0].Get() : nullptr), LightRiseBlend, true);
@@ -407,8 +427,10 @@ bool APlayerCharacter::IsStaminaFlashing() const
 	return GetWorld() && GetWorld()->GetTimeSeconds() < StaminaFlashUntil;
 }
 
-void APlayerCharacter::StartAttack(UAttackDefinition* Definition, float BlendIn, bool bEasedBlend)
+void APlayerCharacter::StartAttack(UAttackDefinition* Definition, float MinBlendIn, bool bForceEase)
 {
+	const float BlendIn = Definition ? FMath::Max(Definition->BlendIn, MinBlendIn) : MinBlendIn;
+	const bool bEasedBlend = bForceEase || (Definition && Definition->bEaseBlendIn);
 	// Snap to the target or the stick at the start; no steering during the attack (spec section 4).
 	// Without lock-on, a target roughly in front still pulls the swing toward him (a soft lock), so
 	// the lunge goes at him rather than past his flank.

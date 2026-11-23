@@ -37,6 +37,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Animation")
 	TObjectPtr<UAnimSequenceBase> Clip;
 
+	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Seconds the clip blends in over whatever played before (a pose far from the last one wants longer)"))
+	float BlendIn = 0.08f;
+
+	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Blend in on a smooth curve instead of a straight crossfade"))
+	bool bEaseBlendIn = false;
+
+	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Clip second the attack starts from (a borrowed clip trimmed at its start); 0 = the clip's start"))
+	float ClipStartAt = 0.f;
+
 	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Clip second of the pose held during the hold (at most Clip Active Start)"))
 	float ClipHoldAt = 0.f;
 

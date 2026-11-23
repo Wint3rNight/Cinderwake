@@ -232,4 +232,32 @@ bool FTimelineValidateBranch::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTimelineClipStartTrims, "BossTest.Combat.Timeline.ClipStartTrims", TimelineTestFlags)
+bool FTimelineClipStartTrims::RunTest(const FString& Parameters)
+{
+	// Step 4e: a borrowed clip can start partway in (Kwang's Ability_R skips its rising cut): the windup runs from
+	// ClipStartAt to the active start instead of from 0.
+	FAttackTiming T;
+	T.ClipStartAt = 0.18f; T.ClipHoldAt = 0.18f; T.ClipActiveStart = 0.43f; T.ClipActiveEnd = 0.52f; T.ClipEnd = 1.50f;
+	T.Windup = 0.50f; T.Active = 0.09f; T.Recovery = 0.95f;
+	TestEqual(TEXT("it starts at the trim"), EvaluateAttack(T, 0.f).ClipTime, 0.18f, 0.001f);
+	TestEqual(TEXT("halfway through the windup, halfway from the trim to the strike"), EvaluateAttack(T, 0.25f).ClipTime, 0.305f, 0.001f);
+	TestEqual(TEXT("the strike at the active start"), EvaluateAttack(T, 0.50f).ClipTime, 0.43f, 0.001f);
+	TestEqual(TEXT("valid"), ValidateTiming(T).Num(), 0);
+	// The charged heavy as built: trimmed at 0.13, easing into the overhead pose at 0.17 over the whole 0.45 s hold
+	// (the drift is capped at the trim, so the hold starts at once), then the leap at about 0.86x to the strike.
+	FAttackTiming C;
+	C.ClipStartAt = 0.13f; C.ClipHoldAt = 0.17f; C.ClipActiveStart = 0.41f; C.ClipActiveEnd = 0.50f; C.ClipEnd = 1.27f;
+	C.Windup = 0.73f; C.Hold = 0.45f; C.bEaseIntoHold = true; C.Active = 0.10f; C.Recovery = 0.92f;
+	TestEqual(TEXT("charged: it starts at the trim"), EvaluateAttack(C, 0.f).ClipTime, 0.13f, 0.002f);
+	TestTrue(TEXT("charged: easing through the hold from the start"), EvaluateAttack(C, 0.f).Phase == EAttackPhase::Hold);
+	TestEqual(TEXT("charged: at the overhead pose when the hold ends"), EvaluateAttack(C, 0.45f).ClipTime, 0.17f, 0.002f);
+	TestEqual(TEXT("charged: the strike at the windup's end"), EvaluateAttack(C, 0.73f).ClipTime, 0.41f, 0.002f);
+	TestEqual(TEXT("charged: valid"), ValidateTiming(C).Num(), 0);
+	FAttackTiming Bad = T;
+	Bad.ClipHoldAt = 0.10f;
+	TestTrue(TEXT("a hold before the trim is an error"), ValidateTiming(Bad).Num() > 0);
+	return true;
+}
+
 #endif

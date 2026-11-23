@@ -23,6 +23,11 @@
 # Third-party content from Fab. The licence allows use in Unreal Engine
 # projects but not redistribution, so it never goes in a public repo.
 /Content/ParagonSevarog/
+/Content/ParagonAurora/
+/Content/ParagonKwang/
+/Content/ParagonKhaimera/
+# Retargeted from Paragon clips (Step 4e): derived from Fab content, so it stays out too.
+/Content/Retargeted/
 /Content/ParagonFengMao/
 /Content/ParagonProps/
 /Content/KiteDemo/

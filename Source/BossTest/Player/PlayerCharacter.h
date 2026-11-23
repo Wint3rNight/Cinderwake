@@ -46,11 +46,14 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The leaping slam: a heavy that comes out 0.50-0.90 s after a dodge started"))
 	TObjectPtr<UAttackDefinition> DodgeHeavyAttack;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The heavy, charged: switched to (a crossfade to its own clip, Melee_B's deep gather and leap) when RMB is still held at the heavy's branch, down since the heavy started"))
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The heavy, charged: switched to (a crossfade to its own clip, Kwang's gather, leap and crashing diagonal) when RMB is still held at the heavy's branch, down since the heavy started"))
 	TObjectPtr<UAttackDefinition> ChargedHeavyAttack;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "A light after sprinting for a quarter of a second"))
 	TObjectPtr<UAttackDefinition> SprintAttack;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The second heavy, a rising uppercut: the heavy that chains from heavy 1, the charged heavy or the slam (Step 4e)"))
+	TObjectPtr<UAttackDefinition> Heavy2Attack;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Light 1 out of the slam's landing crouch: a longer windup so he stands up first (Step 4d)"))
 	TObjectPtr<UAttackDefinition> LightRiseAttack;
@@ -230,7 +233,8 @@ private:
 	double StaminaFlashUntil = 0.0; // world time; a refused press flashes the stamina bar until then
 	void ReadInput(FPlayerFrame& Frame);
 	void Execute(const FPlayerCommands& Commands);
-	void StartAttack(UAttackDefinition* Definition, float BlendIn = 0.08f, bool bEasedBlend = false);
+	// Blends in over the attack's own BlendIn, or MinBlendIn if that's longer (a chained heavy), eased if either asks.
+	void StartAttack(UAttackDefinition* Definition, float MinBlendIn = 0.f, bool bForceEase = false);
 	void StartDodge(bool bBackstep);
 	void EndDodgePush();
 	void TickEvadeVisuals();

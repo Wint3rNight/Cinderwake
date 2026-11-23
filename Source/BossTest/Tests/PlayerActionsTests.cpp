@@ -1254,4 +1254,64 @@ bool FActionsExhaustedAtLock::RunTest(const FString& Parameters)
 	return true;
 }
 
+// ---- Step 4e: the second heavy ----
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHeavyLine, "BossTest.Player.Actions.ChainedHeavyFollowsLine", ActionsTestFlags)
+bool FActionsHeavyLine::RunTest(const FString& Parameters)
+{
+	// Heavy 1, heavy 2, heavy 1: a heavy never follows itself.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("heavy 1 into heavy 2"), Has(A.Tick(Frame(0.95f).Running().Chain()), C::ChainHeavyTwo));
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("heavy 2 into heavy 1"), Has(A.Tick(Frame(0.95f).Running().Chain()), C::ChainHeavy));
+	// Out of a light: heavy 1.
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Light);
+	B.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("a light into heavy 1"), Has(B.Tick(Frame(0.38f).Running().Chain()), C::ChainHeavy));
+	// Out of the slam: heavy 2.
+	FPlayerActions D = MakeActions();
+	PressNow(D, EPlayerInput::Dodge, Frame(0.f).Move());
+	D.Tick(Frame(0.30f));
+	D.Press(EPlayerInput::Heavy);
+	D.Tick(Frame(0.20f).HeavyHeld());
+	D.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("the slam into heavy 2"), Has(D.Tick(Frame(1.05f).Running().Chain()), C::ChainHeavyTwo));
+	// Out of the charged heavy: heavy 2.
+	FPlayerActions E = MakeActions();
+	PressNow(E, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	E.Tick(Frame(0.15f).Running().HeavyHeld().AtBranch()); // charges
+	E.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("the charged heavy into heavy 2"), Has(E.Tick(Frame(1.31f).Running().Chain()), C::ChainHeavyTwo));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHeavy2NoCharge, "BossTest.Player.Actions.Heavy2NeverCharges", ActionsTestFlags)
+bool FActionsHeavy2NoCharge::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	A.Tick(Frame(0.10f).Running()); // released: heavy 1 won't charge either
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("heavy 2 started"), Has(A.Tick(Frame(0.85f).Running().Chain().HeavyHeld()), C::ChainHeavyTwo)); // RMB down from its press
+	const float Before = A.Stamina.Current;
+	TestFalse(TEXT("held through heavy 2: no charge"), Has(A.Tick(Frame(0.15f).Running().HeavyHeld().AtBranch()), C::BeginCharge));
+	TestEqual(TEXT("and no extra stamina"), A.Stamina.Current, Before, ActionsTol);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsEndFrameHeavy2, "BossTest.Player.Actions.EndFrameHeavyIsHeavy2", ActionsTestFlags)
+bool FActionsEndFrameHeavy2::RunTest(const FString& Parameters)
+{
+	// A heavy pressed on the frame heavy 1 ends is still heavy 2 (the line is the rules', not the attack component's).
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	A.Tick(Frame(1.46f).Running());
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("heavy 2 on the free frame"), Has(A.Tick(Frame(0.01f)), C::ChainHeavyTwo));
+	return true;
+}
+
 #endif

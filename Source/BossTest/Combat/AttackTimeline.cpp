@@ -25,7 +25,38 @@ namespace
 	}
 }
 
+namespace
+{
+	// The timing with its clip markers moved so the clip starts at 0 (a borrowed clip trimmed at its start).
+	FAttackTiming FromClipStart(const FAttackTiming& T)
+	{
+		FAttackTiming Shifted = T;
+		Shifted.ClipStartAt = 0.f;
+		Shifted.ClipHoldAt -= T.ClipStartAt;
+		Shifted.ClipActiveStart -= T.ClipStartAt;
+		Shifted.ClipActiveEnd -= T.ClipStartAt;
+		Shifted.ClipEnd -= T.ClipStartAt;
+		return Shifted;
+	}
+
+	FAttackSample EvaluateFromStart(const FAttackTiming& T, float Time);
+}
+
 FAttackSample EvaluateAttack(const FAttackTiming& T, float Time)
+{
+	if (T.ClipStartAt <= 0.f)
+	{
+		return EvaluateFromStart(T, Time);
+	}
+	// The windup runs from the trim to the strike; everything else is the same, shifted back into clip time.
+	FAttackSample S = EvaluateFromStart(FromClipStart(T), Time);
+	S.ClipTime += T.ClipStartAt;
+	return S;
+}
+
+namespace
+{
+FAttackSample EvaluateFromStart(const FAttackTiming& T, float Time)
 {
 	FAttackSample S;
 	S.bChainOpen = T.ChainFrom >= 0.f && Time >= T.ChainFrom;
@@ -75,6 +106,7 @@ FAttackSample EvaluateAttack(const FAttackTiming& T, float Time)
 		S.ClipTime = T.ClipEnd;
 	}
 	return S;
+}
 }
 
 bool ActiveOverlap(const FAttackTiming& T, float From, float To)
@@ -152,10 +184,11 @@ TArray<FString> ValidateTiming(const FAttackTiming& T)
 	{
 		Out.Add(TEXT("Error: the hold can't be longer than the windup that contains it."));
 	}
-	if (!(T.ClipHoldAt >= 0.f && T.ClipHoldAt <= T.ClipActiveStart && T.ClipActiveStart < T.ClipActiveEnd && T.ClipActiveEnd <= T.ClipEnd))
+	if (!(T.ClipStartAt >= 0.f && T.ClipHoldAt >= T.ClipStartAt && T.ClipHoldAt <= T.ClipActiveStart && T.ClipActiveStart < T.ClipActiveEnd && T.ClipActiveEnd <= T.ClipEnd))
 	{
-		Out.Add(TEXT("Error: clip markers must be in order: 0 <= hold-at <= active start < active end <= end."));
+		Out.Add(TEXT("Error: clip markers must be in order: 0 <= start <= hold-at <= active start < active end <= end."));
 	}
+	const FAttackTiming Shifted = FromClipStart(T);
 
 	auto CheckStretch = [&Out](const TCHAR* Segment, float RealSpan, float ClipSpan)
 	{
@@ -165,7 +198,7 @@ TArray<FString> ValidateTiming(const FAttackTiming& T)
 				Segment, RealSpan / ClipSpan));
 		}
 	};
-	CheckStretch(TEXT("windup"), T.Windup - T.Hold, T.ClipActiveStart - HoldDrift(T));
+	CheckStretch(TEXT("windup"), T.Windup - T.Hold, Shifted.ClipActiveStart - HoldDrift(Shifted));
 	CheckStretch(TEXT("active window"), T.Active, T.ClipActiveEnd - T.ClipActiveStart);
 	CheckStretch(TEXT("recovery"), T.Recovery, T.ClipEnd - T.ClipActiveEnd);
 	return Out;

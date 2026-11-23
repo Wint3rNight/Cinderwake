@@ -18,6 +18,7 @@ public class BossTest : ModuleRules
 		{
 			PrivateDependencyModuleNames.Add("UnrealEd");
 			PrivateDependencyModuleNames.Add("PhysicsUtilities"); // Tools/BossTestEditorTools: generating the boss's ragdoll physics asset
+			PrivateDependencyModuleNames.AddRange(new string[] { "AnimationModifiers", "AnimationBlueprintLibrary" }); // Tools/BossTestEditorTools: mirroring borrowed clips
 		}
 
 		// Uncomment if you are using Slate UI

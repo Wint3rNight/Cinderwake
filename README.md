@@ -23,6 +23,8 @@ On Linux, build with the editor closed:
 <Engine>/Engine/Build/BatchFiles/Linux/Build.sh BossTestEditor Linux Development -Project="$PWD/BossTest.uproject"
 ```
 
+Three of Feng Mao's moves are borrowed from Paragon Kwang and Aurora, retargeted and mirrored onto him. Those clips are derived from Fab content too, so they aren't in the repo either: add Paragon: Kwang and Paragon: Aurora as well, build, then run `Scripts/build_borrowed_clips.py` once (the header says how). Without them the charged heavy, the second heavy and the third light won't play.
+
 Controls: WASD and the mouse, left click for a light attack, right click (or F) for a heavy and hold it to charge, Space to dodge, Shift to sprint, Q to guard (tap it just before a hit lands for a perfect guard), E to heal, Tab to lock on. H shows the debug keys.
 
 ## Tests

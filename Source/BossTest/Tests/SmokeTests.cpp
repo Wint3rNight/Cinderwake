@@ -445,15 +445,15 @@ bool FCheckCharged::Update()
 	const UAttackDefinition* Current = Player && Player->GetAttacks() ? Player->GetAttacks()->GetCurrent() : nullptr;
 	Test->TestTrue(FString::Printf(TEXT("holding RMB charged the heavy (current attack: %s)"), Current ? *Current->GetName() : TEXT("none")),
 		Current && Current->GetName() == TEXT("DA_ChargedHeavy"));
-	// Step 4d: the charge crossfades to its own clip and restarts its timeline at the 0.40 s branch.
+	// The charge crossfades to its own clip (Kwang's Ability_R, Step 4e) and restarts its timeline at the 0.15 s branch.
 	if (Current && Player->GetAttacks())
 	{
-		Test->TestTrue(FString::Printf(TEXT("its timeline restarted at the switch (%.2f s in)"), Player->GetAttacks()->GetElapsed()), Player->GetAttacks()->GetElapsed() < 0.40f);
+		Test->TestTrue(FString::Printf(TEXT("its timeline restarted at the 0.15 s switch (%.2f s in, 0.7 s after the press)"), Player->GetAttacks()->GetElapsed()), Player->GetAttacks()->GetElapsed() < 0.65f);
 		const UAnimInstance* Anim = Player->GetMesh()->GetAnimInstance();
 		const UAnimMontage* Playing = Anim ? Anim->GetCurrentActiveMontage() : nullptr;
 		const UAnimSequenceBase* Clip = Playing && Playing->SlotAnimTracks.Num() > 0 && Playing->SlotAnimTracks[0].AnimTrack.AnimSegments.Num() > 0
 			? Playing->SlotAnimTracks[0].AnimTrack.AnimSegments[0].GetAnimReference() : nullptr;
-		Test->TestTrue(FString::Printf(TEXT("and Melee_B is what's playing (%s)"), Clip ? *Clip->GetName() : TEXT("none")), Clip && Clip->GetName() == TEXT("Melee_B"));
+		Test->TestTrue(FString::Printf(TEXT("and Kwang's Ability_R is what's playing (%s)"), Clip ? *Clip->GetName() : TEXT("none")), Clip && Clip->GetName() == TEXT("Kwang_Ability_R_Mirrored"));
 	}
 	return true;
 }
@@ -649,28 +649,17 @@ bool FCheckBodiesOnFloor::Update()
 	Test->TestTrue(TEXT("Feng Mao's body is a ragdoll after his death clip"), Player->GetMesh()->IsSimulatingPhysics());
 	Test->TestTrue(FString::Printf(TEXT("and his head lies near the floor (%.0f cm up)"), HeadAboveFloor(Player, W.FloorZ)), HeadAboveFloor(Player, W.FloorZ) < 45.f);
 	Test->TestTrue(TEXT("Sevarog's body is a ragdoll after his"), Boss->GetMesh()->IsSimulatingPhysics());
-	const UPhysicsAsset* BossPhysics = Boss->GetMesh()->GetPhysicsAsset();
-	Test->TestTrue(FString::Printf(TEXT("on the generated ragdoll asset (%s)"), BossPhysics ? *BossPhysics->GetName() : TEXT("none")),
-		BossPhysics && BossPhysics->GetName() == TEXT("PA_SevarogRagdoll"));
 	Test->TestTrue(FString::Printf(TEXT("and his head lies near the floor (%.0f cm up)"), HeadAboveFloor(Boss, W.FloorZ)), HeadAboveFloor(Boss, W.FloorZ) < 80.f);
-	// DIAGNOSTIC (temporary): bodies, joints and spread of each ragdoll.
+	// In one piece: a ragdoll with missing joints scatters its limbs (Feng Mao's head once landed 30 m from his pelvis).
 	for (const ACharacter* C : { static_cast<const ACharacter*>(Player), static_cast<const ACharacter*>(Boss) })
 	{
 		const USkeletalMeshComponent* Mesh = C->GetMesh();
-		const FVector Pelvis = Mesh->GetSocketLocation(TEXT("pelvis"));
-		float Far = 0.f;
-		FString FarName;
-		for (const FBodyInstance* Body : Mesh->Bodies)
-		{
-			if (Body && Body->BodySetup.IsValid())
-			{
-				const float D = FVector::Dist(Body->GetUnrealWorldTransform().GetLocation(), Pelvis);
-				if (D > Far) { Far = D; FarName = Body->BodySetup->BoneName.ToString(); }
-			}
-		}
-		Test->AddInfo(FString::Printf(TEXT("DIAG %s: physics asset %s, %d bodies, %d constraints, farthest body %s at %.0f cm from the pelvis, head-pelvis %.0f cm"),
-			*C->GetName(), Mesh->GetPhysicsAsset() ? *Mesh->GetPhysicsAsset()->GetName() : TEXT("none"), Mesh->Bodies.Num(), Mesh->Constraints.Num(), *FarName, Far,
-			FVector::Dist(Mesh->GetSocketLocation(TEXT("head")), Pelvis)));
+		const float HeadToPelvis = FVector::Dist(Mesh->GetSocketLocation(TEXT("head")), Mesh->GetSocketLocation(TEXT("pelvis")));
+		const float Limit = C == Player ? 120.f : 200.f;
+		Test->TestTrue(FString::Printf(TEXT("%s: the body stays in one piece (head %.0f cm from the pelvis)"), *C->GetName(), HeadToPelvis), HeadToPelvis < Limit);
+		const UPhysicsAsset* Asset = Mesh->GetPhysicsAsset();
+		const FString Want = C == Player ? TEXT("PA_FengMaoRagdoll") : TEXT("PA_SevarogRagdoll");
+		Test->TestTrue(FString::Printf(TEXT("%s: on the generated ragdoll asset (%s)"), *C->GetName(), Asset ? *Asset->GetName() : TEXT("none")), Asset && Asset->GetName() == Want);
 	}
 	return true;
 }
@@ -699,6 +688,9 @@ bool FCheckBodiesRestored::Update()
 	const UPhysicsAsset* BossPhysics = Boss->GetMesh()->GetPhysicsAsset();
 	Test->TestTrue(FString::Printf(TEXT("Sevarog is back on the Paragon physics asset (%s)"), BossPhysics ? *BossPhysics->GetName() : TEXT("none")),
 		BossPhysics && BossPhysics->GetName() == TEXT("Sevarog_Extents"));
+	const UPhysicsAsset* PlayerPhysics = Player->GetMesh()->GetPhysicsAsset();
+	Test->TestTrue(FString::Printf(TEXT("Feng Mao is back on his Paragon physics asset (%s)"), PlayerPhysics ? *PlayerPhysics->GetName() : TEXT("none")),
+		PlayerPhysics && PlayerPhysics->GetName() == TEXT("FengMao_Extents"));
 	Test->TestTrue(FString::Printf(TEXT("Feng Mao stands again (head %.0f cm up)"), HeadAboveFloor(Player, W.FloorZ)), HeadAboveFloor(Player, W.FloorZ) > 140.f);
 	return true;
 }
@@ -807,6 +799,80 @@ bool FSmokeLightLightHeavy::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FPlayLightLightHeavy(this, MakeShared<FChainWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- Step 4e, played live: the borrowed moves play their borrowed clips ----
+
+// Light, light, light gives Light 3 on Aurora's clip; once free, heavy, heavy gives heavy 2 on Kwang's.
+struct FBorrowWatch
+{
+	double Start = 0.0;
+	int32 Step = 0;
+	bool bLight3 = false;
+};
+
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FPlayBorrowedMoves, FAutomationTestBase*, Test, TSharedRef<FBorrowWatch>, Watch);
+bool FPlayBorrowedMoves::Update()
+{
+	FBorrowWatch& W = Watch.Get();
+	if (W.Start <= 0.0)
+	{
+		W.Start = FPlatformTime::Seconds();
+	}
+	UWorld* World = PlayWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	const APlayerCharacter* Player = SmokePlayer(World);
+	if (!PC || !Player)
+	{
+		Test->AddError(TEXT("no player"));
+		return true;
+	}
+	if (FPlatformTime::Seconds() - W.Start > 10.0)
+	{
+		Test->AddError(FString::Printf(TEXT("the borrowed moves didn't all come out (step %d)"), W.Step));
+		return true;
+	}
+	const UAttackDefinition* Current = Player->GetAttacks() ? Player->GetAttacks()->GetCurrent() : nullptr;
+	const FString Name = Current ? Current->GetName() : FString();
+	const FString Clip = Current && Current->Clip ? Current->Clip->GetName() : FString();
+	auto Tap = [PC](const FKey& Key)
+	{
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(Key, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(Key, IE_Released, 0.f));
+	};
+	switch (W.Step)
+	{
+	case 0: Tap(EKeys::LeftMouseButton); W.Step = 1; return false;
+	case 1: if (Name == TEXT("DA_Light1")) { Tap(EKeys::LeftMouseButton); W.Step = 2; } return false;
+	case 2: if (Name == TEXT("DA_Light2")) { Tap(EKeys::LeftMouseButton); W.Step = 3; } return false;
+	case 3:
+		if (Name == TEXT("DA_Light3"))
+		{
+			Test->TestEqual(TEXT("Light 3 plays Aurora's rising backhand"), Clip, FString(TEXT("Aurora_Primary_Attack_Slow_C_Mirrored")));
+			W.Step = 4;
+		}
+		return false;
+	case 4: if (Name.IsEmpty()) { Tap(EKeys::RightMouseButton); W.Step = 5; } return false; // free again
+	case 5: if (Name == TEXT("DA_Heavy")) { Tap(EKeys::RightMouseButton); W.Step = 6; } return false;
+	default:
+		if (Name == TEXT("DA_Heavy2"))
+		{
+			Test->TestEqual(TEXT("heavy 2 plays Kwang's uppercut"), Clip, FString(TEXT("Kwang_PrimaryAttack_A_Slow_Mirrored")));
+			return true;
+		}
+		return false;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeBorrowedMoves, "BossTest.Smoke.BorrowedMovesPlay", SmokeTestFlags)
+bool FSmokeBorrowedMoves::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FPlayBorrowedMoves(this, MakeShared<FBorrowWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }

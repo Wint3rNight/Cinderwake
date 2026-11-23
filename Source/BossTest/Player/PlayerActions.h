@@ -143,6 +143,7 @@ struct FAttackCosts
 {
 	TArray<float> Lights;           // in combo order
 	float Heavy = 0.f;
+	float Heavy2 = 0.f;             // the rising uppercut (Step 4e)
 	TArray<float> DodgeLights;      // the quick combo out of a dodge, in order
 	float DodgeHeavy = 0.f;         // the leaping slam out of a dodge
 	float SprintAttack = 0.f;
@@ -179,6 +180,7 @@ enum class EPlayerCommand : uint8
 	PlayDeflect,        // a perfect guard
 	PlayHeavyDeflect,   // a perfect guard on a hit that would have knocked down
 	ChainHeavy,         // the normal heavy, started from another attack's chain point (it blends in longer)
+	ChainHeavyTwo,      // the second heavy (the rising uppercut): the heavy that follows a heavy, the charged heavy or the slam
 	StartLightRise,     // Light 1 out of the slam's landing crouch: it stands up first
 	RefuseInput         // a press was refused (a dodge mid-swing, a held attack meeting exhaustion): flash the stamina bar
 };
@@ -251,7 +253,7 @@ private:
 	float SinceDodge = 100.f;     // since the last dodge or backstep started
 	int32 LightIndex = 0;
 	// What's running decides which light follows it at the chain point.
-	enum class EAttackLine : uint8 { None, Light, DodgeLight, Sprint, Heavy, Slam };
+	enum class EAttackLine : uint8 { None, Light, DodgeLight, Sprint, Heavy, Heavy2, Slam };
 	EAttackLine Line = EAttackLine::None;
 	EPlayerInput Held = EPlayerInput::None; // the one held press (Step 4d), latest wins
 	float HeldAge = 0.f;
