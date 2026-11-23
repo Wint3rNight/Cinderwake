@@ -1,0 +1,34 @@
+# Only the public game goes in this repo: our C++ source, config, the .uproject,
+# and our own assets in Content/BossTest. Everything else is ignored.
+
+# Private: design documents and notes
+/Docs/
+/DESIGN.md
+
+# Editor and IDE files (generated)
+/.vscode/
+/.idea/
+*.code-workspace
+/Makefile
+/.ignore
+
+# Unreal build output and caches
+/Binaries/
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+/Plugins/*/Binaries/
+/Plugins/*/Intermediate/
+
+# Third-party content from Fab. The licence allows use in Unreal Engine
+# projects but not redistribution, so it never goes in a public repo.
+/Content/ParagonSevarog/
+/Content/ParagonFengMao/
+/Content/ParagonProps/
+/Content/KiteDemo/
+/Content/SampleMap/
+/Content/Lighting/
+
+# Editor-local content
+/Content/Developers/
+/Content/Collections/
