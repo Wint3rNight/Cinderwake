@@ -13,10 +13,16 @@ namespace
 	// With an eased hold, the pose keeps drifting through the hold, slowing to a stop at ClipHoldAt
 	// (an ease-out: speed falls linearly to 0). The drift is sized so the pose enters the hold at the
 	// raise's own speed, so there's no visible stop: Drift = Rate * Hold / 2, Rate = (ActiveStart - Drift) / Moving.
+	// A creeping hold: how far the pose moves during it, in clip seconds (0 = a frozen or eased hold).
+	float HoldCreep(const FAttackTiming& T)
+	{
+		return FMath::Max(0.f, T.ClipHoldTo - T.ClipHoldAt);
+	}
+
 	float HoldDrift(const FAttackTiming& T)
 	{
 		const float Moving = FMath::Max(0.f, T.Windup - T.Hold);
-		if (!T.bEaseIntoHold || T.Hold <= 0.f || Moving <= 0.f)
+		if (!T.bEaseIntoHold || T.Hold <= 0.f || Moving <= 0.f || HoldCreep(T) > 0.f)
 		{
 			return 0.f;
 		}
@@ -33,6 +39,7 @@ namespace
 		FAttackTiming Shifted = T;
 		Shifted.ClipStartAt = 0.f;
 		Shifted.ClipHoldAt -= T.ClipStartAt;
+		Shifted.ClipHoldTo -= T.ClipStartAt;
 		Shifted.ClipActiveStart -= T.ClipStartAt;
 		Shifted.ClipActiveEnd -= T.ClipStartAt;
 		Shifted.ClipEnd -= T.ClipStartAt;
@@ -63,10 +70,11 @@ FAttackSample EvaluateFromStart(const FAttackTiming& T, float Time)
 	S.bFree = Time >= T.Total();
 
 	// The windup moves through clip 0 -> ClipActiveStart at one constant rate over (Windup - Hold),
-	// pausing at ClipHoldAt for Hold seconds along the way.
+	// pausing at ClipHoldAt for Hold seconds along the way (or creeping on to ClipHoldTo).
 	const float Moving = FMath::Max(0.f, T.Windup - T.Hold);
 	const float Drift = HoldDrift(T);
-	const float WindupRate = Rate(T.ClipActiveStart - Drift, Moving);
+	const float Creep = HoldCreep(T);
+	const float WindupRate = Rate(T.ClipActiveStart - Drift - Creep, Moving);
 	const float HoldStart = WindupRate > 0.f ? (T.ClipHoldAt - Drift) / WindupRate : 0.f;
 
 	if (Time < 0.f)
@@ -83,12 +91,12 @@ FAttackSample EvaluateFromStart(const FAttackTiming& T, float Time)
 	{
 		S.Phase = EAttackPhase::Hold;
 		const float U = T.Hold > 0.f ? (Time - HoldStart) / T.Hold : 1.f;
-		S.ClipTime = T.ClipHoldAt - Drift + Drift * (1.f - (1.f - U) * (1.f - U));
+		S.ClipTime = Creep > 0.f ? T.ClipHoldAt + Creep * U : T.ClipHoldAt - Drift + Drift * (1.f - (1.f - U) * (1.f - U));
 	}
 	else if (Time < T.Windup)
 	{
 		S.Phase = EAttackPhase::Windup;
-		S.ClipTime = T.ClipHoldAt + (Time - HoldStart - T.Hold) * WindupRate;
+		S.ClipTime = T.ClipHoldAt + Creep + (Time - HoldStart - T.Hold) * WindupRate;
 	}
 	else if (Time < T.Windup + T.Active)
 	{
@@ -188,6 +196,14 @@ TArray<FString> ValidateTiming(const FAttackTiming& T)
 	{
 		Out.Add(TEXT("Error: clip markers must be in order: 0 <= start <= hold-at <= active start < active end <= end."));
 	}
+	if (HoldCreep(T) > 0.f && T.ClipHoldTo > T.ClipActiveStart)
+	{
+		Out.Add(TEXT("Error: a creeping hold must end at or before the active start."));
+	}
+	if (HoldCreep(T) > 0.f && T.bEaseIntoHold)
+	{
+		Out.Add(TEXT("Error: a hold either creeps (Clip Hold To) or eases in, not both."));
+	}
 	const FAttackTiming Shifted = FromClipStart(T);
 
 	auto CheckStretch = [&Out](const TCHAR* Segment, float RealSpan, float ClipSpan)
@@ -198,7 +214,7 @@ TArray<FString> ValidateTiming(const FAttackTiming& T)
 				Segment, RealSpan / ClipSpan));
 		}
 	};
-	CheckStretch(TEXT("windup"), T.Windup - T.Hold, Shifted.ClipActiveStart - HoldDrift(Shifted));
+	CheckStretch(TEXT("windup"), T.Windup - T.Hold, Shifted.ClipActiveStart - HoldDrift(Shifted) - HoldCreep(Shifted));
 	CheckStretch(TEXT("active window"), T.Active, T.ClipActiveEnd - T.ClipActiveStart);
 	CheckStretch(TEXT("recovery"), T.Recovery, T.ClipEnd - T.ClipActiveEnd);
 	return Out;

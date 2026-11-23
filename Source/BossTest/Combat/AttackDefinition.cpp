@@ -14,6 +14,7 @@ FAttackTiming UAttackDefinition::GetTiming() const
 	T.ChainFrom = ChainFrom;
 	T.ClipStartAt = ClipStartAt;
 	T.ClipHoldAt = ClipHoldAt;
+	T.ClipHoldTo = ClipHoldTo;
 	T.ClipActiveStart = ClipActiveStart;
 	T.ClipActiveEnd = ClipActiveEnd;
 	T.ClipEnd = ClipEnd;

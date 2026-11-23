@@ -49,6 +49,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Clip second of the pose held during the hold (at most Clip Active Start)"))
 	float ClipHoldAt = 0.f;
 
+	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Set past Clip Hold At, the hold creeps steadily on to this clip second instead of freezing (at most Clip Active Start; not with Ease Into Hold)"))
+	float ClipHoldTo = 0.f;
+
 	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Clip second where the hit window opens (measured from the weapon's speed)"))
 	float ClipActiveStart = 0.f;
 

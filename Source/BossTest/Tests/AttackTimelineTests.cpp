@@ -244,8 +244,8 @@ bool FTimelineClipStartTrims::RunTest(const FString& Parameters)
 	TestEqual(TEXT("halfway through the windup, halfway from the trim to the strike"), EvaluateAttack(T, 0.25f).ClipTime, 0.305f, 0.001f);
 	TestEqual(TEXT("the strike at the active start"), EvaluateAttack(T, 0.50f).ClipTime, 0.43f, 0.001f);
 	TestEqual(TEXT("valid"), ValidateTiming(T).Num(), 0);
-	// The charged heavy as built: trimmed at 0.13, easing into the overhead pose at 0.17 over the whole 0.45 s hold
-	// (the drift is capped at the trim, so the hold starts at once), then the leap at about 0.86x to the strike.
+	// The first 4e charged heavy (since replaced by a creeping gather in the crouch): trimmed at 0.13, easing into the
+	// overhead pose at 0.17 over the whole 0.45 s hold (the drift is capped at the trim, so the hold starts at once).
 	FAttackTiming C;
 	C.ClipStartAt = 0.13f; C.ClipHoldAt = 0.17f; C.ClipActiveStart = 0.41f; C.ClipActiveEnd = 0.50f; C.ClipEnd = 1.27f;
 	C.Windup = 0.73f; C.Hold = 0.45f; C.bEaseIntoHold = true; C.Active = 0.10f; C.Recovery = 0.92f;
@@ -257,6 +257,56 @@ bool FTimelineClipStartTrims::RunTest(const FString& Parameters)
 	FAttackTiming Bad = T;
 	Bad.ClipHoldAt = 0.10f;
 	TestTrue(TEXT("a hold before the trim is an error"), ValidateTiming(Bad).Num() > 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTimelineHoldCreeps, "BossTest.Combat.Timeline.HoldCreeps", TimelineTestFlags)
+bool FTimelineHoldCreeps::RunTest(const FString& Parameters)
+{
+	// After the 4e play (the charged heavy's frozen gather read as weird): a hold can creep at a steady slow rate from
+	// ClipHoldAt to ClipHoldTo instead of freezing, and the windup carries on from ClipHoldTo at its own rate.
+	FAttackTiming T; // the charged heavy's gather: the crouch at the clip's start, then the leap at full speed
+	T.ClipHoldAt = 0.f; T.ClipHoldTo = 0.06f; T.ClipActiveStart = 0.41f; T.ClipActiveEnd = 0.50f; T.ClipEnd = 1.27f;
+	T.Windup = 0.73f; T.Hold = 0.38f; T.Active = 0.10f; T.Recovery = 0.92f;
+	TestTrue(TEXT("holding from the start"), EvaluateAttack(T, 0.f).Phase == EAttackPhase::Hold);
+	TestEqual(TEXT("halfway through the hold, halfway along the creep"), EvaluateAttack(T, 0.19f).ClipTime, 0.03f, 0.001f);
+	TestEqual(TEXT("at the creep's end when the hold ends"), EvaluateAttack(T, 0.38f).ClipTime, 0.06f, 0.001f);
+	TestTrue(TEXT("then winding up again"), EvaluateAttack(T, 0.40f).Phase == EAttackPhase::Windup);
+	TestEqual(TEXT("full speed from the creep's end (0.35 s of clip in 0.35 s)"), EvaluateAttack(T, 0.555f).ClipTime, 0.235f, 0.001f);
+	TestEqual(TEXT("the strike at the windup's end"), EvaluateAttack(T, 0.73f).ClipTime, 0.41f, 0.001f);
+	TestEqual(TEXT("valid"), ValidateTiming(T).Num(), 0);
+	bool bAlwaysMoving = true;
+	for (int32 i = 0; i < 11; ++i)
+	{
+		const float t = i / 30.f;
+		bAlwaysMoving &= EvaluateAttack(T, t + 1.f / 30.f).ClipTime > EvaluateAttack(T, t).ClipTime + 0.001f;
+	}
+	TestTrue(TEXT("never frozen: the pose moves in every 1/30 s step of the hold"), bAlwaysMoving);
+
+	// A creep partway through the windup: the raise reaches ClipHoldAt at its own rate, creeps, then carries on.
+	FAttackTiming M = T;
+	M.ClipHoldAt = 0.10f; M.ClipHoldTo = 0.14f; // moving: 0.37 s of clip in 0.35 s
+	const float HoldStart = 0.10f / (0.37f / 0.35f);
+	TestEqual(TEXT("mid-windup: the raise reaches the hold pose"), EvaluateAttack(M, HoldStart).ClipTime, 0.10f, 0.002f);
+	TestEqual(TEXT("mid-windup: halfway along the creep"), EvaluateAttack(M, HoldStart + 0.19f).ClipTime, 0.12f, 0.002f);
+	TestEqual(TEXT("mid-windup: the strike at the windup's end"), EvaluateAttack(M, 0.73f).ClipTime, 0.41f, 0.002f);
+
+	// With a trim, the creep is in clip seconds like every other marker.
+	FAttackTiming S = T;
+	S.ClipStartAt = 0.02f; S.ClipHoldAt = 0.02f; S.ClipHoldTo = 0.08f;
+	TestEqual(TEXT("trimmed: starts at the trim"), EvaluateAttack(S, 0.f).ClipTime, 0.02f, 0.001f);
+	TestEqual(TEXT("trimmed: at the creep's end when the hold ends"), EvaluateAttack(S, 0.38f).ClipTime, 0.08f, 0.001f);
+	TestEqual(TEXT("trimmed: the strike at the windup's end"), EvaluateAttack(S, 0.73f).ClipTime, 0.41f, 0.001f);
+
+	FAttackTiming Frozen = T;
+	Frozen.ClipHoldTo = 0.f;
+	TestEqual(TEXT("no creep set: the hold still freezes"), EvaluateAttack(Frozen, 0.19f).ClipTime, 0.f, 0.001f);
+	FAttackTiming Past = T;
+	Past.ClipHoldTo = 0.45f;
+	TestTrue(TEXT("a creep past the strike is an error"), ValidateTiming(Past).Num() > 0);
+	FAttackTiming Both = T;
+	Both.bEaseIntoHold = true;
+	TestTrue(TEXT("a creep that also eases in is an error (they're two different holds)"), ValidateTiming(Both).Num() > 0);
 	return true;
 }
 

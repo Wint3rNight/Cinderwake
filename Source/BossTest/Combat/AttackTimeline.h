@@ -19,6 +19,7 @@ struct FAttackTiming
 	// Clip seconds (measured markers)
 	float ClipStartAt = 0.f; // the windup starts here (a borrowed clip trimmed at its start); 0 = the clip's start
 	float ClipHoldAt = 0.f;  // the pose held during the hold (<= ClipActiveStart)
+	float ClipHoldTo = 0.f;  // set past ClipHoldAt, the hold creeps steadily on to this pose instead of freezing (<= ClipActiveStart)
 	float ClipActiveStart = 0.f;
 	float ClipActiveEnd = 0.f;
 	float ClipEnd = 0.f;

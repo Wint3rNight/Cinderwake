@@ -92,6 +92,12 @@ bool FAttackDataChainPoints::RunTest(const FString& Parameters)
 		TestEqual(TEXT("charged heavy: free 1.90 s after the press"), At + C.Total(), 1.90f, 0.005f);
 		TestTrue(TEXT("charged heavy: the chain point after its hit and before free"), C.ChainFrom > C.Windup + C.Active && C.ChainFrom < C.Total());
 		TestTrue(TEXT("charged heavy: chaining into Light 1 never frees you earlier"), C.ChainFrom + Light1->GetTiming().Total() > C.Total());
+		// After the 4e play: the switch and the gather looked weird. The heavy barely moves before the decision, so a
+		// charge has no thrust to switch away from, and the gather creeps instead of freezing on a pose.
+		const FAttackTiming H = Heavy->GetTiming();
+		TestTrue(TEXT("heavy: still creeping in its hold at the branch"), EvaluateAttack(H, At - 0.01f).Phase == EAttackPhase::Hold);
+		TestTrue(FString::Printf(TEXT("heavy: at most 0.05 s into its clip at the branch (%.3f)"), EvaluateAttack(H, At).ClipTime), EvaluateAttack(H, At).ClipTime <= 0.05f);
+		TestTrue(TEXT("charged heavy: the gather creeps (never a frozen pose)"), C.ClipHoldTo > C.ClipHoldAt && !C.bEaseIntoHold);
 	}
 	return true;
 }
