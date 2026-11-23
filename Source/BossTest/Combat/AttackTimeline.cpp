@@ -127,11 +127,9 @@ FBranchStep StepToBranch(float Elapsed, float Step, float BranchAt, bool bResolv
 TArray<FString> ValidateBranch(const FAttackTiming& Mine, const FAttackTiming& Variant, bool bSameClip, float BranchAt)
 {
 	TArray<FString> Out;
-	if (!bSameClip)
-	{
-		Out.Add(TEXT("Error: the branch variant must use the same clip."));
-	}
-	else if (FMath::Abs(EvaluateAttack(Mine, BranchAt).ClipTime - EvaluateAttack(Variant, BranchAt).ClipTime) > 0.005f)
+	// A variant on another clip restarts its own timeline at the branch with a crossfade (Step 4d), so no pose has
+	// to match. On the same clip it carries on seamlessly, so the poses must agree.
+	if (bSameClip && FMath::Abs(EvaluateAttack(Mine, BranchAt).ClipTime - EvaluateAttack(Variant, BranchAt).ClipTime) > 0.005f)
 	{
 		Out.Add(TEXT("Error: the pose at the branch differs between the attack and its variant."));
 	}

@@ -33,8 +33,11 @@ struct FPlayerTuning
 	UPROPERTY(EditAnywhere, Category = "Stamina", meta = (ToolTip = "Per second while sprinting"))
 	float SprintDrain = 12.f;
 
-	UPROPERTY(EditAnywhere, Category = "Input", meta = (ToolTip = "Seconds an early press is remembered"))
+	UPROPERTY(EditAnywhere, Category = "Input", meta = (ToolTip = "Seconds an early press is remembered (from free, and a second dodge during a dodge); attack presses during an attack are held until its chain point"))
 	float InputBuffer = 0.18f;
+
+	UPROPERTY(EditAnywhere, Category = "Input", meta = (ToolTip = "A dodge pressed during an attack is held until free only if pressed after the attack's own hit window and within this many seconds of free; earlier it's dropped"))
+	float DodgeHoldBeforeFree = 0.45f;
 
 	UPROPERTY(EditAnywhere, Category = "Dodge")
 	float DodgeCost = 22.f;
@@ -174,7 +177,10 @@ enum class EPlayerCommand : uint8
 	PlayGuardBreak,
 	EndGuardBreak,      // the break's stagger is over: release its held pose
 	PlayDeflect,        // a perfect guard
-	PlayHeavyDeflect    // a perfect guard on a hit that would have knocked down
+	PlayHeavyDeflect,   // a perfect guard on a hit that would have knocked down
+	ChainHeavy,         // the normal heavy, started from another attack's chain point (it blends in longer)
+	StartLightRise,     // Light 1 out of the slam's landing crouch: it stands up first
+	RefuseInput         // a press was refused (a dodge mid-swing, a held attack meeting exhaustion): flash the stamina bar
 };
 
 using FPlayerCommands = TArray<EPlayerCommand, TInlineAllocator<4>>;
@@ -190,6 +196,8 @@ struct FPlayerFrame
 	bool bGuardHeld = false;        // the guard key is down
 	bool bGuardPressed = false;     // ...and went down this frame (only a fresh press opens a perfect window)
 	bool bAtChargeBranch = false;   // the heavy is held at its cocked pose, waiting for the charge decision (UAttackComponent::IsAtBranch)
+	bool bPastActive = false;       // the running attack's own hit window is over (its sample, on the attack's capped clock)
+	float TimeToFree = 100.f;       // attack-clock seconds until the running attack frees him
 };
 
 class BOSSTEST_API FPlayerActions
@@ -200,9 +208,13 @@ public:
 	FStaminaModel Stamina;
 	FInputBuffer Buffer;
 
-	// A light pressed during a light attack, or a second one while one is still waiting (a double-click
-	// during a dodge), is held for the chain point, however early it comes.
+	// Classifies a press the moment it's made (Step 4d). During an attack, a light or heavy is held until the
+	// chain point and a late dodge until free (an early dodge is dropped and takes back a held attack); during a
+	// dodge, a light or heavy is held until the lock. One slot: the latest press wins. Otherwise the buffer.
 	void Press(EPlayerInput Input);
+	// The running attack's sample for this frame, given before the frame's presses so they're classified against it
+	// (Tick also records it, for presses that arrive without a call to this).
+	void NoteAttack(bool bPastActive, float TimeToFree);
 	FPlayerCommands Tick(const FPlayerFrame& Frame);
 	FPlayerCommands OnHit(bool bKnockdown);   // a hit that landed (dodged hits never get here)
 	FPlayerCommands OnDeath();
@@ -225,6 +237,8 @@ public:
 
 private:
 	bool TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands& Out);
+	// From the running attack's chain point: the held light continues its line, the held heavy is the normal heavy.
+	bool TryStartChained(EPlayerInput Input, const FPlayerFrame& Frame, FPlayerCommands& Out);
 	bool TryStartAttack(float Cost, FPlayerCommands& Out);
 	void Enter(EPlayerState NewState);
 	void StopSprint(FPlayerCommands& Out);
@@ -236,9 +250,15 @@ private:
 	float StateTime = 0.f;
 	float SinceDodge = 100.f;     // since the last dodge or backstep started
 	int32 LightIndex = 0;
-	bool bLightAttack = false;    // the running attack is part of a light combo
-	bool bDodgeChain = false;     // ...the dodge combo, not the normal string
-	bool bChainQueued = false;    // a light clicked during a light attack (or a second during the dodge), held for the chain point
+	// What's running decides which light follows it at the chain point.
+	enum class EAttackLine : uint8 { None, Light, DodgeLight, Sprint, Heavy, Slam };
+	EAttackLine Line = EAttackLine::None;
+	EPlayerInput Held = EPlayerInput::None; // the one held press (Step 4d), latest wins
+	float HeldAge = 0.f;
+	bool bChainQueued = false;    // a second light during a dodge: the finisher, after the dodge light the first one starts
+	bool bRefused = false;        // a press was dropped; shown on the next tick
+	bool bLastPastActive = false; // the running attack's last sample, for classifying presses between ticks
+	float LastTimeToFree = 100.f;
 	int32 HealCharges = 2;
 	float HealRetryLeft = 0.f;
 	bool bDodgeHeld = false;      // a dodge pressed during a hit reaction, released when it ends

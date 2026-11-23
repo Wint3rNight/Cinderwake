@@ -136,7 +136,7 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Branch", meta = (ToolTip = "Real second where the attack waits for its owner to choose this or Branch Variant (the charge). -1 = no branch"))
 	float BranchAt = -1.f;
 
-	UPROPERTY(EditAnywhere, Category = "Branch", meta = (ToolTip = "Same clip; its pose at Branch At must match this attack's"))
+	UPROPERTY(EditAnywhere, Category = "Branch", meta = (ToolTip = "Same clip: its pose at Branch At must match this attack's. Another clip: it crossfades in and its own timeline starts at the branch"))
 	TObjectPtr<UAttackDefinition> BranchVariant;
 
 	// ---- Delivery ----

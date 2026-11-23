@@ -6,6 +6,12 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "Boss/BossCharacter.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "PhysicsEngine/PhysicsAsset.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimInstance.h"
 #include "Combat/AttackComponent.h"
 #include "Combat/CombatantComponent.h"
 #include "Engine/Engine.h"
@@ -439,6 +445,16 @@ bool FCheckCharged::Update()
 	const UAttackDefinition* Current = Player && Player->GetAttacks() ? Player->GetAttacks()->GetCurrent() : nullptr;
 	Test->TestTrue(FString::Printf(TEXT("holding RMB charged the heavy (current attack: %s)"), Current ? *Current->GetName() : TEXT("none")),
 		Current && Current->GetName() == TEXT("DA_ChargedHeavy"));
+	// Step 4d: the charge crossfades to its own clip and restarts its timeline at the 0.40 s branch.
+	if (Current && Player->GetAttacks())
+	{
+		Test->TestTrue(FString::Printf(TEXT("its timeline restarted at the switch (%.2f s in)"), Player->GetAttacks()->GetElapsed()), Player->GetAttacks()->GetElapsed() < 0.40f);
+		const UAnimInstance* Anim = Player->GetMesh()->GetAnimInstance();
+		const UAnimMontage* Playing = Anim ? Anim->GetCurrentActiveMontage() : nullptr;
+		const UAnimSequenceBase* Clip = Playing && Playing->SlotAnimTracks.Num() > 0 && Playing->SlotAnimTracks[0].AnimTrack.AnimSegments.Num() > 0
+			? Playing->SlotAnimTracks[0].AnimTrack.AnimSegments[0].GetAnimReference() : nullptr;
+		Test->TestTrue(FString::Printf(TEXT("and Melee_B is what's playing (%s)"), Clip ? *Clip->GetName() : TEXT("none")), Clip && Clip->GetName() == TEXT("Melee_B"));
+	}
 	return true;
 }
 
@@ -532,6 +548,265 @@ bool FSmokePerfectGuard::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(0.3f));
 	ADD_LATENT_AUTOMATION_COMMAND(FSimulateKey(EKeys::Q, false));
 	ADD_LATENT_AUTOMATION_COMMAND(FCheckNoTimeouts(this));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- Death: the clips end mid-fall, so a ragdoll finishes it; R puts both fighters back ----
+
+struct FDeathWatch
+{
+	double Start = 0.0;
+	bool bPlayerDead = false;
+	bool bBossDead = false;
+	float FloorZ = 0.f;
+	FVector PlayerMeshRelative = FVector::ZeroVector;
+	FVector BossMeshRelative = FVector::ZeroVector;
+};
+
+namespace
+{
+	APlayerCharacter* SmokePlayer(UWorld* World)
+	{
+		APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+		return PC ? Cast<APlayerCharacter>(PC->GetPawn()) : nullptr;
+	}
+
+	ABossCharacter* SmokeBoss(UWorld* World)
+	{
+		if (World)
+		{
+			if (TActorIterator<ABossCharacter> It(World); It)
+			{
+				return *It;
+			}
+		}
+		return nullptr;
+	}
+
+	float HeadAboveFloor(const ACharacter* Character, float FloorZ)
+	{
+		return Character->GetMesh()->GetSocketLocation(TEXT("head")).Z - FloorZ;
+	}
+}
+
+// Kills both fighters with one lethal hit each (retrying while the boss's intro keeps him immune).
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FKillBoth, FAutomationTestBase*, Test, TSharedRef<FDeathWatch>, Watch);
+bool FKillBoth::Update()
+{
+	FDeathWatch& W = Watch.Get();
+	if (W.Start <= 0.0)
+	{
+		W.Start = FPlatformTime::Seconds();
+	}
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	if (FPlatformTime::Seconds() - W.Start > 20.0)
+	{
+		Test->AddError(TEXT("couldn't kill both fighters in 20 s"));
+		return true;
+	}
+	if (W.FloorZ == 0.f)
+	{
+		W.FloorZ = Player->GetActorLocation().Z - Player->GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+		W.PlayerMeshRelative = Player->GetMesh()->GetRelativeLocation();
+		W.BossMeshRelative = Boss->GetMesh()->GetRelativeLocation();
+	}
+	FCombatHitContext Lethal;
+	Lethal.Damage = 100000.f;
+	FHitRegistry Registry;
+	if (!W.bPlayerDead)
+	{
+		Lethal.AttackInstanceId = 900001;
+		W.bPlayerDead = Player->FindComponentByClass<UCombatantComponent>()->ReceiveHit(Lethal, Registry, Boss).bKilled;
+	}
+	if (!W.bBossDead)
+	{
+		Lethal.AttackInstanceId = 900002;
+		W.bBossDead = Boss->FindComponentByClass<UCombatantComponent>()->ReceiveHit(Lethal, Registry, Player).bKilled;
+	}
+	return W.bPlayerDead && W.bBossDead;
+}
+
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FCheckBodiesOnFloor, FAutomationTestBase*, Test, TSharedRef<FDeathWatch>, Watch);
+bool FCheckBodiesOnFloor::Update()
+{
+	const FDeathWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	const APlayerCharacter* Player = SmokePlayer(World);
+	const ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	Test->TestTrue(TEXT("Feng Mao's body is a ragdoll after his death clip"), Player->GetMesh()->IsSimulatingPhysics());
+	Test->TestTrue(FString::Printf(TEXT("and his head lies near the floor (%.0f cm up)"), HeadAboveFloor(Player, W.FloorZ)), HeadAboveFloor(Player, W.FloorZ) < 45.f);
+	Test->TestTrue(TEXT("Sevarog's body is a ragdoll after his"), Boss->GetMesh()->IsSimulatingPhysics());
+	const UPhysicsAsset* BossPhysics = Boss->GetMesh()->GetPhysicsAsset();
+	Test->TestTrue(FString::Printf(TEXT("on the generated ragdoll asset (%s)"), BossPhysics ? *BossPhysics->GetName() : TEXT("none")),
+		BossPhysics && BossPhysics->GetName() == TEXT("PA_SevarogRagdoll"));
+	Test->TestTrue(FString::Printf(TEXT("and his head lies near the floor (%.0f cm up)"), HeadAboveFloor(Boss, W.FloorZ)), HeadAboveFloor(Boss, W.FloorZ) < 80.f);
+	// DIAGNOSTIC (temporary): bodies, joints and spread of each ragdoll.
+	for (const ACharacter* C : { static_cast<const ACharacter*>(Player), static_cast<const ACharacter*>(Boss) })
+	{
+		const USkeletalMeshComponent* Mesh = C->GetMesh();
+		const FVector Pelvis = Mesh->GetSocketLocation(TEXT("pelvis"));
+		float Far = 0.f;
+		FString FarName;
+		for (const FBodyInstance* Body : Mesh->Bodies)
+		{
+			if (Body && Body->BodySetup.IsValid())
+			{
+				const float D = FVector::Dist(Body->GetUnrealWorldTransform().GetLocation(), Pelvis);
+				if (D > Far) { Far = D; FarName = Body->BodySetup->BoneName.ToString(); }
+			}
+		}
+		Test->AddInfo(FString::Printf(TEXT("DIAG %s: physics asset %s, %d bodies, %d constraints, farthest body %s at %.0f cm from the pelvis, head-pelvis %.0f cm"),
+			*C->GetName(), Mesh->GetPhysicsAsset() ? *Mesh->GetPhysicsAsset()->GetName() : TEXT("none"), Mesh->Bodies.Num(), Mesh->Constraints.Num(), *FarName, Far,
+			FVector::Dist(Mesh->GetSocketLocation(TEXT("head")), Pelvis)));
+	}
+	return true;
+}
+
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FCheckBodiesRestored, FAutomationTestBase*, Test, TSharedRef<FDeathWatch>, Watch);
+bool FCheckBodiesRestored::Update()
+{
+	const FDeathWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	const APlayerCharacter* Player = SmokePlayer(World);
+	const ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	for (const ACharacter* C : { static_cast<const ACharacter*>(Player), static_cast<const ACharacter*>(Boss) })
+	{
+		const USkeletalMeshComponent* Mesh = C->GetMesh();
+		Test->TestFalse(FString::Printf(TEXT("%s: R ends the ragdoll"), *C->GetName()), Mesh->IsSimulatingPhysics());
+		Test->TestTrue(FString::Printf(TEXT("%s: the mesh is back on the capsule"), *C->GetName()), Mesh->GetAttachParent() == C->GetCapsuleComponent());
+		const FVector Want = C == Player ? W.PlayerMeshRelative : W.BossMeshRelative;
+		Test->TestTrue(FString::Printf(TEXT("%s: in its old place"), *C->GetName()), Mesh->GetRelativeLocation().Equals(Want, 1.f));
+		Test->TestEqual(FString::Printf(TEXT("%s: its collision profile is back"), *C->GetName()), Mesh->GetCollisionProfileName(), FName(TEXT("CharacterMesh")));
+	}
+	const UPhysicsAsset* BossPhysics = Boss->GetMesh()->GetPhysicsAsset();
+	Test->TestTrue(FString::Printf(TEXT("Sevarog is back on the Paragon physics asset (%s)"), BossPhysics ? *BossPhysics->GetName() : TEXT("none")),
+		BossPhysics && BossPhysics->GetName() == TEXT("Sevarog_Extents"));
+	Test->TestTrue(FString::Printf(TEXT("Feng Mao stands again (head %.0f cm up)"), HeadAboveFloor(Player, W.FloorZ)), HeadAboveFloor(Player, W.FloorZ) > 140.f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeDeathRagdoll, "BossTest.Smoke.DeathRagdollAndReset", SmokeTestFlags)
+bool FSmokeDeathRagdoll::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FDeathWatch> Watch = MakeShared<FDeathWatch>();
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(3.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FKillBoth(this, Watch));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(3.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FCheckBodiesOnFloor(this, Watch));
+	ADD_LATENT_AUTOMATION_COMMAND(FSimulateKey(EKeys::R, true));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(0.5f));
+	ADD_LATENT_AUTOMATION_COMMAND(FSimulateKey(EKeys::R, false));
+	ADD_LATENT_AUTOMATION_COMMAND(FCheckBodiesRestored(this, Watch));
+	// A second death after the reset ragdolls just the same.
+	const TSharedRef<FDeathWatch> Again = MakeShared<FDeathWatch>();
+	ADD_LATENT_AUTOMATION_COMMAND(FKillBoth(this, Again));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(3.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FCheckBodiesOnFloor(this, Again));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- Step 4d, played live: light, light, heavy from early presses ----
+
+// Presses LMB, LMB again once Light 1 is running, then RMB once Light 2 is (released at once, so no charge),
+// and checks the heavy comes out of Light 2's chain point.
+struct FChainWatch
+{
+	double Start = 0.0;
+	int32 Step = 0;
+	FString Seen;
+};
+
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FPlayLightLightHeavy, FAutomationTestBase*, Test, TSharedRef<FChainWatch>, Watch);
+bool FPlayLightLightHeavy::Update()
+{
+	FChainWatch& W = Watch.Get();
+	if (W.Start <= 0.0)
+	{
+		W.Start = FPlatformTime::Seconds();
+	}
+	UWorld* World = PlayWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	const APlayerCharacter* Player = SmokePlayer(World);
+	if (!PC || !Player)
+	{
+		Test->AddError(TEXT("no player"));
+		return true;
+	}
+	if (FPlatformTime::Seconds() - W.Start > 6.0)
+	{
+		Test->AddError(FString::Printf(TEXT("light, light, heavy never got to the heavy (attacks seen: %s)"), *W.Seen));
+		return true;
+	}
+	const UAttackDefinition* Current = Player->GetAttacks() ? Player->GetAttacks()->GetCurrent() : nullptr;
+	const FString Name = Current ? Current->GetName() : FString();
+	if (!Name.IsEmpty() && !W.Seen.EndsWith(Name))
+	{
+		W.Seen += W.Seen.IsEmpty() ? Name : TEXT(" > ") + Name;
+	}
+	auto Tap = [PC](const FKey& Key)
+	{
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(Key, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(Key, IE_Released, 0.f));
+	};
+	switch (W.Step)
+	{
+	case 0:
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::LeftMouseButton, IE_Pressed, 1.f));
+		W.Step = 1;
+		return false;
+	case 1:
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::LeftMouseButton, IE_Released, 0.f));
+		if (Name == TEXT("DA_Light1"))
+		{
+			Tap(EKeys::LeftMouseButton); // early: held until Light 1's chain point
+			W.Step = 2;
+		}
+		return false;
+	case 2:
+		if (Name == TEXT("DA_Light2"))
+		{
+			Tap(EKeys::RightMouseButton); // early: held until Light 2's chain point
+			W.Step = 3;
+		}
+		return false;
+	default:
+		if (Name == TEXT("DA_Heavy"))
+		{
+			Test->TestTrue(FString::Printf(TEXT("light, light, heavy came out in order (%s)"), *W.Seen), W.Seen == TEXT("DA_Light1 > DA_Light2 > DA_Heavy"));
+			return true;
+		}
+		return false;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeLightLightHeavy, "BossTest.Smoke.LightLightHeavy", SmokeTestFlags)
+bool FSmokeLightLightHeavy::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FPlayLightLightHeavy(this, MakeShared<FChainWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }

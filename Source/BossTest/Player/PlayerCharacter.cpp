@@ -121,6 +121,10 @@ void APlayerCharacter::BeginPlay()
 		UE_LOG(LogTemp, Error, TEXT("BossTest: DA_Heavy's branch variant isn't the charged heavy set on %s; the charge won't match"), *GetName());
 	}
 
+	if (!LightRiseAttack)
+	{
+		UE_LOG(LogTemp, Error, TEXT("BossTest: %s is missing its Step 4d data (the stand-up Light 1); run Docs/tools/setup_player.py"), *GetName());
+	}
 	if (!ChargedHeavyAttack || !SprintAttack || !GuardRaiseClip || !GuardLoopClip || !BlockClip || !GuardBreakClip)
 	{
 		UE_LOG(LogTemp, Error, TEXT("BossTest: %s is missing its Step 4b data (charged heavy, sprint attack or guard clips); run Docs/tools/setup_player.py"), *GetName());
@@ -161,10 +165,15 @@ void APlayerCharacter::Tick(float DeltaSeconds)
 
 	FPlayerFrame Frame;
 	Frame.Dt = DeltaSeconds;
-	ReadInput(Frame);
 	Frame.bAttackRunning = Attacks->IsAttacking();
 	Frame.bChainOpen = Frame.bAttackRunning && Attacks->GetSample().bChainOpen;
 	Frame.bAtChargeBranch = Attacks->IsAtBranch();
+	// The attack's own clock (capped at 1/30 s a step), so a slow frame rate can't drop a dodge pressed in time.
+	// Given to the rules before this frame's presses (the attack has already ticked this frame).
+	Frame.bPastActive = Frame.bAttackRunning && Attacks->GetSample().Phase >= EAttackPhase::Recovery;
+	Frame.TimeToFree = Frame.bAttackRunning ? Attacks->GetTimeToFree() : 0.f;
+	Actions.NoteAttack(Frame.bPastActive, Frame.TimeToFree);
+	ReadInput(Frame);
 	const bool bHadWindow = Actions.HasPerfectWindow();
 	Execute(Actions.Tick(Frame));
 	if (!bHadWindow && Actions.HasPerfectWindow())
@@ -242,6 +251,16 @@ void APlayerCharacter::Execute(const FPlayerCommands& Commands)
 		case EPlayerCommand::StartHeavy:
 			StartAttack(HeavyAttack);
 			break;
+		case EPlayerCommand::ChainHeavy:
+			// Out of another attack's follow-through: a longer, eased blend turns it into the heavy's windup.
+			StartAttack(HeavyAttack, ChainedHeavyBlend, true);
+			break;
+		case EPlayerCommand::StartLightRise:
+			StartAttack(LightRiseAttack ? LightRiseAttack.Get() : (LightAttacks.IsValidIndex(0) ? LightAttacks[0].Get() : nullptr), LightRiseBlend, true);
+			break;
+		case EPlayerCommand::RefuseInput:
+			StaminaFlashUntil = GetWorld()->GetTimeSeconds() + 0.25;
+			break;
 		case EPlayerCommand::StartDodgeLight:
 			StartAttack(DodgeLightAttacks.IsValidIndex(Actions.GetLightIndex()) ? DodgeLightAttacks[Actions.GetLightIndex()].Get() : nullptr);
 			break;
@@ -286,7 +305,7 @@ void APlayerCharacter::Execute(const FPlayerCommands& Commands)
 			PlayReaction(true);
 			break;
 		case EPlayerCommand::BeginCharge:
-			// Same clip, same timeline: the heavy turns into the charged heavy at its cocked pose.
+			// The heavy turns into the charged heavy: a crossfade to its own clip, whose timeline starts here.
 			if (Attacks->ResolveBranch(true))
 			{
 				if (ChargeEffect)
@@ -357,6 +376,8 @@ void APlayerCharacter::Execute(const FPlayerCommands& Commands)
 				{
 					Instance->bEnableAutoBlendOut = false;
 				}
+				// The clip ends mid-fall (Paragon handed over to physics here): a ragdoll finishes it.
+				Combatant->RagdollAfter(ClipMontage ? ClipMontage->GetPlayLength() : DeathClip->GetPlayLength());
 			}
 			SetEvent(TEXT("YOU DIED  (R to retry)"), 1000.f);
 			break;
@@ -381,7 +402,12 @@ void APlayerCharacter::FaceForAction()
 	}
 }
 
-void APlayerCharacter::StartAttack(UAttackDefinition* Definition)
+bool APlayerCharacter::IsStaminaFlashing() const
+{
+	return GetWorld() && GetWorld()->GetTimeSeconds() < StaminaFlashUntil;
+}
+
+void APlayerCharacter::StartAttack(UAttackDefinition* Definition, float BlendIn, bool bEasedBlend)
 {
 	// Snap to the target or the stick at the start; no steering during the attack (spec section 4).
 	// Without lock-on, a target roughly in front still pulls the swing toward him (a soft lock), so
@@ -396,7 +422,7 @@ void APlayerCharacter::StartAttack(UAttackDefinition* Definition)
 			SetActorRotation(FRotator(0.f, To.Rotation().Yaw, 0.f));
 		}
 	}
-	Attacks->StartAttack(Definition, Target);
+	Attacks->StartAttack(Definition, Target, BlendIn, bEasedBlend);
 }
 
 AActor* APlayerCharacter::LungeTarget() const
@@ -875,7 +901,12 @@ void APlayerCharacter::OnHitLanded(const FHitOutcome& Outcome, AActor* Victim)
 {
 	// Damage dealt reclaims soul fragments (spec section 8).
 	Combatant->State.Health.OnDamageDealtToBoss(Outcome.DamageDealt);
-	CameraKick(6.f, 0.12f);
+	// "Tick, tick, thud": lights don't kick the camera; the heavy does, the charged heavy and the slam harder.
+	if (const UAttackDefinition* Landed = Attacks->GetCurrent(); Landed && Landed->bHeavy)
+	{
+		const bool bBig = Landed == ChargedHeavyAttack || Landed == DodgeHeavyAttack;
+		CameraKick(bBig ? 9.f : 6.f, bBig ? 0.15f : 0.12f);
+	}
 	SetEvent(FString::Printf(TEXT("you hit  %.0f%s"), Outcome.DamageDealt, Outcome.Poise == EPoiseOutcome::Stagger ? TEXT("  STAGGER") : TEXT("")), 1.2f);
 }
 

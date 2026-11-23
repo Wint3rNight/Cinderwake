@@ -61,8 +61,9 @@ struct FBranchStep
 };
 FBranchStep StepToBranch(float Elapsed, float Step, float BranchAt, bool bResolved);
 
-// A branch must be seamless and come before anything happens: same clip, the same pose at BranchAt in both
-// timings, and at least 1/30 s before the attack's windup ends. Messages start with "Error:".
+// A branch must come before anything happens: at least 1/30 s before the attack's windup ends. On the same clip it
+// must also be seamless (the same pose at BranchAt in both timings); a variant on another clip restarts its own
+// timeline at the branch with a crossfade, so its pose is free. Messages start with "Error:".
 TArray<FString> ValidateBranch(const FAttackTiming& Mine, const FAttackTiming& Variant, bool bSameClip, float BranchAt);
 
 // Largest step an attack advances in one tick (1/30 s), so a hitch can never jump over an active window.

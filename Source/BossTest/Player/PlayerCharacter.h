@@ -46,11 +46,20 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The leaping slam: a heavy that comes out 0.50-0.90 s after a dodge started"))
 	TObjectPtr<UAttackDefinition> DodgeHeavyAttack;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The heavy, charged: same clip as HeavyAttack, with a hold at the cocked pose. Switched to when RMB is still held at the cocked pose"))
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The heavy, charged: switched to (a crossfade to its own clip, Melee_B's deep gather and leap) when RMB is still held at the heavy's branch, down since the heavy started"))
 	TObjectPtr<UAttackDefinition> ChargedHeavyAttack;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "A light after sprinting for a quarter of a second"))
 	TObjectPtr<UAttackDefinition> SprintAttack;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Light 1 out of the slam's landing crouch: a longer windup so he stands up first (Step 4d)"))
+	TObjectPtr<UAttackDefinition> LightRiseAttack;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Seconds a heavy started from another attack's chain point blends in (eased); a fresh attack uses 0.08"))
+	float ChainedHeavyBlend = 0.15f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Seconds the stand-up Light 1 blends in out of the slam's crouch (eased)"))
+	float LightRiseBlend = 0.22f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Glow on the blade while the heavy charges"))
 	TObjectPtr<UParticleSystem> ChargeEffect;
@@ -191,6 +200,7 @@ public:
 	// ---- Read by the HUD and the debug controller ----
 	const FPlayerActions& GetActions() const { return Actions; }
 	const UCombatantComponent* GetCombatant() const { return Combatant; }
+	bool IsStaminaFlashing() const;   // a press was just refused (the HUD flashes the stamina bar)
 	UAttackComponent* GetAttacks() const { return Attacks; }
 	FString DebugLine() const;
 	FString LastEventText() const { return LastEventTime > 0.f ? LastEvent : FString(); }
@@ -217,9 +227,10 @@ protected:
 	TObjectPtr<ULockOnComponent> LockOn;
 
 private:
+	double StaminaFlashUntil = 0.0; // world time; a refused press flashes the stamina bar until then
 	void ReadInput(FPlayerFrame& Frame);
 	void Execute(const FPlayerCommands& Commands);
-	void StartAttack(UAttackDefinition* Definition);
+	void StartAttack(UAttackDefinition* Definition, float BlendIn = 0.08f, bool bEasedBlend = false);
 	void StartDodge(bool bBackstep);
 	void EndDodgePush();
 	void TickEvadeVisuals();

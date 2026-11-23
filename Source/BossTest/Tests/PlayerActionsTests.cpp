@@ -40,6 +40,7 @@ namespace
 		FFrameBuilder& Guard() { F.bGuardHeld = true; return *this; }
 		FFrameBuilder& GuardPressed() { F.bGuardHeld = true; F.bGuardPressed = true; return *this; }
 		FFrameBuilder& AtBranch() { F.bAtChargeBranch = true; return *this; }
+		FFrameBuilder& PastActive(float ToFree) { F.bPastActive = true; F.TimeToFree = ToFree; return *this; }
 		operator FPlayerFrame() const { return F; }
 	};
 	FFrameBuilder Frame(float Dt) { return FFrameBuilder(Dt); }
@@ -105,8 +106,9 @@ bool FActionsFreeOnTheFrameAttackEnds::RunTest(const FString& Parameters)
 {
 	FPlayerActions A = MakeActions();
 	PressNow(A, EPlayerInput::Light);
+	A.Tick(Frame(0.25f).Running().PastActive(0.10f)); // after the swing (Step 4d: a dodge in the windup is dropped)
 	A.Press(EPlayerInput::Dodge);
-	TestTrue(TEXT("recovery is the commitment: no dodge yet"), A.Tick(Frame(0.05f).Move().Running()).IsEmpty());
+	TestTrue(TEXT("recovery is the commitment: no dodge yet"), A.Tick(Frame(0.05f).Move().Running().PastActive(0.05f)).IsEmpty());
 	TestTrue(TEXT("the dodge comes out on the tick the attack ends"), Same(A.Tick(Frame(0.05f).Move()), { C::StartDodge }));
 	return true;
 }
@@ -237,8 +239,9 @@ bool FActionsDodgeLightChains::RunTest(const FString& Parameters)
 	TestTrue(TEXT("one press: one hit, nothing more on its own"), A.Tick(Frame(0.1f).Running().Chain()).IsEmpty());
 	TestTrue(TEXT("pressing again makes it a combo: the dodge finisher, not Light 2"), Same(PressNow(A, EPlayerInput::Light, Frame(0.f).Running().Chain()), { C::StartDodgeLight }));
 	TestEqual(TEXT("the finisher"), A.GetLightIndex(), 1);
-	TestTrue(TEXT("the combo ends there: no third hit"), PressNow(A, EPlayerInput::Light, Frame(0.f).Running().Chain()).IsEmpty());
-	TestEqual(TEXT("28 + 12 + 16 spent"), A.Stamina.Current, 64.f, ActionsTol);
+	// Step 4d: a third press carries on into Light 2 of the normal string (the evade is three hits).
+	TestTrue(TEXT("a third press: Light 2"), Same(PressNow(A, EPlayerInput::Light, Frame(0.f).Running().Chain()), { C::StartLight }) && A.GetLightIndex() == 1);
+	TestEqual(TEXT("28 + 12 + 16 + 14 spent"), A.Stamina.Current, 50.f, ActionsTol);
 	return true;
 }
 
@@ -976,6 +979,278 @@ bool FActionsAttackThroughHeavyDeflect::RunTest(const FString& Parameters)
 	TestTrue(TEXT("still in the stun at 0.29 s"), A.GetState() == EPlayerState::BlockStun);
 	const FPlayerCommands Out = A.Tick(Frame(0.01f).Guard());
 	TestTrue(TEXT("the light comes out at 0.30 s"), Has(Out, C::StartLight) && A.GetState() == EPlayerState::Attacking);
+	return true;
+}
+
+// ---- Step 4d: Elden Ring flow (one chain rule, held presses) ----
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsLightLightHeavy, "BossTest.Player.Actions.HeldHeavyChainsFromLight", ActionsTestFlags)
+bool FActionsLightLightHeavy::RunTest(const FString& Parameters)
+{
+	// R1 R1 R2: Light 1, Light 2 from its chain point, then the heavy from Light 2's.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Tick(Frame(0.10f).Running());
+	A.Press(EPlayerInput::Light);
+	A.Tick(Frame(0.27f).Running());
+	TestTrue(TEXT("held until Light 1's chain point"), A.GetLightIndex() == 0);
+	TestTrue(TEXT("Light 2 at the chain point"), Same(A.Tick(Frame(0.01f).Running().Chain()), { C::StartLight }) && A.GetLightIndex() == 1);
+	A.Tick(Frame(0.10f).Running());
+	A.Press(EPlayerInput::Heavy);
+	const float Before = A.Stamina.Current;
+	TestTrue(TEXT("the heavy comes out of Light 2's chain point"), Has(A.Tick(Frame(0.18f).Running().Chain()), C::ChainHeavy));
+	TestEqual(TEXT("at the heavy's own cost"), Before - A.Stamina.Current, 32.f, ActionsTol);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHeavyIntoLight1, "BossTest.Player.Actions.HeavyChainsIntoLight1", ActionsTestFlags)
+bool FActionsHeavyIntoLight1::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	A.Tick(Frame(0.50f).Running());
+	A.Press(EPlayerInput::Light);
+	A.Tick(Frame(0.40f).Running());
+	TestTrue(TEXT("held until the heavy's chain point"), A.GetState() == EPlayerState::Attacking);
+	const FPlayerCommands Out = A.Tick(Frame(0.05f).Running().Chain());
+	TestTrue(TEXT("Light 1 out of the heavy"), Same(Out, { C::StartLight }) && A.GetLightIndex() == 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsFinisherIntoLight2, "BossTest.Player.Actions.FinisherChainsIntoLight2", ActionsTestFlags)
+bool FActionsFinisherIntoLight2::RunTest(const FString& Parameters)
+{
+	// The evade as three hits: the dodge light, the finisher, then Light 2 of the normal string.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.30f));
+	A.Press(EPlayerInput::Light);
+	TestTrue(TEXT("the dodge light at the lock"), Has(A.Tick(Frame(0.20f)), C::StartDodgeLight));
+	A.Press(EPlayerInput::Light);
+	TestTrue(TEXT("the finisher at its chain point"), Same(A.Tick(Frame(0.32f).Running().Chain()), { C::StartDodgeLight }) && A.GetLightIndex() == 1);
+	A.Press(EPlayerInput::Light);
+	TestTrue(TEXT("Light 2 out of the finisher"), Same(A.Tick(Frame(0.55f).Running().Chain()), { C::StartLight }) && A.GetLightIndex() == 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsSlamIntoRise, "BossTest.Player.Actions.SlamChainsIntoRise", ActionsTestFlags)
+bool FActionsSlamIntoRise::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.30f));
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("the slam at the lock"), Has(A.Tick(Frame(0.20f).HeavyHeld()), C::StartDodgeHeavy));
+	A.Press(EPlayerInput::Light);
+	TestTrue(TEXT("out of the landing crouch, the stand-up Light 1"), Same(A.Tick(Frame(1.05f).Running().Chain()), { C::StartLightRise }) && A.GetLightIndex() == 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHeldLatestWins, "BossTest.Player.Actions.HeldPressLatestWins", ActionsTestFlags)
+bool FActionsHeldLatestWins::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Press(EPlayerInput::Light);
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("light then heavy: the heavy"), Has(A.Tick(Frame(0.38f).Running().Chain()), C::ChainHeavy));
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Light);
+	B.Press(EPlayerInput::Heavy);
+	B.Press(EPlayerInput::Light);
+	TestTrue(TEXT("heavy then light: the light"), Same(B.Tick(Frame(0.38f).Running().Chain()), { C::StartLight }));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsEarlyDodgeDropped, "BossTest.Player.Actions.EarlyDodgeDroppedAndClears", ActionsTestFlags)
+bool FActionsEarlyDodgeDropped::RunTest(const FString& Parameters)
+{
+	// A panic dodge while your own blade is moving: ignored, the refusal shows, and it takes back the queued slash.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Tick(Frame(0.10f).Running());
+	A.Press(EPlayerInput::Light);
+	A.Press(EPlayerInput::Dodge);
+	TestTrue(TEXT("the refusal is shown"), Has(A.Tick(Frame(0.01f).Running()), C::RefuseInput));
+	TestTrue(TEXT("no light at the chain point"), A.Tick(Frame(0.27f).Running().Chain()).IsEmpty());
+	TestTrue(TEXT("and no dodge when he's free"), A.Tick(Frame(0.32f)).IsEmpty() && A.GetState() == EPlayerState::Free);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsLateDodgeHeld, "BossTest.Player.Actions.LateDodgeHeldToFree", ActionsTestFlags)
+bool FActionsLateDodgeHeld::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Tick(Frame(0.26f).Running().PastActive(0.44f));
+	A.Press(EPlayerInput::Dodge);
+	A.Tick(Frame(0.20f).Running().Chain().PastActive(0.24f));
+	TestTrue(TEXT("0.44 s before free, after the swing: held, out the moment he's free"), Has(A.Tick(Frame(0.24f).Move()), C::StartDodge));
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Light);
+	B.Tick(Frame(0.24f).Running().PastActive(0.46f));
+	B.Press(EPlayerInput::Dodge);
+	TestTrue(TEXT("0.46 s before free: dropped"), Has(B.Tick(Frame(0.01f).Running().PastActive(0.45f)), C::RefuseInput));
+	TestFalse(TEXT("so no dodge at free"), Has(B.Tick(Frame(0.45f).Move()), C::StartDodge));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsGuardClearsHeld, "BossTest.Player.Actions.GuardPressClearsHeld", ActionsTestFlags)
+bool FActionsGuardClearsHeld::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Press(EPlayerInput::Light);
+	A.Tick(Frame(0.10f).Running().GuardPressed());
+	TestFalse(TEXT("a fresh guard press takes back the queued light"), Has(A.Tick(Frame(0.28f).Running().Chain()), C::StartLight));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsExhaustedHeldDropped, "BossTest.Player.Actions.ExhaustedHeldDropped", ActionsTestFlags)
+bool FActionsExhaustedHeldDropped::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Stamina.Spend(1000.f); // exhausted
+	A.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("nothing at the chain point, and the refusal shows"), Same(A.Tick(Frame(0.38f).Running().Chain()), { C::RefuseInput }));
+	A.Tick(Frame(0.32f)); // free
+	A.Tick(Frame(3.0f));  // long after exhaustion ends
+	TestTrue(TEXT("and nothing later"), A.GetState() == EPlayerState::Free);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsRePressNoCharge, "BossTest.Player.Actions.RePressDoesntCharge", ActionsTestFlags)
+bool FActionsRePressNoCharge::RunTest(const FString& Parameters)
+{
+	// Released and pressed again before the branch: that's queuing a second heavy, not charging this one.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	A.Tick(Frame(0.10f).Running());
+	A.Press(EPlayerInput::Heavy);
+	A.Tick(Frame(0.20f).Running().HeavyHeld());
+	TestFalse(TEXT("no charge"), Has(A.Tick(Frame(0.10f).Running().HeavyHeld().AtBranch()), C::BeginCharge));
+	// A chained heavy whose button stays down from the press does charge.
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Light);
+	B.Press(EPlayerInput::Heavy);
+	B.Tick(Frame(0.38f).Running().Chain().HeavyHeld());
+	B.Tick(Frame(0.30f).Running().HeavyHeld());
+	const float Before = B.Stamina.Current;
+	TestTrue(TEXT("held through the chained heavy: it charges"), Has(B.Tick(Frame(0.10f).Running().HeavyHeld().AtBranch()), C::BeginCharge));
+	TestEqual(TEXT("for 12 more"), Before - B.Stamina.Current, 12.f, ActionsTol);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsChainedHeavyNotSlam, "BossTest.Player.Actions.ChainedHeavyIsNotSlam", ActionsTestFlags)
+bool FActionsChainedHeavyNotSlam::RunTest(const FString& Parameters)
+{
+	// Dodge light into heavy starts 0.82 s after the dodge, inside the dodge-attack window: still the normal heavy.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.30f));
+	A.Press(EPlayerInput::Light);
+	A.Tick(Frame(0.20f));
+	A.Press(EPlayerInput::Heavy);
+	const FPlayerCommands Out = A.Tick(Frame(0.32f).Running().Chain().HeavyHeld());
+	TestTrue(TEXT("the heavy, not the slam"), Has(Out, C::ChainHeavy) && !Has(Out, C::StartDodgeHeavy));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsDodgeHeavyPrecedence, "BossTest.Player.Actions.DodgeThenHeavyPrecedence", ActionsTestFlags)
+bool FActionsDodgeHeavyPrecedence::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.10f));
+	A.Press(EPlayerInput::Heavy);
+	A.Tick(Frame(0.30f));
+	A.Press(EPlayerInput::Dodge);
+	TestTrue(TEXT("heavy then dodge: the dodge, the later press"), Has(A.Tick(Frame(0.10f).Move()), C::StartDodge));
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Dodge, Frame(0.f).Move());
+	B.Tick(Frame(0.20f));
+	B.Press(EPlayerInput::Dodge);
+	B.Tick(Frame(0.10f));
+	B.Press(EPlayerInput::Heavy);
+	TestTrue(TEXT("dodge then heavy: the slam"), Has(B.Tick(Frame(0.20f).HeavyHeld()), C::StartDodgeHeavy));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHitClearsHeld, "BossTest.Player.Actions.HitClearsHeld", ActionsTestFlags)
+bool FActionsHitClearsHeld::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Press(EPlayerInput::Light);
+	A.OnHit(false);
+	TestTrue(TEXT("a held attack never comes out after the reaction"), A.Tick(Frame(0.35f)).IsEmpty() && A.GetState() == EPlayerState::Free);
+	// A held dodge younger than 0.18 s survives the hit; an older one doesn't.
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Light);
+	B.Tick(Frame(0.30f).Running().PastActive(0.40f));
+	B.Press(EPlayerInput::Dodge);
+	B.Tick(Frame(0.10f).Running().PastActive(0.30f));
+	B.OnHit(false);
+	TestTrue(TEXT("a 0.10 s old dodge comes out when the reaction ends"), Has(B.Tick(Frame(0.35f).Move()), C::StartDodge));
+	FPlayerActions D = MakeActions();
+	PressNow(D, EPlayerInput::Light);
+	D.Tick(Frame(0.30f).Running().PastActive(0.40f));
+	D.Press(EPlayerInput::Dodge);
+	D.Tick(Frame(0.30f).Running().PastActive(0.10f));
+	D.OnHit(false);
+	TestFalse(TEXT("a 0.30 s old one is cleared"), Has(D.Tick(Frame(0.35f).Move()), C::StartDodge));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsPressOnFreeFrame, "BossTest.Player.Actions.PressOnFreeFrameStillChains", ActionsTestFlags)
+bool FActionsPressOnFreeFrame::RunTest(const FString& Parameters)
+{
+	// The attack ends before the character reads input, so a press can arrive while the model still says Attacking
+	// on the frame he's free. It must still come out, in the attack's line.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Tick(Frame(0.69f).Running());
+	A.Press(EPlayerInput::Light);
+	const FPlayerCommands Out = A.Tick(Frame(0.01f));
+	TestTrue(TEXT("Light 2, on the free frame"), Has(Out, C::StartLight) && A.GetLightIndex() == 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsRePressSameFrame, "BossTest.Player.Actions.RePressInOneFrameDoesntCharge", ActionsTestFlags)
+bool FActionsRePressSameFrame::RunTest(const FString& Parameters)
+{
+	// Released and pressed again between two ticks (a quick tap at 30 fps): the tick never sees RMB up, but a new
+	// press is still a queue, not a charge.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heavy, Frame(0.f).HeavyHeld());
+	A.Press(EPlayerInput::Heavy);
+	TestFalse(TEXT("no charge"), Has(A.Tick(Frame(0.40f).Running().HeavyHeld().AtBranch()), C::BeginCharge));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsGuardDuringDodge, "BossTest.Player.Actions.GuardDuringDodgeClearsHeld", ActionsTestFlags)
+bool FActionsGuardDuringDodge::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.20f));
+	A.Press(EPlayerInput::Light);
+	A.Tick(Frame(0.10f).GuardPressed());
+	TestFalse(TEXT("a guard press during the dodge takes back the held light"), Has(A.Tick(Frame(0.20f)), C::StartDodgeLight));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsExhaustedAtLock, "BossTest.Player.Actions.ExhaustedAtLockRefused", ActionsTestFlags)
+bool FActionsExhaustedAtLock::RunTest(const FString& Parameters)
+{
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.20f));
+	A.Press(EPlayerInput::Heavy);
+	A.Stamina.Spend(1000.f); // exhausted
+	const FPlayerCommands Out = A.Tick(Frame(0.30f).HeavyHeld());
+	TestTrue(TEXT("no slam, and the refusal shows"), Has(Out, C::RefuseInput) && !Has(Out, C::StartDodgeHeavy));
 	return true;
 }
 

@@ -1,7 +1,10 @@
 #include "Combat/CombatantComponent.h"
 
+#include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Actor.h"
+#include "Engine/CollisionProfile.h"
+#include "PhysicsEngine/PhysicsAsset.h"
 #include "GameFramework/Character.h"
 #include "HAL/PlatformTime.h"
 
@@ -53,6 +56,17 @@ void UCombatantComponent::TickComponent(float DeltaTime, ELevelTick TickType, FA
 		bHitStopApplied = false;
 	}
 	TickTremble();
+
+	// On the dilated clock, like the death clip it waits for.
+	if (bRagdollPending)
+	{
+		RagdollIn -= DeltaTime;
+		if (RagdollIn <= 0.f)
+		{
+			bRagdollPending = false;
+			StartRagdoll();
+		}
+	}
 }
 
 USkeletalMeshComponent* UCombatantComponent::OwnerMesh() const
@@ -129,6 +143,7 @@ void UCombatantComponent::StartHitStop(float Duration, const FVector& InTrembleD
 
 void UCombatantComponent::ResetCombatant()
 {
+	StopRagdoll();
 	StopTremble();
 	HitStop = FHitStop(); // a reset mid-freeze mustn't leave him at 0.01 dilation
 	if (bHitStopApplied)
@@ -145,4 +160,78 @@ void UCombatantComponent::ResetCombatant()
 	State.bImmune = false;
 	State.bGuarding = false;
 	State.GuardPressTime = -1.0;
+}
+
+void UCombatantComponent::RagdollAfter(float Seconds)
+{
+	bRagdollPending = true;
+	RagdollIn = FMath::Max(0.f, Seconds);
+}
+
+void UCombatantComponent::StartRagdoll()
+{
+	USkeletalMeshComponent* Mesh = OwnerMesh();
+	if (!Mesh || bRagdoll)
+	{
+		return;
+	}
+	StopTremble(); // so the saved place is the real one
+	MeshProfile = Mesh->GetCollisionProfileName();
+	MeshCollisionEnabled = Mesh->GetCollisionEnabled();
+	MeshObjectType = Mesh->GetCollisionObjectType();
+	MeshResponses = Mesh->GetCollisionResponseToChannels();
+	MeshRelative = Mesh->GetRelativeTransform();
+	if (RagdollPhysicsAsset)
+	{
+		SavedPhysicsOverride = Mesh->PhysicsAssetOverride;
+		Mesh->SetPhysicsAsset(RagdollPhysicsAsset, true);
+	}
+	// Ragdoll collides with the floor but ignores pawns, so the capsule left standing doesn't hold the body up.
+	Mesh->SetCollisionProfileName(TEXT("Ragdoll"));
+	Mesh->SetSimulatePhysics(true);
+	Mesh->WakeAllRigidBodies();
+	bRagdoll = true;
+}
+
+void UCombatantComponent::StopRagdoll()
+{
+	bRagdollPending = false;
+	if (!bRagdoll)
+	{
+		return;
+	}
+	bRagdoll = false;
+	USkeletalMeshComponent* Mesh = OwnerMesh();
+	if (!Mesh)
+	{
+		return;
+	}
+	Mesh->SetSimulatePhysics(false);
+	// The collision first, so the physics asset swap below builds its bodies under the right profile. A mesh whose
+	// collision was set per component (profile "Custom") gets its settings back one by one.
+	if (MeshProfile == UCollisionProfile::CustomCollisionProfileName)
+	{
+		Mesh->SetCollisionEnabled(MeshCollisionEnabled);
+		Mesh->SetCollisionObjectType(MeshObjectType);
+		Mesh->SetCollisionResponseToChannels(MeshResponses);
+	}
+	else
+	{
+		Mesh->SetCollisionProfileName(MeshProfile);
+	}
+	if (RagdollPhysicsAsset)
+	{
+		Mesh->SetPhysicsAsset(SavedPhysicsOverride, true);
+		SavedPhysicsOverride = nullptr;
+	}
+	// In 5.8 the simulating mesh stays attached but physics moves it; put it back in its place on the capsule.
+	// (The attach is a safety net in case a future version detaches it.)
+	if (const ACharacter* Character = Cast<ACharacter>(GetOwner()))
+	{
+		if (Mesh->GetAttachParent() != Character->GetCapsuleComponent())
+		{
+			Mesh->AttachToComponent(Character->GetCapsuleComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+		}
+	}
+	Mesh->SetRelativeTransform(MeshRelative);
 }

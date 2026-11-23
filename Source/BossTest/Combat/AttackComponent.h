@@ -12,6 +12,7 @@
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnAttackHitLanded, const FHitOutcome& /*Outcome*/, AActor* /*Victim*/);
 
 class UAnimMontage;
+class UAnimSequenceBase;
 class UCurveFloat;
 class UAttackDefinition;
 class USkeletalMeshComponent;
@@ -33,11 +34,17 @@ public:
 	static bool ShouldDrawDebug();
 	static void SetDrawDebug(bool bOn);
 
-	bool StartAttack(UAttackDefinition* Definition, AActor* InTarget);
+	// BlendIn: seconds the attack's clip blends in over the slot (a chained heavy uses a longer one); eased with a
+	// smooth curve instead of a linear crossfade.
+	bool StartAttack(UAttackDefinition* Definition, AActor* InTarget, float BlendIn = 0.08f, bool bEasedBlend = false);
 	void StopAttack(float BlendOut = 0.2f);
-	// Swaps the running attack for another on the same clip without a pop: keeps the elapsed time, the
-	// instance (so nothing already hit can be hit twice) and the montage. Used by the charged heavy.
+	// Swaps the running attack for its variant (the charged heavy), keeping the instance so nothing already hit can
+	// be hit twice. Same clip: keeps the elapsed time and the montage, no pop. Another clip: crossfades to it
+	// (SwitchBlend, eased) and the variant's own timeline starts at 0.
 	bool SwitchTo(UAttackDefinition* Definition);
+
+	UPROPERTY(EditAnywhere, Category = "Attack", meta = (ToolTip = "Seconds a branch variant on another clip crossfades in"))
+	float SwitchBlend = 0.20f;
 
 	// An attack with a branch (BranchAt) holds there until its owner chooses, later in the same frame:
 	// true takes the variant (SwitchTo), false goes on as it is. Held more than 0.1 s, it goes on by itself.
@@ -48,6 +55,7 @@ public:
 	const UAttackDefinition* GetCurrent() const { return CurrentDefinition; }
 	FAttackSample GetSample() const;
 	float GetElapsed() const { return Elapsed; }
+	float GetTimeToFree() const;      // attack-clock seconds until the attack frees its owner; 0 when none runs
 
 	// Fires for every hit this component lands (Result == Hit).
 	FOnAttackHitLanded OnHitLanded;
@@ -58,6 +66,7 @@ public:
 
 private:
 	void Pose(float ClipTime);
+	UAnimMontage* PlayPaused(UAnimSequenceBase* Clip, float BlendIn, bool bEased);
 	void SweepWeapon();
 	void ApplyLunge(float Duration);
 	void TrackTarget(float Step);

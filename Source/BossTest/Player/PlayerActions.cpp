@@ -9,11 +9,57 @@ namespace
 
 void FPlayerActions::Press(EPlayerInput Input)
 {
-	// Held the moment it's pressed, so even a long frame right after the click can't lose it.
-	const bool bDuringLight = State == EPlayerState::Attacking && bLightAttack;
-	if (Input == EPlayerInput::Light && (bDuringLight || Buffer.Peek() == EPlayerInput::Light))
+	// Classified the moment it's pressed, so even a long frame right after the click can't lose it.
+	const bool bAttackInput = Input == EPlayerInput::Light || Input == EPlayerInput::Heavy;
+	if (State == EPlayerState::Attacking)
 	{
-		bChainQueued = true;
+		if (bAttackInput)
+		{
+			Held = Input; // until the chain point, however early
+			HeldAge = 0.f;
+			if (Input == EPlayerInput::Heavy)
+			{
+				bChargeable = false; // any new press is a re-press: it queues a heavy, it never charges this one
+			}
+		}
+		else if (Input == EPlayerInput::Dodge)
+		{
+			// Only after his own hit, and close enough to free that it won't fire long after he chose it.
+			if (bLastPastActive && LastTimeToFree <= Tuning.DodgeHoldBeforeFree + TimeSlack)
+			{
+				Held = EPlayerInput::Dodge;
+				HeldAge = 0.f;
+			}
+			else
+			{
+				Held = EPlayerInput::None; // dropped, and it takes back a held attack: a panic dodge never adds a slash
+				bRefused = true;
+			}
+		}
+		else
+		{
+			Held = EPlayerInput::None;
+			Buffer.Press(Input); // a heal still only starts from free, within the buffer
+		}
+		return;
+	}
+	if (State == EPlayerState::Dodging)
+	{
+		if (bAttackInput)
+		{
+			if (Input == EPlayerInput::Light && Held == EPlayerInput::Light)
+			{
+				bChainQueued = true; // the double-click: the finisher after the dodge light
+				return;
+			}
+			Held = Input; // until the lock: the dodge light or the slam
+			HeldAge = 0.f;
+			bChainQueued = false;
+			Buffer.Clear(); // the latest press wins over a dodge waiting in the buffer
+			return;
+		}
+		Held = EPlayerInput::None;
+		bChainQueued = false;
 	}
 	Buffer.Press(Input);
 }
@@ -33,9 +79,13 @@ void FPlayerActions::Reset()
 	StateTime = 0.f;
 	SinceDodge = 100.f;
 	LightIndex = 0;
-	bLightAttack = false;
-	bDodgeChain = false;
+	Line = EAttackLine::None;
+	Held = EPlayerInput::None;
+	HeldAge = 0.f;
 	bChainQueued = false;
+	bRefused = false;
+	bLastPastActive = false;
+	LastTimeToFree = 100.f;
 	bChargeable = false;
 	SprintTime = 0.f;
 	BlockStunTime = 0.f;
@@ -76,6 +126,12 @@ void FPlayerActions::Enter(EPlayerState NewState)
 	}
 	State = NewState;
 	StateTime = 0.f;
+	if (NewState == EPlayerState::Attacking)
+	{
+		// A new attack: presses until its first sample are early ones.
+		bLastPastActive = false;
+		LastTimeToFree = 100.f;
+	}
 }
 
 void FPlayerActions::StopSprint(FPlayerCommands& Out)
@@ -161,8 +217,7 @@ bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands
 			}
 			LightIndex = 0;
 			Out.Add(EPlayerCommand::StartDodgeLight);
-			bLightAttack = true;
-			bDodgeChain = true;
+			Line = EAttackLine::DodgeLight;
 			bChargeable = false;
 		}
 		else if (bSprinting && Reached(SprintTime, Tuning.SprintAttackAfter))
@@ -174,8 +229,7 @@ bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands
 			}
 			LightIndex = 0;
 			Out.Add(EPlayerCommand::StartSprintAttack);
-			bLightAttack = true;
-			bDodgeChain = false;
+			Line = EAttackLine::Sprint;
 			bChargeable = false;
 		}
 		else
@@ -186,8 +240,7 @@ bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands
 			}
 			LightIndex = 0;
 			Out.Add(EPlayerCommand::StartLight);
-			bLightAttack = true;
-			bDodgeChain = false;
+			Line = EAttackLine::Light;
 			bChargeable = false;
 		}
 		Buffer.Consume();
@@ -204,10 +257,9 @@ bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands
 			return false;
 		}
 		Out.Add(bDodgeHeavy ? EPlayerCommand::StartDodgeHeavy : EPlayerCommand::StartHeavy);
-		bLightAttack = false;
-		bDodgeChain = false;
+		Line = bDodgeHeavy ? EAttackLine::Slam : EAttackLine::Heavy;
 		bChainQueued = false;
-		bChargeable = !bDodgeHeavy;
+		bChargeable = !bDodgeHeavy && Frame.bHeavyHeld; // charges only while RMB stays down from here
 		Buffer.Consume();
 		Enter(EPlayerState::Attacking);
 		return true;
@@ -230,10 +282,25 @@ bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands
 	}
 }
 
+void FPlayerActions::NoteAttack(bool bPastActive, float TimeToFree)
+{
+	bLastPastActive = bPastActive;
+	LastTimeToFree = TimeToFree;
+}
+
 FPlayerCommands FPlayerActions::Tick(const FPlayerFrame& Frame)
 {
 	FPlayerCommands Out;
 	const float Dt = FMath::Max(0.f, Frame.Dt);
+	if (bRefused)
+	{
+		Out.Add(EPlayerCommand::RefuseInput);
+		bRefused = false;
+	}
+	// The running attack's own clock, for classifying the presses that arrive before the next tick.
+	bLastPastActive = Frame.bPastActive;
+	LastTimeToFree = Frame.TimeToFree;
+	HeldAge += Dt;
 
 	// Age the buffer first, so a press is judged by how long ago it happened.
 	Buffer.Tick(Dt);
@@ -343,51 +410,95 @@ FPlayerCommands FPlayerActions::Tick(const FPlayerFrame& Frame)
 			break;
 
 		case EPlayerState::Attacking:
+			if (bChargeable && !Frame.bHeavyHeld)
+			{
+				bChargeable = false; // released since this heavy started: a press now queues a heavy, it doesn't charge this one
+			}
 			if (bChargeable && Frame.bAttackRunning && Frame.bAtChargeBranch)
 			{
-				// The heavy waits at its cocked pose for this: still holding RMB commits to the charge (if there's stamina).
+				// The heavy waits at its cocked pose for this: RMB still down since its start commits to the charge (if there's stamina).
 				bChargeable = false;
-				if (Frame.bHeavyHeld && Stamina.CanStartAction())
+				if (Stamina.CanStartAction())
 				{
 					Stamina.Spend(Tuning.ChargeExtraCost);
 					Out.Add(EPlayerCommand::BeginCharge);
 				}
 			}
-			if (!Frame.bAttackRunning)
+			if (Frame.bGuardPressed && Held != EPlayerInput::None)
 			{
-				bChainQueued = false; // a held click with no next hit is dropped, not turned into Light 1
-				bChargeable = false;
-				Enter(EPlayerState::Free);
+				Held = EPlayerInput::None; // a fresh guard press takes back a queued press
 			}
-			else if (bLightAttack && !Frame.bChainOpen && Buffer.Peek() == EPlayerInput::Light)
+			if (!Frame.bAttackRunning && (Held == EPlayerInput::Light || Held == EPlayerInput::Heavy))
 			{
-				// Clicked during the hit, before its chain point: held until the point opens, however early.
-				bChainQueued = true;
-				Buffer.Consume();
-			}
-			else if (bLightAttack && Frame.bChainOpen && (bChainQueued || Buffer.Peek() == EPlayerInput::Light))
-			{
-				// The normal string loops back to Light 1; the dodge combo ends after its last hit.
-				const TArray<float>& Chain = bDodgeChain ? Costs.DodgeLights : Costs.Lights;
-				const int32 Next = bDodgeChain ? LightIndex + 1 : (Chain.Num() > 0 ? (LightIndex + 1) % Chain.Num() : 0);
-				if (Chain.IsValidIndex(Next) && TryStartAttack(Chain[Next], Out))
+				// Pressed on the frame the attack ended (it ticks before input is read): free is past every chain
+				// point, so it starts now, in this attack's line.
+				const EPlayerInput Next = Held;
+				Held = EPlayerInput::None;
+				if (!TryStartChained(Next, Frame, Out))
 				{
-					LightIndex = Next;
-					Out.Add(bDodgeChain ? EPlayerCommand::StartDodgeLight : EPlayerCommand::StartLight);
-					if (Buffer.Peek() == EPlayerInput::Light)
-					{
-						Buffer.Consume();
-					}
+					Out.Add(EPlayerCommand::RefuseInput);
 					bChainQueued = false;
-					Enter(EPlayerState::Attacking);
+					bChargeable = false;
+					Line = EAttackLine::None;
+					Enter(EPlayerState::Free);
+				}
+			}
+			else if (!Frame.bAttackRunning)
+			{
+				// Free. A held dodge comes out now (the free pass below); a held attack that never chained is dropped.
+				const bool bDodgeNow = Held == EPlayerInput::Dodge;
+				Held = EPlayerInput::None;
+				bChainQueued = false;
+				bChargeable = false;
+				Line = EAttackLine::None;
+				Enter(EPlayerState::Free);
+				if (bDodgeNow)
+				{
+					Buffer.Press(EPlayerInput::Dodge);
+				}
+			}
+			else if (Frame.bChainOpen && (Held == EPlayerInput::Light || Held == EPlayerInput::Heavy))
+			{
+				const EPlayerInput Next = Held;
+				Held = EPlayerInput::None;
+				if (!TryStartChained(Next, Frame, Out))
+				{
+					Out.Add(EPlayerCommand::RefuseInput); // exhausted: dropped now, never fired later
 				}
 			}
 			break;
 
 		case EPlayerState::Dodging:
-			if (Reached(StateTime, Tuning.DodgeLock) && TryStartBuffered(Frame, Out))
+			if (Frame.bGuardPressed && Held != EPlayerInput::None)
 			{
-				break;
+				Held = EPlayerInput::None; // a fresh guard press takes back a held attack here too
+				bChainQueued = false;
+			}
+			if (Reached(StateTime, Tuning.DodgeLock))
+			{
+				if (Held == EPlayerInput::Light || Held == EPlayerInput::Heavy)
+				{
+					if (Stamina.CanStartAction())
+					{
+						Buffer.Press(Held); // the dodge light or the slam, now
+					}
+					else
+					{
+						Out.Add(EPlayerCommand::RefuseInput); // exhausted: dropped, shown
+						bChainQueued = false;
+					}
+					Held = EPlayerInput::None;
+				}
+				if (TryStartBuffered(Frame, Out))
+				{
+					if (bChainQueued && State == EPlayerState::Attacking)
+					{
+						Held = EPlayerInput::Light; // the double-click's second light: the finisher at the dodge light's chain point
+						HeldAge = 0.f;
+					}
+					bChainQueued = false;
+					break;
+				}
 			}
 			if (Reached(StateTime, Tuning.DodgeDuration))
 			{
@@ -482,6 +593,9 @@ FPlayerCommands FPlayerActions::OnHit(bool bKnockdown)
 	SinceDodge = 100.f; // getting hit closes the dodge-attack window: a light after the reaction is Light 1
 	bChainQueued = false;
 	StunHeld = EPlayerInput::None;
+	// Held attacks never come out after a hit; a held dodge does if it's fresh (it waits out the reaction).
+	const bool bFreshDodge = Held == EPlayerInput::Dodge && HeldAge < Tuning.InputBuffer - TimeSlack;
+	Held = EPlayerInput::None;
 	if (bKnockdown)
 	{
 		bDodgeHeld = false; // only a hit reaction holds a dodge
@@ -492,6 +606,10 @@ FPlayerCommands FPlayerActions::OnHit(bool bKnockdown)
 	{
 		Out.Add(EPlayerCommand::PlayHitReact);
 		Enter(EPlayerState::HitReact);
+		if (bFreshDodge)
+		{
+			bDodgeHeld = true;
+		}
 	}
 	return Out;
 }
@@ -583,6 +701,7 @@ FPlayerCommands FPlayerActions::OnDeath()
 	Buffer.Clear();
 	bDodgeHeld = false;
 	StunHeld = EPlayerInput::None;
+	Held = EPlayerInput::None;
 	Enter(EPlayerState::Dead);
 	return Out;
 }
@@ -617,4 +736,66 @@ FPlayerCommands FPlayerActions::OnPerfectGuard(float RawDamage, bool bKnockdownH
 bool FPlayerActions::HasPerfectWindow() const
 {
 	return bPerfectWindow;
+}
+
+bool FPlayerActions::TryStartChained(EPlayerInput Input, const FPlayerFrame& Frame, FPlayerCommands& Out)
+{
+	if (Input == EPlayerInput::Heavy)
+	{
+		// The normal heavy started early, out of anything. Never the slam, even inside the dodge-attack window.
+		if (!TryStartAttack(Costs.Heavy, Out))
+		{
+			return false;
+		}
+		Out.Add(EPlayerCommand::ChainHeavy);
+		Line = EAttackLine::Heavy;
+		bChainQueued = false;
+		bChargeable = Frame.bHeavyHeld; // still down since the press: it can charge
+		Enter(EPlayerState::Attacking);
+		return true;
+	}
+
+	// The next light in this attack's line.
+	int32 Next = 0;
+	EPlayerCommand Command = EPlayerCommand::StartLight;
+	EAttackLine NextLine = EAttackLine::Light;
+	switch (Line)
+	{
+	case EAttackLine::Light:
+		Next = Costs.Lights.Num() > 0 ? (LightIndex + 1) % Costs.Lights.Num() : 0;
+		break;
+	case EAttackLine::Sprint:
+		Next = 1; // the sprint attack carries on into Light 2
+		break;
+	case EAttackLine::DodgeLight:
+		if (LightIndex == 0 && Costs.DodgeLights.IsValidIndex(1))
+		{
+			Next = 1; // the finisher
+			Command = EPlayerCommand::StartDodgeLight;
+			NextLine = EAttackLine::DodgeLight;
+		}
+		else
+		{
+			Next = 1; // after the finisher, Light 2: its blade comes back the other way
+		}
+		break;
+	case EAttackLine::Slam:
+		Next = 0;
+		Command = EPlayerCommand::StartLightRise; // he stands up out of the landing crouch first
+		break;
+	default:
+		Next = 0; // after a heavy, Light 1 rises out of the thrust
+		break;
+	}
+	const TArray<float>& Table = Command == EPlayerCommand::StartDodgeLight ? Costs.DodgeLights : Costs.Lights;
+	if (!Table.IsValidIndex(Next) || !TryStartAttack(Table[Next], Out))
+	{
+		return false;
+	}
+	LightIndex = Next;
+	Out.Add(Command);
+	Line = NextLine;
+	bChargeable = false;
+	Enter(EPlayerState::Attacking);
+	return true;
 }

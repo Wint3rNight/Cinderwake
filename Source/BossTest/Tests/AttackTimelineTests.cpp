@@ -220,7 +220,12 @@ bool FTimelineValidateBranch::RunTest(const FString& Parameters)
 	Charged.Windup = 0.94f; Charged.Hold = 0.50f; Charged.ClipHoldAt = 0.26f; Charged.Recovery = 0.90f;
 	TestEqual(TEXT("the real pair at 0.40 s is valid"), ValidateBranch(Heavy, Charged, true, 0.40f).Num(), 0);
 	TestTrue(TEXT("too close to the strike (0.43 s of a 0.44 s windup)"), ValidateBranch(Heavy, Charged, true, 0.43f).Num() > 0);
-	TestTrue(TEXT("another clip"), ValidateBranch(Heavy, Charged, false, 0.40f).Num() > 0);
+	// Step 4d: a variant on another clip restarts its own timeline at the branch (the charged heavy's deeper
+	// gather on Melee_B), so no pose has to match; it still has to come before the strike.
+	FAttackTiming Gather = Charged;
+	Gather.Windup = 0.74f; Gather.Hold = 0.30f; Gather.ClipHoldAt = 0.04f; Gather.ClipActiveStart = 0.52f;
+	TestEqual(TEXT("another clip, any pose: valid"), ValidateBranch(Heavy, Gather, false, 0.40f).Num(), 0);
+	TestTrue(TEXT("another clip, but too close to the strike"), ValidateBranch(Heavy, Gather, false, 0.43f).Num() > 0);
 	FAttackTiming Mismatched = Charged;
 	Mismatched.Windup = 1.10f; // a slower pre-hold windup: the pose at 0.40 s differs
 	TestTrue(TEXT("a different pose at the branch"), ValidateBranch(Heavy, Mismatched, true, 0.40f).Num() > 0);

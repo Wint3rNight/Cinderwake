@@ -406,6 +406,8 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 			{
 				Instance->bEnableAutoBlendOut = false;
 			}
+			// The clip ends mid-collapse: a ragdoll puts him on the floor.
+			Combatant->RagdollAfter(ClipMontage ? ClipMontage->GetPlayLength() : DeathClip->GetPlayLength());
 		}
 		break;
 	case EBossState::Paused:

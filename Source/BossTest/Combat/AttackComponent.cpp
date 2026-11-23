@@ -79,7 +79,44 @@ USkeletalMeshComponent* UAttackComponent::GetOwnerMesh() const
 	return Character ? Character->GetMesh() : GetOwner()->FindComponentByClass<USkeletalMeshComponent>();
 }
 
-bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarget)
+UAnimMontage* UAttackComponent::PlayPaused(UAnimSequenceBase* Clip, float BlendIn, bool bEased)
+{
+	USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	UAnimInstance* Anim = Mesh ? Mesh->GetAnimInstance() : nullptr;
+	if (!Anim || !Clip)
+	{
+		return nullptr;
+	}
+	// The montage is only a pose source: it's paused, and every tick its position is set from the gameplay
+	// timeline, so animation and hit timing can never drift apart. Playing on the same slot blends out whatever
+	// played there before (a chained attack).
+	UAnimMontage* Played = nullptr;
+	if (bEased)
+	{
+		FMontageBlendSettings In(BlendIn);
+		In.Blend.BlendOption = EAlphaBlendOption::HermiteCubic;
+		FMontageBlendSettings Out(0.2f);
+		Out.Blend.BlendOption = EAlphaBlendOption::HermiteCubic;
+		Played = Anim->PlaySlotAnimationAsDynamicMontage_WithBlendSettings(Clip, MontageSlot, In, Out, 1.f);
+	}
+	else
+	{
+		Played = Anim->PlaySlotAnimationAsDynamicMontage(Clip, MontageSlot, BlendIn, 0.2f, 1.f);
+	}
+	if (Played)
+	{
+		Anim->Montage_Pause(Played);
+		Anim->Montage_SetPosition(Played, 0.f);
+	}
+	return Played;
+}
+
+float UAttackComponent::GetTimeToFree() const
+{
+	return CurrentDefinition ? FMath::Max(0.f, Timing.Total() - Elapsed) : 0.f;
+}
+
+bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarget, float BlendIn, bool bEasedBlend)
 {
 	if (!Definition || !Definition->Clip)
 	{
@@ -110,17 +147,12 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	bBranchResolved = false;
 	BranchWait = 0.f;
 
-	// The montage is only a pose source: it's paused, and every tick its position is set from the
-	// gameplay timeline, so animation and hit timing can never drift apart. Playing on the same slot
-	// blends out whatever played there before (a chained attack).
-	Montage = Anim->PlaySlotAnimationAsDynamicMontage(Definition->Clip, MontageSlot, 0.08f, 0.2f, 1.f);
+	Montage = PlayPaused(Definition->Clip, BlendIn, bEasedBlend);
 	if (!Montage)
 	{
 		CurrentDefinition = nullptr;
 		return false;
 	}
-	Anim->Montage_Pause(Montage);
-	Anim->Montage_SetPosition(Montage, 0.f);
 
 	UE_LOG(LogTemp, Log, TEXT("BossTest: %s starts %s (instance %u)"), *GetOwner()->GetName(), *Definition->GetName(), InstanceId);
 	return true;
@@ -202,8 +234,8 @@ void UAttackComponent::TrackTarget(float Step)
 
 bool UAttackComponent::IsAtBranch() const
 {
-	// Only a branch that can actually be taken: a variant on the same clip.
-	return bAtBranch && CurrentDefinition && CurrentDefinition->BranchVariant && CurrentDefinition->BranchVariant->Clip == CurrentDefinition->Clip;
+	// Only a branch that can actually be taken: a variant with a clip.
+	return bAtBranch && CurrentDefinition && CurrentDefinition->BranchVariant && CurrentDefinition->BranchVariant->Clip;
 }
 
 bool UAttackComponent::ResolveBranch(bool bTakeVariant)
@@ -219,14 +251,29 @@ bool UAttackComponent::ResolveBranch(bool bTakeVariant)
 
 bool UAttackComponent::SwitchTo(UAttackDefinition* Definition)
 {
-	if (!CurrentDefinition || !Definition || Definition->Clip != CurrentDefinition->Clip)
+	if (!CurrentDefinition || !Definition || !Definition->Clip)
 	{
 		return false;
 	}
-	// Too late once either attack's active window has started: something may already have been hit.
-	if (Elapsed >= Timing.Windup || Elapsed >= Definition->GetTiming().Windup)
+	const bool bSameClip = Definition->Clip == CurrentDefinition->Clip;
+	// Too late once the active window has started: something may already have been hit. (A variant on another
+	// clip starts its own timeline at 0, so only this attack's windup matters for it.)
+	if (Elapsed >= Timing.Windup || (bSameClip && Elapsed >= Definition->GetTiming().Windup))
 	{
 		return false;
+	}
+	if (!bSameClip)
+	{
+		UAnimMontage* Crossfaded = PlayPaused(Definition->Clip, SwitchBlend, true);
+		if (!Crossfaded)
+		{
+			return false;
+		}
+		Montage = Crossfaded;
+		Elapsed = 0.f;
+		PrevPoints.Reset();
+		bAtBranch = false;
+		bBranchResolved = true; // the variant has no branch of its own to wait at
 	}
 	CurrentDefinition = Definition;
 	Timing = Definition->GetTiming();

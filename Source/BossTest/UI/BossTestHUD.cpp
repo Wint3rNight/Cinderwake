@@ -98,6 +98,13 @@ void ABossTestHUD::DrawHUD()
 	DrawRect(FLinearColor(0.05f, 0.08f, 0.04f), X, Y, StaminaWidth, StaminaHeight);
 	const FLinearColor StaminaColor = Stamina.bExhausted ? FLinearColor(0.45f, 0.30f, 0.08f) : FLinearColor(0.25f, 0.62f, 0.18f);
 	DrawRect(StaminaColor, X, Y, FMath::Clamp(Stamina.Current, 0.f, Stamina.Max) * StaminaPixelsPerPoint, StaminaHeight);
+	if (Player->IsStaminaFlashing())
+	{
+		// A refused press (a dodge mid-swing, an attack while exhausted): a bright frame around the bar.
+		const FLinearColor Flash(1.f, 0.85f, 0.4f, 0.9f);
+		DrawRect(Flash, X - Border, Y - Border, StaminaWidth + Border * 2.f, 2.f);
+		DrawRect(Flash, X - Border, Y + StaminaHeight + Border - 2.f, StaminaWidth + Border * 2.f, 2.f);
+	}
 	Y += StaminaHeight + Border * 2.f + 6.f;
 
 	// Heal charges, and the cast's progress while healing.

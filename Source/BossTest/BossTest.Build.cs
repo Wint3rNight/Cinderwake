@@ -17,6 +17,7 @@ public class BossTest : ModuleRules
 		if (Target.bBuildEditor)
 		{
 			PrivateDependencyModuleNames.Add("UnrealEd");
+			PrivateDependencyModuleNames.Add("PhysicsUtilities"); // Tools/BossTestEditorTools: generating the boss's ragdoll physics asset
 		}
 
 		// Uncomment if you are using Slate UI
