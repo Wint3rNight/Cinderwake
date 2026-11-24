@@ -19,6 +19,20 @@ FAttackTiming UAttackDefinition::GetTiming() const
 	T.ClipActiveEnd = ClipActiveEnd;
 	T.ClipEnd = ClipEnd;
 	T.bEaseIntoHold = bEaseIntoHold;
+	T.HoldEase = HoldEase;
+	T.RecoveryHold = RecoveryHold;
+	T.ClipRecoveryHoldAt = ClipRecoveryHoldAt;
+	T.ClipRecoveryHoldTo = ClipRecoveryHoldTo;
+	if (LeadInClip)
+	{
+		T.LeadInFrom = LeadInFrom;
+		T.LeadInTo = LeadInTo;
+	}
+	if (TailClip)
+	{
+		T.TailFrom = TailFrom;
+		T.TailTo = TailTo;
+	}
 	return T;
 }
 

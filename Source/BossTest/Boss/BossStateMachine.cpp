@@ -19,6 +19,7 @@ const TCHAR* FBossStateMachine::StateName(EBossState S)
 	case EBossState::Stagger: return TEXT("stagger");
 	case EBossState::Paused: return TEXT("paused");
 	case EBossState::Dead: return TEXT("dead");
+	case EBossState::CastBroken: return TEXT("cast broken");
 	}
 	return TEXT("?");
 }
@@ -52,6 +53,10 @@ bool FBossStateMachine::IsLegal(EBossState From, EBossState To)
 	{
 		return From != EBossState::Stagger; // a stagger doesn't restart itself
 	}
+	if (To == EBossState::CastBroken)
+	{
+		return From == EBossState::Attack; // only a cast (an attack) can be broken
+	}
 	switch (From)
 	{
 	case EBossState::Intro:
@@ -68,6 +73,7 @@ bool FBossStateMachine::IsLegal(EBossState From, EBossState To)
 	case EBossState::Paused:
 		return To == EBossState::Evaluate || To == EBossState::Attack;
 	case EBossState::Stagger:
+	case EBossState::CastBroken:
 		return To == EBossState::Evaluate;
 	default:
 		return false;
@@ -85,6 +91,7 @@ float FBossStateMachine::DefaultTimeout(EBossState S)
 	case EBossState::Neutral: return 2.f;
 	case EBossState::Attack: return 5.f;       // callers pass the attack's length plus 1 s
 	case EBossState::Stagger: return 2.8f;     // 1.8 s plus 1 s (callers pass the stagger's own length plus 1 s)
+	case EBossState::CastBroken: return 1.8f;  // the 0.8 s recoil plus 1 s
 	default: return -1.f;                      // paused (a debug state) and dead never time out
 	}
 }
@@ -95,7 +102,8 @@ EBossPriority FBossStateMachine::GetHeldPriority() const
 	{
 	case EBossState::Intro: return EBossPriority::Scripted;
 	case EBossState::Attack: return bAttackRecovering ? EBossPriority::Recovery : EBossPriority::CommittedAttack;
-	case EBossState::Stagger: return EBossPriority::Stagger;
+	case EBossState::Stagger:
+	case EBossState::CastBroken: return EBossPriority::Stagger;
 	case EBossState::Dead: return EBossPriority::Death;
 	default: return EBossPriority::Decision;
 	}
@@ -205,6 +213,24 @@ void FBossStateMachine::RequestAtSafePoint(EBossState To, EBossPriority Priority
 	Pending.Timeout = InTimeout;
 	bHasPending = true;
 	Record(State, To, Priority, true, Reason + TEXT(" (waits for the safe point)"));
+}
+
+bool FBossStateMachine::NextStep(const FString& Reason, float InTimeout)
+{
+	if (State != EBossState::Attack)
+	{
+		Record(State, EBossState::Attack, EBossPriority::CommittedAttack, false, Reason + TEXT(" (rejected: not attacking)"));
+		return false;
+	}
+	if (PlayPending(TEXT(" (between steps)")))
+	{
+		return false;
+	}
+	bAttackRecovering = false;
+	StateTime = 0.f;
+	Timeout = InTimeout >= 0.f ? InTimeout : DefaultTimeout(EBossState::Attack);
+	Record(EBossState::Attack, EBossState::Attack, EBossPriority::CommittedAttack, true, Reason);
+	return true;
 }
 
 void FBossStateMachine::SetAttackRecovering(bool bRecovering)

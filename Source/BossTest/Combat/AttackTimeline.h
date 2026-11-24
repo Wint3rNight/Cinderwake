@@ -6,12 +6,14 @@
 #include "Combat/CombatTypes.h"
 
 enum class EAttackPhase : uint8 { Windup, Hold, Active, Recovery, Done };
+enum class EAttackSpan : uint8 { LeadIn, Main, Tail }; // which clip an attack is on (Step 5: up to three per attack)
 
 struct FAttackTiming
 {
 	// Real seconds
 	float Windup = 0.f;      // from the start to the active window, including the hold
 	float Hold = 0.f;        // frozen time inside the windup
+	float HoldEase = 0.f;    // an eased hold reaches its stop after this long, then holds still; 0 = it eases over the whole hold
 	float Active = 0.f;
 	float Recovery = 0.f;
 	float ChainFrom = -1.f;  // the next attack may start from here (-1 = never)
@@ -24,6 +26,18 @@ struct FAttackTiming
 	float ClipActiveEnd = 0.f;
 	float ClipEnd = 0.f;
 
+	// A hold inside the recovery (real seconds), still or creeping from ClipRecoveryHoldAt to ClipRecoveryHoldTo
+	float RecoveryHold = 0.f;
+	float ClipRecoveryHoldAt = 0.f;
+	float ClipRecoveryHoldTo = 0.f;
+
+	// Other clips around the main one (Step 5), in their own clip seconds. The timeline runs on one extended clip
+	// coordinate: the lead-in just before ClipStartAt, the tail just after ClipEnd. Hold markers use that coordinate.
+	float LeadInFrom = 0.f;  // a lead-in when LeadInTo > LeadInFrom
+	float LeadInTo = 0.f;
+	float TailFrom = 0.f;    // a tail when TailTo > TailFrom
+	float TailTo = 0.f;
+
 	bool bEaseIntoHold = false; // the raise slows smoothly into the held pose instead of stopping dead
 	float Total() const { return Windup + Active + Recovery; } // free to move or dodge from here
 };
@@ -31,12 +45,26 @@ struct FAttackTiming
 struct FAttackSample
 {
 	EAttackPhase Phase = EAttackPhase::Windup;
-	float ClipTime = 0.f;
+	float ClipTime = 0.f;    // the extended clip coordinate (the main clip's own time while on it)
+	EAttackSpan Span = EAttackSpan::Main;
+	float SpanTime = 0.f;    // the time inside that span's clip
 	bool bChainOpen = false;
 	bool bFree = false;
 };
 
 FAttackSample EvaluateAttack(const FAttackTiming& T, float Time);
+
+// The windup hold in real seconds from the start (Start == End when there's none).
+struct FHoldWindow
+{
+	float Start = 0.f;
+	float End = 0.f;
+};
+FHoldWindow GetHoldWindow(const FAttackTiming& T);
+
+// Per-instance variation (Delayed Execution's +-0.10 s, the timing bands): a longer or shorter hold moves the strike
+// and everything after it. With no hold, the windup itself stretches instead.
+void AddHoldTime(FAttackTiming& T, float Extra);
 
 // True if any part of [From, To] falls inside the active window, so a long frame never skips it.
 bool ActiveOverlap(const FAttackTiming& T, float From, float To);

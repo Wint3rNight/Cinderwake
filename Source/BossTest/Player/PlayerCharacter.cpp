@@ -19,6 +19,7 @@
 #include "Particles/ParticleSystem.h"
 #include "Particles/ParticleSystemComponent.h"
 #include "Misc/App.h"
+#include "Player/KnockdownPlan.h"
 #include "Player/LockOnComponent.h"
 #include "Player/PlayerMovementComponent.h"
 #include "UObject/ConstructorHelpers.h"
@@ -178,6 +179,21 @@ void APlayerCharacter::Tick(float DeltaSeconds)
 	// gameplay clock below (i-frames, the dodge lock, the heal, regeneration, the buffer).
 	Super::Tick(DeltaSeconds);
 	LastEventTime -= DeltaSeconds;
+
+	// The knockdown's get-up follows its fall, on this actor's clock (hit-stop pauses it too). Only while still
+	// knocked down: death, a reset or anything else that ended it cancels it.
+	if (KnockdownGetUpIn >= 0.f)
+	{
+		KnockdownGetUpIn -= DeltaSeconds;
+		if (Actions.GetState() != EPlayerState::Knockdown)
+		{
+			KnockdownGetUpIn = -1.f;
+		}
+		else if (KnockdownGetUpIn < 0.f && KnockdownGetUp)
+		{
+			PlayClip(KnockdownGetUp, KnockdownRate, 0.05f, 0.2f);
+		}
+	}
 
 	FPlayerFrame Frame;
 	Frame.Dt = DeltaSeconds;
@@ -788,9 +804,19 @@ void APlayerCharacter::PlayReaction(bool bKnockdown)
 	const float Front = FVector::DotProduct(GetActorForwardVector(), ToAttacker);
 	const float Side = FVector::DotProduct(GetActorRightVector(), ToAttacker);
 
+	KnockdownGetUpIn = -1.f;
 	if (bKnockdown)
 	{
 		UAnimSequenceBase* Clip = Front >= 0.f ? KnockdownFront : KnockdownBack;
+		if (Clip && KnockdownGetUp)
+		{
+			// The fall onto the floor, then the get-up from that pose, at one rate: he's standing when it ends.
+			const FKnockdownPlan Plan = PlanKnockdown(KnockdownFallFrom, Clip->GetPlayLength(), KnockdownGetUp->GetPlayLength(), Actions.Tuning.Knockdown);
+			KnockdownRate = Plan.Rate;
+			KnockdownGetUpIn = Plan.GetUpAt;
+			PlayClip(Clip, Plan.Rate, 0.05f, 0.05f, 1, KnockdownFallFrom);
+			return;
+		}
 		// Played to fit the knockdown, so he's up when it ends.
 		PlayClip(Clip, Clip ? Clip->GetPlayLength() / Actions.Tuning.Knockdown : 1.f, 0.05f, 0.2f);
 		return;

@@ -129,14 +129,21 @@ FHitOutcome ResolveCombatHit(const FCombatHitContext& Hit, FCombatantState& Targ
 		Target.Cast.Close();
 		return Out;
 	}
+	if (Hit.bSoulFragment)
+	{
+		Target.Health.AddFragment();
+		Out.bFragmentTaken = true;
+	}
 
 	// The cast counter runs even while poise is immune; then poise itself.
 	Out.bCastBroken = Target.Cast.Apply(Hit.PoiseDamage);
 	Out.Poise = Target.Poise.Apply(Hit.PoiseDamage, Hit.bHeavy, Target.Armor);
 
-	if (Out.Poise == EPoiseOutcome::Stagger)
+	if (Out.Poise != EPoiseOutcome::None)
 	{
-		Out.bCastBroken = false; // a stagger wins over a cast break; the cast ends either way
+		// A stagger wins over a cast break, deferred or not (otherwise the cast-broken state would drop the pending
+		// stagger); the cast ends either way.
+		Out.bCastBroken = false;
 		Target.Cast.Close();
 	}
 	return Out;

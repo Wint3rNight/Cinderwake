@@ -7,6 +7,9 @@
 #include "Combat/AttackDefinition.h"
 #include "Animation/AnimSequenceBase.h"
 #include "Animation/Skeleton.h"
+#include "Engine/SkeletalMesh.h"
+#include "Engine/SkeletalMeshSocket.h"
+#include "Particles/ParticleSystem.h"
 
 namespace
 {
@@ -98,6 +101,97 @@ bool FAttackDataChainPoints::RunTest(const FString& Parameters)
 		TestTrue(TEXT("heavy: still creeping in its hold at the branch"), EvaluateAttack(H, At - 0.01f).Phase == EAttackPhase::Hold);
 		TestTrue(FString::Printf(TEXT("heavy: at most 0.05 s into its clip at the branch (%.3f)"), EvaluateAttack(H, At).ClipTime), EvaluateAttack(H, At).ClipTime <= 0.05f);
 		TestTrue(TEXT("charged heavy: the gather creeps (never a frozen pose)"), C.ClipHoldTo > C.ClipHoldAt && !C.bEaseIntoHold);
+	}
+	return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAttackDataBossAttacks, "BossTest.Data.BossAttacks", AttackDataTestFlags)
+bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
+{
+	// Step 5: his attacks as built. Clips on his skeleton with markers inside them, timings valid with no slow-motion
+	// warnings, sockets that exist (a misspelt one sweeps his feet), full armour while every blockable swing is active
+	// (so a perfect guard's poise can't flinch him out of it), and section 5's numbers.
+	auto Load = [](const TCHAR* Name)
+	{
+		return LoadObject<UAttackDefinition>(nullptr, *FString::Printf(TEXT("/Game/BossTest/Attacks/Boss/%s.%s"), Name, Name));
+	};
+	const USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, TEXT("/Game/ParagonSevarog/Characters/Heroes/Sevarog/Meshes/Sevarog.Sevarog"));
+	if (!TestNotNull(TEXT("his mesh"), Mesh))
+	{
+		return false;
+	}
+	const USkeleton* Skeleton = Mesh->GetSkeleton();
+	auto HasPoint = [Mesh](FName N) { return N.IsNone() || Mesh->FindSocket(N) || Mesh->GetRefSkeleton().FindBoneIndex(N) != INDEX_NONE; };
+	struct FExpect { const TCHAR* Name; float Damage; bool bKnockdown; };
+	const FExpect All[] = {
+		{ TEXT("DA_ExecutionersSwing"), 35.f, false }, { TEXT("DA_DelayedExecution"), 40.f, false }, { TEXT("DA_ReverseSweep"), 35.f, false },
+		{ TEXT("DA_CrushingOverhead"), 55.f, true }, { TEXT("DA_DoubleExecution1"), 35.f, false }, { TEXT("DA_DoubleExecutionStop"), 35.f, false },
+		{ TEXT("DA_DoubleExecution2Fast"), 40.f, false }, { TEXT("DA_DoubleExecution2Delayed"), 40.f, false }, { TEXT("DA_PunishmentSweep"), 40.f, false },
+		{ TEXT("DA_JudgmentSlam"), 60.f, true }, { TEXT("DA_SoulMark"), 0.f, false }, { TEXT("DA_AdvanceDash"), 0.f, false }, { TEXT("DA_AdvanceSwing"), 40.f, false },
+	};
+	for (const FExpect& E : All)
+	{
+		const UAttackDefinition* A = Load(E.Name);
+		if (!TestNotNull(FString::Printf(TEXT("%s exists"), E.Name), A) || !TestNotNull(FString::Printf(TEXT("%s has its clip"), E.Name), A->Clip.Get()))
+		{
+			continue;
+		}
+		TestTrue(FString::Printf(TEXT("%s: on his skeleton"), E.Name), A->Clip->GetSkeleton() == Skeleton);
+		TestTrue(FString::Printf(TEXT("%s: its clip end fits the clip"), E.Name), A->ClipEnd <= A->Clip->GetPlayLength() + 0.01f);
+		if (A->LeadInClip)
+		{
+			TestTrue(FString::Printf(TEXT("%s: the lead-in fits its clip, on his skeleton"), E.Name),
+				A->LeadInTo <= A->LeadInClip->GetPlayLength() + 0.01f && A->LeadInClip->GetSkeleton() == Skeleton);
+		}
+		if (A->TailClip)
+		{
+			TestTrue(FString::Printf(TEXT("%s: the tail fits its clip, on his skeleton"), E.Name),
+				A->TailTo <= A->TailClip->GetPlayLength() + 0.01f && A->TailClip->GetSkeleton() == Skeleton);
+		}
+		const TArray<FString> Messages = ValidateTiming(A->GetTiming());
+		TestEqual(FString::Printf(TEXT("%s: timing valid, no warnings (%s)"), E.Name, *FString::Join(Messages, TEXT(" "))), Messages.Num(), 0);
+		bool bPoints = HasPoint(A->SocketStart) && HasPoint(A->SocketEnd) && HasPoint(A->DeliverySocket);
+		for (const FAttackCue& Cue : A->Cues)
+		{
+			// A one-shot must really end by itself, or it would pile up on his mesh.
+			bPoints &= HasPoint(Cue.Socket) && Cue.Effect != nullptr && !(Cue.bOneShot && Cue.Effect->IsLooping());
+		}
+		TestTrue(FString::Printf(TEXT("%s: every socket exists, every cue has its effect, no one-shot loops"), E.Name), bPoints);
+		if (!A->SocketStart.IsNone() && !A->bUnblockable)
+		{
+			TestTrue(FString::Printf(TEXT("%s: full armour while active"), E.Name), A->ActiveArmor == EAttackArmor::Full);
+		}
+		TestEqual(FString::Printf(TEXT("%s: damage"), E.Name), A->Damage, E.Damage);
+		TestEqual(FString::Printf(TEXT("%s: knockdown"), E.Name), A->bKnockdown, E.bKnockdown);
+		if (A->Delivery != EAttackDelivery::None)
+		{
+			TestTrue(FString::Printf(TEXT("%s: the delivery launches inside the active window"), E.Name),
+				A->DeliveryClipAt >= A->ClipActiveStart - 0.001f && A->DeliveryClipAt <= A->ClipActiveEnd + 0.001f);
+		}
+	}
+	const UAttackDefinition* Slam = Load(TEXT("DA_JudgmentSlam"));
+	TestTrue(TEXT("Judgment Slam: a 35-damage ring, 10 m/s out to 5 m"), Slam && Slam->Delivery == EAttackDelivery::Ring && Slam->DeliveryDamage == 35.f
+		&& Slam->DeliverySpeed == 1000.f && Slam->DeliveryReach == 500.f);
+	const UAttackDefinition* Mark = Load(TEXT("DA_SoulMark"));
+	TestTrue(TEXT("Soul Mark: a 30-damage soul projectile at 14 m/s, no sweep"), Mark && Mark->Delivery == EAttackDelivery::Projectile
+		&& Mark->DeliveryDamage == 30.f && Mark->DeliverySpeed == 1400.f && Mark->bDeliverySoulFragment && Mark->SocketStart.IsNone());
+	const UAttackDefinition* Dash = Load(TEXT("DA_AdvanceDash"));
+	TestTrue(TEXT("the Advance's dash: no sweep, aims at an interception point"), Dash && Dash->SocketStart.IsNone() && Dash->LungeAim == ELungeAim::Intercept);
+
+	// The 0.70 s rule (spec section 5): Double Execution's second active window starts at least 0.70 s after the first,
+	// at both ends of both bands.
+	const UAttackDefinition* Hit1 = Load(TEXT("DA_DoubleExecution1"));
+	const UAttackDefinition* Fast = Load(TEXT("DA_DoubleExecution2Fast"));
+	const UAttackDefinition* Late = Load(TEXT("DA_DoubleExecution2Delayed"));
+	if (Hit1 && Fast && Late)
+	{
+		const FAttackTiming T1 = Hit1->GetTiming();
+		auto Gap = [&T1](const UAttackDefinition* Second, float Extra) { return T1.Total() + Second->GetTiming().Windup + Extra - T1.Windup; };
+		TestTrue(FString::Printf(TEXT("fast band, earliest: %.2f s apart"), Gap(Fast, 0.f)), Gap(Fast, 0.f) >= 0.70f - 0.001f);
+		TestTrue(TEXT("fast band, latest: 0.60 s windup"), FMath::IsNearlyEqual(Fast->GetTiming().Windup + 0.05f, 0.60f, 0.001f));
+		TestTrue(FString::Printf(TEXT("delayed band, earliest: %.2f s apart"), Gap(Late, 0.f)), Gap(Late, 0.f) >= 0.70f);
+		TestTrue(TEXT("delayed band: 0.95-1.15 s windup"), FMath::IsNearlyEqual(Late->GetTiming().Windup, 0.95f, 0.001f));
 	}
 	return true;
 }

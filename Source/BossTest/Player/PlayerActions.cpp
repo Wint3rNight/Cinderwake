@@ -654,7 +654,10 @@ FPlayerCommands FPlayerActions::OnBlock(float RawDamage, bool bHeavyBlock)
 	Stamina.Spend(RawDamage * Tuning.BlockCostPerDamage);
 	if (Stamina.bExhausted)
 	{
-		Stamina.SetDrain(0.f); // the exhaustion clock runs from the break
+		// Stamina regenerates through the break stun (the user, after Step 5): the break costs the turn, but the dodge
+		// is back when the stun ends, so his next attack stays dodgeable (the charter's guard and exhaustion lesson).
+		Stamina.SetDrain(0.f);
+		Stamina.RestartRegenDelay(0.f);
 		bDodgeHeld = false;
 		StunHeld = EPlayerInput::None;
 		Out.Add(EPlayerCommand::PlayGuardBreak);

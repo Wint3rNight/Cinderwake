@@ -237,4 +237,51 @@ bool FBossStatesRecordHook::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBossStatesCastBroken, "BossTest.Boss.States.CastBroken", BossStateTestFlags)
+bool FBossStatesCastBroken::RunTest(const FString& Parameters)
+{
+	// Step 5: breaking Soul Mark's cast (spec section 9) puts him in a 0.8 s recoil. It isn't a stagger, but it holds
+	// stagger priority, and a real stagger can still take over.
+	FBossStateMachine M = Attacking();
+	TestTrue(TEXT("a broken cast interrupts the attack"), M.Request(S::CastBroken, P::Stagger, TEXT("cast broken"), 1.8f));
+	TestTrue(TEXT("he's recoiling"), M.GetState() == S::CastBroken);
+	TestTrue(TEXT("it holds stagger priority"), M.GetHeldPriority() == P::Stagger);
+	TestFalse(TEXT("a decision can't cut it short"), M.Request(S::Approach, P::Decision, TEXT("chase")));
+	TestTrue(TEXT("a stagger can take over"), M.Request(S::Stagger, P::Stagger, TEXT("poise broke")));
+	FBossStateMachine N = Attacking();
+	N.Request(S::CastBroken, P::Stagger, TEXT("cast broken"), 1.8f);
+	TestTrue(TEXT("its natural end goes back to deciding"), N.Complete(S::Evaluate, TEXT("recoil over")) && N.GetState() == S::Evaluate);
+	FBossStateMachine T = Attacking();
+	T.Request(S::CastBroken, P::Stagger, TEXT("cast broken"));
+	TestTrue(TEXT("its default timeout is 0.8 s plus 1 s"), FMath::IsNearlyEqual(T.GetTimeout(), 1.8f));
+	FBossStateMachine E = Evaluating();
+	TestFalse(TEXT("only an attack (a cast) can be broken"), E.Request(S::CastBroken, P::Stagger, TEXT("not casting")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBossStatesNextStep, "BossTest.Boss.States.NextStep", BossStateTestFlags)
+bool FBossStatesNextStep::RunTest(const FString& Parameters)
+{
+	// Step 5 review: a sequence's next step (Double Execution's hit 2, the Advance's swing) is a fresh commitment:
+	// committed-attack priority again, its own clock and timeout. A pending safe-point request plays instead.
+	FBossStateMachine M = Attacking();
+	M.SetAttackRecovering(true);
+	M.Tick(1.f);
+	TestTrue(TEXT("the next step starts"), M.NextStep(TEXT("hit 2"), 2.5f));
+	TestTrue(TEXT("still attacking"), M.GetState() == S::Attack);
+	TestTrue(TEXT("committed again, not recovering"), M.GetHeldPriority() == P::CommittedAttack);
+	TestEqual(TEXT("its own clock"), M.GetStateTime(), 0.f);
+	TestEqual(TEXT("its own timeout"), M.GetTimeout(), 2.5f);
+	TestTrue(TEXT("recorded"), M.GetHistory().Num() > 0 && M.GetHistory().Last().Reason.Contains(TEXT("hit 2")));
+	TestFalse(TEXT("a decision still can't interrupt it"), M.Request(S::Approach, P::Decision, TEXT("chase")));
+	TestFalse(TEXT("2.4 s in: no timeout"), M.Tick(2.4f));
+	FBossStateMachine N = Attacking();
+	N.RequestAtSafePoint(S::Stagger, P::Stagger, TEXT("deferred stagger"));
+	TestFalse(TEXT("a pending stagger: no next step"), N.NextStep(TEXT("hit 2"), 2.5f));
+	TestTrue(TEXT("the stagger plays instead"), N.GetState() == S::Stagger);
+	FBossStateMachine E = Evaluating();
+	TestFalse(TEXT("not attacking: no next step"), E.NextStep(TEXT("hit 2"), 2.5f));
+	return true;
+}
+
 #endif

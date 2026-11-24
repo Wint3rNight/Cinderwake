@@ -310,4 +310,124 @@ bool FTimelineHoldCreeps::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTimelineSpans, "BossTest.Combat.Timeline.Spans", TimelineTestFlags)
+bool FTimelineSpans::RunTest(const FString& Parameters)
+{
+	// Step 5: an attack can run across three clips. Double Execution's second hit: a lead-in (Swing1_Slow 0.57-1.50,
+	// his own re-raise), the main clip (Swing2_Slow), then a tail (its return clip, 0-0.97). The timeline works in one
+	// extended clip coordinate: the lead-in before the main clip's start, the tail after its end.
+	FAttackTiming T;
+	T.LeadInFrom = 0.57f; T.LeadInTo = 1.50f;
+	T.ClipActiveStart = 0.42f; T.ClipActiveEnd = 0.55f; T.ClipEnd = 1.53f;
+	T.TailFrom = 0.f; T.TailTo = 0.97f;
+	T.Windup = 0.55f; T.Active = 0.18f; T.Recovery = 1.15f;
+	const float WindupRate = 1.35f / 0.55f; // 0.93 s of lead-in plus 0.42 s of the main clip
+	FAttackSample S = EvaluateAttack(T, 0.f);
+	TestTrue(TEXT("starts in the lead-in"), S.Span == EAttackSpan::LeadIn);
+	TestEqual(TEXT("at the lead-in's first frame"), S.SpanTime, 0.57f, 0.001f);
+	S = EvaluateAttack(T, 0.2f);
+	TestTrue(TEXT("0.2 s: still the lead-in"), S.Span == EAttackSpan::LeadIn);
+	TestEqual(TEXT("0.2 s: 0.49 s into it"), S.SpanTime, 0.57f + 0.2f * WindupRate, 0.002f);
+	S = EvaluateAttack(T, 0.45f);
+	TestTrue(TEXT("0.45 s: the main clip"), S.Span == EAttackSpan::Main);
+	TestEqual(TEXT("0.45 s: its time"), S.SpanTime, 0.45f * WindupRate - 0.93f, 0.002f);
+	S = EvaluateAttack(T, 0.55f);
+	TestTrue(TEXT("the strike on the main clip"), S.Span == EAttackSpan::Main && S.Phase == EAttackPhase::Active);
+	TestEqual(TEXT("at its active start"), S.SpanTime, 0.42f, 0.002f);
+	const float RecoveryRate = (0.98f + 0.97f) / 1.15f;
+	S = EvaluateAttack(T, 0.73f + 0.5f);
+	TestTrue(TEXT("recovery: the main clip first"), S.Span == EAttackSpan::Main);
+	TestEqual(TEXT("recovery: its time"), S.SpanTime, 0.55f + 0.5f * RecoveryRate, 0.002f);
+	S = EvaluateAttack(T, 0.73f + 1.0f);
+	TestTrue(TEXT("recovery: then the tail"), S.Span == EAttackSpan::Tail);
+	TestEqual(TEXT("recovery: the tail's time"), S.SpanTime, 0.55f + 1.0f * RecoveryRate - 1.53f, 0.002f);
+	S = EvaluateAttack(T, 5.f);
+	TestTrue(TEXT("done: at the tail's end"), S.Phase == EAttackPhase::Done && S.Span == EAttackSpan::Tail);
+	TestEqual(TEXT("done: the tail's last frame"), S.SpanTime, 0.97f, 0.002f);
+	TestEqual(TEXT("valid"), ValidateTiming(T).Num(), 0);
+	FAttackTiming Plain;
+	Plain.ClipHoldAt = 0.43f; Plain.ClipActiveStart = 0.43f; Plain.ClipActiveEnd = 0.57f; Plain.ClipEnd = 1.60f;
+	Plain.Windup = 1.05f; Plain.Active = 0.18f; Plain.Recovery = 0.90f;
+	S = EvaluateAttack(Plain, 1.2f);
+	TestTrue(TEXT("no spans: always the main clip, span time = clip time"), S.Span == EAttackSpan::Main && FMath::IsNearlyEqual(S.SpanTime, S.ClipTime));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTimelineHoldEase, "BossTest.Combat.Timeline.HoldEase", TimelineTestFlags)
+bool FTimelineHoldEase::RunTest(const FString& Parameters)
+{
+	// Delayed Execution: the same raise and eased stop as Executioner's Swing (a 0.40 s ease), then held still for the
+	// rest of a longer hold. Until the swing would have resumed, the two are identical: the deception is the timing.
+	FAttackTiming Swing;
+	Swing.ClipHoldAt = 0.40f; Swing.ClipActiveStart = 0.43f; Swing.ClipActiveEnd = 0.57f; Swing.ClipEnd = 1.60f;
+	Swing.Windup = 1.05f; Swing.Hold = 0.40f; Swing.bEaseIntoHold = true; Swing.Active = 0.18f; Swing.Recovery = 0.90f;
+	FAttackTiming Delayed = Swing;
+	Delayed.Windup = 1.85f; Delayed.Hold = 1.20f; Delayed.HoldEase = 0.40f; Delayed.Recovery = 0.95f;
+	const FHoldWindow SwingHold = GetHoldWindow(Swing);
+	const FHoldWindow DelayedHold = GetHoldWindow(Delayed);
+	TestEqual(TEXT("both holds start together"), DelayedHold.Start, SwingHold.Start, 0.001f);
+	TestEqual(TEXT("the swing's hold ends 0.40 s later"), SwingHold.End - SwingHold.Start, 0.40f, 0.001f);
+	TestEqual(TEXT("the delayed hold ends 1.20 s later"), DelayedHold.End - DelayedHold.Start, 1.20f, 0.001f);
+	bool bSame = true;
+	for (float t = 0.f; t <= SwingHold.End; t += 1.f / 60.f)
+	{
+		bSame &= FMath::IsNearlyEqual(EvaluateAttack(Swing, t).ClipTime, EvaluateAttack(Delayed, t).ClipTime, 0.001f);
+	}
+	TestTrue(TEXT("identical to Executioner's Swing until its stop"), bSame);
+	TestEqual(TEXT("then held still at the loaded pose"), EvaluateAttack(Delayed, SwingHold.End + 0.5f).ClipTime, 0.40f, 0.001f);
+	TestTrue(TEXT("still in the hold"), EvaluateAttack(Delayed, SwingHold.End + 0.5f).Phase == EAttackPhase::Hold);
+	TestEqual(TEXT("the strike at its windup's end"), EvaluateAttack(Delayed, 1.85f).ClipTime, 0.43f, 0.001f);
+	TestEqual(TEXT("valid, no warnings"), ValidateTiming(Delayed).Num(), 0);
+	FAttackTiming Varied = Delayed;
+	AddHoldTime(Varied, 0.10f);
+	TestEqual(TEXT("variation: a longer hold"), Varied.Hold, 1.30f, 0.001f);
+	TestEqual(TEXT("variation: the strike moves with it"), Varied.Windup, 1.95f, 0.001f);
+	TestEqual(TEXT("variation: the same raise"), EvaluateAttack(Varied, 0.5f).ClipTime, EvaluateAttack(Delayed, 0.5f).ClipTime, 0.001f);
+	FAttackTiming Whip;
+	Whip.ClipHoldAt = 0.42f; Whip.ClipActiveStart = 0.42f; Whip.ClipActiveEnd = 0.55f; Whip.ClipEnd = 1.53f;
+	Whip.Windup = 0.55f; Whip.Active = 0.18f; Whip.Recovery = 1.15f;
+	AddHoldTime(Whip, 0.05f);
+	TestTrue(TEXT("no hold: the windup stretches instead of freezing somewhere"), Whip.Hold == 0.f && FMath::IsNearlyEqual(Whip.Windup, 0.60f));
+	bool bMoving = true;
+	for (int32 i = 0; i < 17; ++i)
+	{
+		bMoving &= EvaluateAttack(Whip, (i + 1) / 30.f).ClipTime > EvaluateAttack(Whip, i / 30.f).ClipTime + 0.001f;
+	}
+	TestTrue(TEXT("no hold: it moves in every frame of the windup"), bMoving);
+	FAttackTiming BadEase = Delayed;
+	BadEase.bEaseIntoHold = false;
+	TestTrue(TEXT("an ease time without an eased hold is an error"), ValidateTiming(BadEase).Num() > 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTimelineRecoveryHold, "BossTest.Combat.Timeline.RecoveryHold", TimelineTestFlags)
+bool FTimelineRecoveryHold::RunTest(const FString& Parameters)
+{
+	// Judgment Slam: the hammer held in the floor (creeping 0.78-0.80) for 0.45 s of the recovery, then his own return.
+	FAttackTiming T;
+	T.ClipHoldAt = 0.64f; T.ClipActiveStart = 0.64f; T.ClipActiveEnd = 0.78f; T.ClipEnd = 2.31f;
+	T.Windup = 1.00f; T.Active = 0.25f; T.Recovery = 1.55f;
+	T.RecoveryHold = 0.45f; T.ClipRecoveryHoldAt = 0.78f; T.ClipRecoveryHoldTo = 0.80f;
+	const float RecStart = 1.25f;
+	TestEqual(TEXT("halfway through the held impact"), EvaluateAttack(T, RecStart + 0.225f).ClipTime, 0.79f, 0.001f);
+	TestTrue(TEXT("a recovery hold is still recovery (no armour)"), EvaluateAttack(T, RecStart + 0.225f).Phase == EAttackPhase::Recovery);
+	TestEqual(TEXT("its end"), EvaluateAttack(T, RecStart + 0.45f).ClipTime, 0.80f, 0.001f);
+	TestEqual(TEXT("then the return at its own rate"), EvaluateAttack(T, RecStart + 0.45f + 0.55f).ClipTime, 0.80f + 0.55f * (1.51f / 1.10f), 0.002f);
+	TestEqual(TEXT("ends at the clip end"), EvaluateAttack(T, RecStart + 1.549f).ClipTime, 2.31f, 0.003f);
+	TestEqual(TEXT("valid"), ValidateTiming(T).Num(), 0);
+	FAttackTiming Mid = T;
+	Mid.ClipRecoveryHoldAt = 1.20f; Mid.ClipRecoveryHoldTo = 0.f; // still, partway through
+	const float Rate = 1.53f / 1.10f;
+	const float HoldAt = RecStart + (1.20f - 0.78f) / Rate;
+	TestEqual(TEXT("a still recovery hold partway: reaches its pose"), EvaluateAttack(Mid, HoldAt).ClipTime, 1.20f, 0.002f);
+	TestEqual(TEXT("and stays there"), EvaluateAttack(Mid, HoldAt + 0.4f).ClipTime, 1.20f, 0.002f);
+	FAttackTiming Long = T;
+	Long.RecoveryHold = 2.f;
+	TestTrue(TEXT("a recovery hold longer than the recovery is an error"), ValidateTiming(Long).Num() > 0);
+	FAttackTiming Outside = T;
+	Outside.ClipRecoveryHoldAt = 0.70f;
+	TestTrue(TEXT("a recovery hold before the active end is an error"), ValidateTiming(Outside).Num() > 0);
+	return true;
+}
+
 #endif

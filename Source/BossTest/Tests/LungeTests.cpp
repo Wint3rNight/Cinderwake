@@ -20,4 +20,18 @@ bool FLungeDistance::RunTest(const FString& Parameters)
 	return true;
 }
 
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FLungeIntercept, "BossTest.Combat.Lunge.InterceptPoint", LungeTestFlags)
+bool FLungeIntercept::RunTest(const FString& Parameters)
+{
+	// Step 5: Executioner's Advance dashes to where you'll be, not where you are, with the lead capped at 2 m.
+	const FVector You(1000.f, 0.f, 0.f);
+	TestTrue(TEXT("standing still: your position"), InterceptPoint(You, FVector::ZeroVector, 0.30f, 200.f).Equals(You, 0.1));
+	TestTrue(TEXT("running 4 m/s sideways for 0.3 s: 1.2 m ahead of you"), InterceptPoint(You, FVector(0.f, 400.f, 0.f), 0.30f, 200.f).Equals(FVector(1000.f, 120.f, 0.f), 0.1));
+	// (A dodge isn't led at all: the attack component passes no velocity while the target moves by root motion.)
+	TestTrue(TEXT("a fast target: the lead is capped at 2 m"), InterceptPoint(You, FVector(0.f, 1000.f, 0.f), 0.30f, 200.f).Equals(FVector(1000.f, 200.f, 0.f), 0.1));
+	TestTrue(TEXT("vertical speed is ignored"), InterceptPoint(You, FVector(0.f, 0.f, 500.f), 0.30f, 200.f).Equals(You, 0.1));
+	return true;
+}
+
 #endif

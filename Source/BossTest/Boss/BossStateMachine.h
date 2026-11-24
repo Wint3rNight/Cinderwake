@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 
-enum class EBossState : uint8 { Intro, Evaluate, Approach, Turn, Neutral, Attack, Stagger, Paused, Dead };
+enum class EBossState : uint8 { Intro, Evaluate, Approach, Turn, Neutral, Attack, Stagger, Paused, Dead, CastBroken };
 
 // Higher wins. A request needs at least the priority his current state holds.
 enum class EBossPriority : uint8 { Decision, Recovery, CommittedAttack, Stagger, Scripted, Transformation, Death };
@@ -42,6 +42,9 @@ public:
 	int32 GetTimeoutCount() const { return TimeoutCount; }
 	// A committed attack's recovery only holds recovery priority (a stagger can land, decisions still can't).
 	void SetAttackRecovering(bool bRecovering);
+	// A sequence's next step (Step 5): the attack goes on as a fresh commitment (committed priority, its own state clock
+	// and timeout). If a safe-point request is pending, that plays instead and this returns false.
+	bool NextStep(const FString& Reason, float Timeout = -1.f);
 	// Advances the state's clock. Returns true when a timeout fired: it's recorded and he goes back to Evaluate.
 	bool Tick(float Dt);
 	void Reset(float IntroTimeout = -1.f);   // back to the intro (its clip length plus 1 s), no history

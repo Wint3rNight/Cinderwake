@@ -17,6 +17,7 @@ struct FCombatHitContext
 	bool bHeavy = false;            // heavy, dash and charged attacks
 	bool bKnockdown = false;        // a landed hit knocks the target down instead of a normal reaction
 	bool bBlockable = false;        // a weapon sweep: a guard can stop it (projectiles, tethers, bursts, rings can't)
+	bool bSoulFragment = false;     // a soul hit: on a Hit, the target loses a fragment of max HP (spec section 8)
 	float AngleFromTargetFront = 0.f; // degrees between the target's facing and the direction to the attacker
 	EHitPolicy Policy = EHitPolicy::SingleHitPerTarget;
 	float MultiHitInterval = 0.f;
@@ -31,6 +32,7 @@ struct FHitOutcome
 	float DamageDealt = 0.f;
 	EPoiseOutcome Poise = EPoiseOutcome::None;
 	bool bCastBroken = false;
+	bool bFragmentTaken = false;    // a soul hit landed and took a fragment
 	bool bKilled = false;
 	bool bKnockdown = false;        // on a Hit: knocked down; on a Blocked hit: a heavy block (no knockdown)
 	float BlockedDamage = 0.f;      // a Blocked or PerfectGuard hit's raw damage (the stamina cost; a perfect sends it back as poise)

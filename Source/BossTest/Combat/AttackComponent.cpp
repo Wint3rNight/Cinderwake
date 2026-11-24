@@ -5,6 +5,10 @@
 #include "Animation/AnimSequenceBase.h"
 #include "Combat/AttackDefinition.h"
 #include "Combat/CombatantComponent.h"
+#include "Combat/DeliveryComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Particles/ParticleSystem.h"
+#include "Particles/ParticleSystemComponent.h"
 #include "Combat/Lunge.h"
 #include "Combat/Tracking.h"
 #include "Curves/CurveFloat.h"
@@ -35,7 +39,7 @@ void UAttackComponent::SetDrawDebug(bool bOn)
 
 namespace
 {
-	const TCHAR* ResultName(EHitResult Result)
+	const TCHAR* AttackResultName(EHitResult Result)
 	{
 		switch (Result)
 		{
@@ -116,7 +120,63 @@ float UAttackComponent::GetTimeToFree() const
 	return CurrentDefinition ? FMath::Max(0.f, Timing.Total() - Elapsed) : 0.f;
 }
 
-bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarget, float BlendIn, bool bEasedBlend)
+uint32 UAttackComponent::AllocateInstanceId()
+{
+	uint32 Id = ++NextInstanceId;
+	if (Id == 0)
+	{
+		Id = ++NextInstanceId; // 0 is never a valid instance
+	}
+	return Id;
+}
+
+void UAttackComponent::QueueNext(UAttackDefinition* Next, float ExtraHold)
+{
+	QueuedNext = Next;
+	QueuedHold = ExtraHold;
+}
+
+void UAttackComponent::ClearQueue()
+{
+	QueuedNext = nullptr;
+	QueuedHold = 0.f;
+}
+
+void UAttackComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	ClearEffects();
+	if (TrailComponent)
+	{
+		TrailComponent->DestroyComponent();
+		TrailComponent = nullptr;
+	}
+	Super::EndPlay(EndPlayReason);
+}
+
+void UAttackComponent::ClearEffects()
+{
+	for (TObjectPtr<UParticleSystemComponent>& Cue : CueComponents)
+	{
+		if (Cue)
+		{
+			Cue->DeactivateSystem();
+			Cue->DestroyComponent();
+		}
+		Cue = nullptr;
+	}
+	// Attached one-shots (the cast glow on his hand) stop emitting when he's interrupted, and finish by themselves.
+	for (TObjectPtr<UParticleSystemComponent>& Cue : OneShotCues)
+	{
+		if (IsValid(Cue))
+		{
+			Cue->DeactivateSystem();
+		}
+	}
+	OneShotCues.Reset();
+	EndTrails();
+}
+
+bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarget, float BlendIn, bool bEasedBlend, float ExtraHold)
 {
 	if (!Definition || !Definition->Clip)
 	{
@@ -132,15 +192,19 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	EndAttack();
 	CurrentDefinition = Definition;
 	Timing = Definition->GetTiming();
-	// Armour from the first frame, before this component next ticks.
-	SetOwnerArmor(ArmorAt(EvaluateAttack(Timing, 0.f).Phase, Definition->GetWindupArmor(), Definition->GetActiveArmor()));
-	Elapsed = 0.f;
-	InstanceId = ++NextInstanceId;
-	if (InstanceId == 0)
+	if (ExtraHold != 0.f)
 	{
-		InstanceId = ++NextInstanceId; // 0 is never a valid instance
+		AddHoldTime(Timing, ExtraHold);
 	}
+	// Armour from the first frame, before this component next ticks.
+	const FAttackSample First = EvaluateAttack(Timing, 0.f);
+	SetOwnerArmor(ArmorAt(First.Phase, Definition->GetWindupArmor(), Definition->GetActiveArmor()));
+	Elapsed = 0.f;
+	InstanceId = AllocateInstanceId();
 	Target = InTarget;
+	bDeliveryDone = false;
+	CueFired.Init(false, Definition->Cues.Num());
+	CueComponents.SetNum(Definition->Cues.Num());
 	PrevPoints.Reset();
 	bLungeDone = false;
 	bAtBranch = false;
@@ -148,12 +212,15 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	bBranchResolved = !(Definition->BranchVariant && Definition->BranchVariant->Clip);
 	BranchWait = 0.f;
 
-	Montage = PlayPaused(Definition->Clip, BlendIn, bEasedBlend);
+	// An attack with a lead-in starts on that clip (Double Execution's re-raise).
+	CurrentSpan = First.Span;
+	Montage = PlayPaused(SpanClip(First.Span), BlendIn, bEasedBlend);
 	if (!Montage)
 	{
 		CurrentDefinition = nullptr;
 		return false;
 	}
+	Anim->Montage_SetPosition(Montage, First.SpanTime);
 
 	UE_LOG(LogTemp, Log, TEXT("BossTest: %s starts %s (instance %u)"), *GetOwner()->GetName(), *Definition->GetName(), InstanceId);
 	return true;
@@ -190,6 +257,15 @@ void UAttackComponent::EndAttack()
 		LungeId = 0;
 	}
 	SetOwnerArmor(EArmor::None); // an interrupted attack mustn't leave its armour behind
+	ClearQueue();
+	ClearEffects();
+	if (UDeliveryComponent* Delivery = GetOwner()->FindComponentByClass<UDeliveryComponent>())
+	{
+		Delivery->ForgetInstance(InstanceId); // rings already launched keep their own skip sets
+	}
+	bDeliveryDone = false;
+	CurrentSpan = EAttackSpan::Main;
+	CueFired.Reset();
 	bAtBranch = false;
 	bBranchResolved = false;
 	BranchWait = 0.f;
@@ -276,7 +352,7 @@ bool UAttackComponent::SwitchTo(UAttackDefinition* Definition)
 		{
 			if (UAnimInstance* Anim = Mesh->GetAnimInstance())
 			{
-				Anim->Montage_SetPosition(Montage, EvaluateAttack(Definition->GetTiming(), 0.f).ClipTime); // from its trim
+				Anim->Montage_SetPosition(Montage, EvaluateAttack(Definition->GetTiming(), 0.f).SpanTime); // from its trim
 			}
 		}
 		PrevPoints.Reset();
@@ -285,6 +361,10 @@ bool UAttackComponent::SwitchTo(UAttackDefinition* Definition)
 	}
 	CurrentDefinition = Definition;
 	Timing = Definition->GetTiming();
+	CurrentSpan = EAttackSpan::Main;
+	ClearEffects();
+	CueFired.Init(false, Definition->Cues.Num());
+	CueComponents.SetNum(Definition->Cues.Num());
 	// The lunge belongs to the new attack's window; a running one stops.
 	if (LungeId != 0)
 	{
@@ -356,8 +436,15 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 	TrackTarget(Step); // before advancing: tracking covers every moment up to the cutoff
 	Elapsed += Step;
 	const FAttackSample Sample = EvaluateAttack(Timing, Elapsed);
-	Pose(Sample.ClipTime);
+	Pose(Sample);
 	SetOwnerArmor(ArmorAt(Sample.Phase, CurrentDefinition->GetWindupArmor(), CurrentDefinition->GetActiveArmor()));
+	UpdateCues(Sample.ClipTime);
+	UpdateTrails(Sample.Phase == EAttackPhase::Active);
+	if (!bDeliveryDone && CurrentDefinition->Delivery != EAttackDelivery::None && Sample.Phase >= EAttackPhase::Active
+		&& Sample.ClipTime >= CurrentDefinition->DeliveryClipAt - KINDA_SMALL_NUMBER)
+	{
+		Deliver();
+	}
 
 	const FLungeWindow Window = LungeWindow(Timing, CurrentDefinition->LungeStartsBeforeActive, CurrentDefinition->LungeEndsIntoActive);
 	if (!bLungeDone && Elapsed >= Window.Start)
@@ -366,7 +453,9 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 		ApplyLunge(Window.Duration);
 	}
 
-	if (ActiveOverlap(Timing, Before, Elapsed))
+	// No sockets, no sweep: an empty socket name gives the mesh's own transform, which would sweep his feet.
+	const bool bHasWeapon = !CurrentDefinition->SocketStart.IsNone() && !CurrentDefinition->SocketEnd.IsNone();
+	if (bHasWeapon && ActiveOverlap(Timing, Before, Elapsed))
 	{
 		SweepWeapon();
 	}
@@ -375,19 +464,172 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 		PrevPoints.Reset();
 	}
 
-	if (Sample.Phase == EAttackPhase::Done)
+	if (Sample.Phase == EAttackPhase::Done && CurrentDefinition)
 	{
+		// A queued step starts here, in the same tick: no frame without armour, a new instance, its own blend-in.
+		UAttackDefinition* Next = QueuedNext;
+		const float NextHold = QueuedHold;
+		if (Next && (!CanContinue || CanContinue()))
+		{
+			AActor* KeepTarget = Target.Get();
+			if (StartAttack(Next, KeepTarget, Next->BlendIn, Next->bEaseBlendIn, NextHold))
+			{
+				OnStepStarted.Broadcast(Next, InstanceId);
+				return;
+			}
+		}
 		StopAttack(0.2f);
 	}
 }
 
-void UAttackComponent::Pose(float ClipTime)
+UAnimSequenceBase* UAttackComponent::SpanClip(EAttackSpan Span) const
 {
+	if (!CurrentDefinition)
+	{
+		return nullptr;
+	}
+	switch (Span)
+	{
+	case EAttackSpan::LeadIn: return CurrentDefinition->LeadInClip;
+	case EAttackSpan::Tail: return CurrentDefinition->TailClip;
+	default: return CurrentDefinition->Clip;
+	}
+}
+
+void UAttackComponent::UpdateCues(float ClipTime)
+{
+	const TArray<FAttackCue>& Cues = CurrentDefinition->Cues;
+	USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	if (!Mesh || CueFired.Num() != Cues.Num() || CueComponents.Num() != Cues.Num())
+	{
+		return;
+	}
+	for (int32 i = 0; i < Cues.Num(); ++i)
+	{
+		const FAttackCue& Cue = Cues[i];
+		if (!CueFired[i] && Cue.Effect && ClipTime >= Cue.ClipFrom)
+		{
+			CueFired[i] = true;
+			UParticleSystemComponent* Spawned = nullptr;
+			if (Cue.bAttached)
+			{
+				Spawned = UGameplayStatics::SpawnEmitterAttached(Cue.Effect, Mesh, Cue.Socket, FVector::ZeroVector, FRotator::ZeroRotator,
+					FVector(Cue.Scale), EAttachLocation::SnapToTarget, Cue.bOneShot);
+			}
+			else
+			{
+				const ACharacter* Character = Cast<ACharacter>(GetOwner());
+				const FVector Feet = Character ? Character->GetActorLocation() - FVector(0.f, 0.f, Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()) : GetOwner()->GetActorLocation();
+				const FVector At = Cue.Socket.IsNone() ? Feet : Mesh->GetSocketLocation(Cue.Socket);
+				Spawned = UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), Cue.Effect, At, GetOwner()->GetActorRotation(), FVector(Cue.Scale), Cue.bOneShot);
+			}
+			if (!Cue.bOneShot)
+			{
+				CueComponents[i] = Spawned; // looping: stopped at ClipTo or the attack's end, never leaked
+			}
+			else if (Cue.bAttached && Spawned)
+			{
+				OneShotCues.Add(Spawned);
+			}
+		}
+		if (CueComponents[i] && Cue.ClipTo > Cue.ClipFrom && ClipTime >= Cue.ClipTo)
+		{
+			CueComponents[i]->DeactivateSystem();
+			CueComponents[i]->DestroyComponent();
+			CueComponents[i] = nullptr;
+		}
+	}
+}
+
+void UAttackComponent::UpdateTrails(bool bActive)
+{
+	UParticleSystem* Effect = CurrentDefinition ? CurrentDefinition->TrailEffect : nullptr;
+	if (bActive && Effect && !bTrailsOn)
+	{
+		USkeletalMeshComponent* Mesh = GetOwnerMesh();
+		if (!Mesh)
+		{
+			return;
+		}
+		// Cascade's anim trail reads its parent mesh's sockets, so it must be attached to the mesh (a free one asserts).
+		if (!TrailComponent || TrailComponent->Template != Effect)
+		{
+			if (TrailComponent)
+			{
+				TrailComponent->DestroyComponent();
+			}
+			TrailComponent = UGameplayStatics::SpawnEmitterAttached(Effect, Mesh, NAME_None, FVector::ZeroVector, FRotator::ZeroRotator,
+				EAttachLocation::KeepRelativeOffset, false);
+		}
+		else
+		{
+			TrailComponent->ActivateSystem(true);
+		}
+		if (TrailComponent)
+		{
+			TrailComponent->BeginTrails(CurrentDefinition->SocketStart, CurrentDefinition->SocketEnd, ETrailWidthMode_FromCentre, 1.f);
+			bTrailsOn = true;
+		}
+	}
+	else if (!bActive && bTrailsOn)
+	{
+		EndTrails();
+	}
+}
+
+void UAttackComponent::EndTrails()
+{
+	if (TrailComponent && bTrailsOn)
+	{
+		TrailComponent->EndTrails();
+	}
+	bTrailsOn = false;
+}
+
+void UAttackComponent::Deliver()
+{
+	bDeliveryDone = true;
+	UDeliveryComponent* Delivery = GetOwner()->FindComponentByClass<UDeliveryComponent>();
+	USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	const UAttackDefinition* Def = CurrentDefinition;
+	if (!Delivery || !Mesh || !Def)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("BossTest: %s can't launch %s's delivery (no delivery component or mesh)"), *GetOwner()->GetName(), Def ? *Def->GetName() : TEXT("?"));
+		return;
+	}
+	const FVector From = Def->DeliverySocket.IsNone() ? GetOwner()->GetActorLocation() : Mesh->GetSocketLocation(Def->DeliverySocket);
+	if (Def->Delivery == EAttackDelivery::Ring)
+	{
+		Delivery->LaunchRing(*Def, InstanceId, From);
+	}
+	else if (Def->Delivery == EAttackDelivery::Projectile)
+	{
+		// Aimed once, at where the target is now (spec section 5: Soul Mark aims at its windup's end, then commits).
+		const AActor* TargetActor = Target.Get();
+		const FVector Aim = TargetActor ? TargetActor->GetActorLocation() : From + GetOwner()->GetActorForwardVector() * 1000.f;
+		Delivery->LaunchProjectile(*Def, From, (Aim - From).GetSafeNormal());
+	}
+}
+
+void UAttackComponent::Pose(const FAttackSample& Sample)
+{
+	// Crossing into another span's clip: Paragon's chained clips join exactly, so the switch is instant.
+	if (Sample.Span != CurrentSpan)
+	{
+		if (UAnimSequenceBase* Clip = SpanClip(Sample.Span))
+		{
+			if (UAnimMontage* Next = PlayPaused(Clip, 0.f, false))
+			{
+				Montage = Next;
+			}
+		}
+		CurrentSpan = Sample.Span;
+	}
 	if (USkeletalMeshComponent* Mesh = GetOwnerMesh())
 	{
 		if (UAnimInstance* Anim = Mesh->GetAnimInstance())
 		{
-			Anim->Montage_SetPosition(Montage, ClipTime);
+			Anim->Montage_SetPosition(Montage, Sample.SpanTime);
 		}
 	}
 }
@@ -400,8 +642,9 @@ void UAttackComponent::ApplyLunge(float Duration)
 		return;
 	}
 	// Toward the target when there is one (the owner picks it), measured along where the attacker
-	// faces now; otherwise half the cap straight ahead.
-	const FVector Forward = Character->GetActorForwardVector().GetSafeNormal2D();
+	// faces now; otherwise half the cap straight ahead. An intercepting lunge (the Advance's dash) aims at where
+	// the target will be instead, whichever way he faces.
+	FVector Forward = Character->GetActorForwardVector().GetSafeNormal2D();
 	TOptional<float> Edge;
 	if (const AActor* TargetActor = Target.Get())
 	{
@@ -410,7 +653,20 @@ void UAttackComponent::ApplyLunge(float Duration)
 		{
 			TargetRadius = TargetCharacter->GetCapsuleComponent()->GetScaledCapsuleRadius();
 		}
-		const float Ahead = FVector::DotProduct(TargetActor->GetActorLocation() - Character->GetActorLocation(), Forward);
+		FVector Aim = TargetActor->GetActorLocation();
+		if (CurrentDefinition->LungeAim == ELungeAim::Intercept)
+		{
+			// A dodge or a lunge is root motion: never led (it would fling him 2 m with it). Running and sprinting are.
+			const ACharacter* TargetCharacter = Cast<ACharacter>(TargetActor);
+			const bool bRootMotion = TargetCharacter && TargetCharacter->GetCharacterMovement()->HasRootMotionSources();
+			Aim = InterceptPoint(Aim, bRootMotion ? FVector::ZeroVector : TargetActor->GetVelocity(), Duration, CurrentDefinition->InterceptLeadMax);
+			const FVector ToAim = (Aim - Character->GetActorLocation()).GetSafeNormal2D();
+			if (!ToAim.IsNearlyZero())
+			{
+				Forward = ToAim;
+			}
+		}
+		const float Ahead = FVector::DotProduct(Aim - Character->GetActorLocation(), Forward);
 		Edge = Ahead - Character->GetCapsuleComponent()->GetScaledCapsuleRadius() - TargetRadius;
 	}
 	const float Distance = LungeDistance(Edge, CurrentDefinition->LungeCap, CurrentDefinition->LungeStopDistance);
@@ -543,8 +799,18 @@ void UAttackComponent::SweepWeapon()
 		{
 			continue; // already hit by this instance: not worth logging every frame
 		}
+		OnSweepResolved.Broadcast(Outcome, Victim->GetOwner(), InstanceId);
+		if (Outcome.Result != EHitResult::Immune)
+		{
+			// One slam, one dodge: whoever the direct strike hit, or who dodged, blocked or deflected it, is skipped by
+			// this attack's ring.
+			if (UDeliveryComponent* Delivery = GetOwner()->FindComponentByClass<UDeliveryComponent>())
+			{
+				Delivery->NoteDirectResult(InstanceId, Victim->GetTargetKey());
+			}
+		}
 		UE_LOG(LogTemp, Log, TEXT("BossTest: %s -> %s with %s: %s, %.0f damage%s%s%s"),
-			*GetOwner()->GetName(), *Victim->GetOwner()->GetName(), *Def->GetName(), ResultName(Outcome.Result), Outcome.DamageDealt,
+			*GetOwner()->GetName(), *Victim->GetOwner()->GetName(), *Def->GetName(), AttackResultName(Outcome.Result), Outcome.DamageDealt,
 			Outcome.Poise == EPoiseOutcome::Stagger ? TEXT(", STAGGER") : Outcome.Poise == EPoiseOutcome::DeferredStagger ? TEXT(", deferred stagger") : TEXT(""),
 			Outcome.bCastBroken ? TEXT(", cast broken") : TEXT(""), Outcome.bKilled ? TEXT(", KILLED") : TEXT(""));
 
@@ -571,7 +837,7 @@ void UAttackComponent::SweepWeapon()
 				// stagger and his immunity all apply exactly as they do to a sword hit. Its own registry, so the
 				// attack's never collects one-off entries.
 				FCombatHitContext Back;
-				Back.AttackInstanceId = ++NextInstanceId;
+				Back.AttackInstanceId = AllocateInstanceId();
 				Back.PoiseDamage = Outcome.BlockedDamage;
 				Back.Time = Elapsed;
 				Back.WorldTime = Hit.WorldTime;
@@ -586,6 +852,11 @@ void UAttackComponent::SweepWeapon()
 		if (Outcome.Result == EHitResult::Hit)
 		{
 			OnHitLanded.Broadcast(Outcome, Victim->GetOwner());
+			if (Def->HitEffect)
+			{
+				UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), Def->HitEffect, Mesh->GetSocketLocation(Def->SocketEnd), FRotator::ZeroRotator,
+					FVector(Def->HitEffectScale), true);
+			}
 			Victim->StartHitStop(Def->HitStop);
 			if (UCombatantComponent* Self = GetOwner()->FindComponentByClass<UCombatantComponent>())
 			{

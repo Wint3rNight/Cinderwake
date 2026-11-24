@@ -125,6 +125,49 @@ bool FResolveStaggerBeatsCastBreak::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FResolveDeferredStaggerBeatsCastBreak, "BossTest.Combat.Resolve.DeferredStaggerBeatsCastBreak", ResolveTestFlags)
+bool FResolveDeferredStaggerBeatsCastBreak::RunTest(const FString& Parameters)
+{
+	// Step 5 review: under armour the same hit gives a deferred stagger and a cast break. The stagger still wins
+	// (spec section 9), or entering the cast-broken state would drop the pending stagger.
+	FCombatantState Target;
+	FHitRegistry Registry;
+	Target.Poise.Apply(640.f, false, EArmor::None);
+	Target.Cast.Open(70.f);
+	Target.Cast.Apply(35.f);
+	Target.Armor = EArmor::Windup;
+	const FHitOutcome Out = ResolveCombatHit(MakeHit(1), Target, Registry);
+	TestTrue(TEXT("the light hit defers a stagger under windup armour"), Out.Poise == EPoiseOutcome::DeferredStagger);
+	TestFalse(TEXT("so it isn't a cast break"), Out.bCastBroken);
+	TestFalse(TEXT("and the cast is closed"), Target.Cast.IsOpen());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FResolveSoulFragment, "BossTest.Combat.Resolve.SoulFragmentOnHitOnly", ResolveTestFlags)
+bool FResolveSoulFragment::RunTest(const FString& Parameters)
+{
+	// Step 5: a soul hit (Soul Mark) rips out a fragment of max HP, through the resolver, and only when it lands.
+	FCombatHitContext Soul = MakeHit(1);
+	Soul.Damage = 30.f;
+	Soul.bSoulFragment = true;
+	FCombatantState Target;
+	FHitRegistry Registry;
+	const FHitOutcome Out = ResolveCombatHit(Soul, Target, Registry);
+	TestTrue(TEXT("a landed soul hit takes a fragment"), Out.Result == EHitResult::Hit && Out.bFragmentTaken && Target.Health.Fragments == 1);
+	TestEqual(TEXT("max HP drops 15%"), Target.Health.Max(), 255.f, ResolveTol);
+	FCombatantState Dodger;
+	Dodger.bInvulnerable = true;
+	FHitRegistry R2;
+	const FHitOutcome Dodged = ResolveCombatHit(Soul, Dodger, R2);
+	TestTrue(TEXT("dodged: no fragment"), Dodged.Result == EHitResult::Dodged && !Dodged.bFragmentTaken && Dodger.Health.Fragments == 0);
+	FCombatantState Dying;
+	Dying.Health.Current = 20.f;
+	FHitRegistry R3;
+	const FHitOutcome Killed = ResolveCombatHit(Soul, Dying, R3);
+	TestTrue(TEXT("a killing soul hit doesn't bring him back to 1 HP"), Killed.bKilled && Dying.Health.IsDead());
+	return true;
+}
+
 #endif
 
 #if WITH_DEV_AUTOMATION_TESTS

@@ -159,6 +159,12 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Clips")
 	TObjectPtr<UAnimSequenceBase> KnockdownBack;
 
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Clips", meta = (ToolTip = "Played after the knockdown's fall, from where the fall lands; both fit the knockdown"))
+	TObjectPtr<UAnimSequenceBase> KnockdownGetUp;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Clips", meta = (ToolTip = "Clip second the knockdown's fall starts from (skips a standing stagger: the hit is the impact)"))
+	float KnockdownFallFrom = 0.35f;
+
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Clips", meta = (ToolTip = "Its first HealCast seconds play during the heal"))
 	TObjectPtr<UAnimSequenceBase> HealClip;
 
@@ -248,6 +254,8 @@ private:
 	void ApplyGuardTuning();
 	void TickCamera();
 	void PlayReaction(bool bKnockdown);
+	float KnockdownGetUpIn = -1.f; // gameplay seconds until the knockdown's get-up clip starts; below 0 when none waits
+	float KnockdownRate = 1.f;
 	UAnimMontage* PlayClip(UAnimSequenceBase* Clip, float Rate, float BlendIn, float BlendOut, int32 Loops = 1, float StartAt = 0.f);
 	void StopClip(float BlendOut);
 	void FaceForAction();

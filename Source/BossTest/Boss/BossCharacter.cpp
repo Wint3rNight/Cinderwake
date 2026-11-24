@@ -8,6 +8,7 @@
 #include "Combat/AttackComponent.h"
 #include "Combat/AttackDefinition.h"
 #include "Combat/CombatantComponent.h"
+#include "Combat/DeliveryComponent.h"
 #include "Combat/Tracking.h"
 #include "Components/CapsuleComponent.h"
 #include "DrawDebugHelpers.h"
@@ -78,6 +79,7 @@ ABossCharacter::ABossCharacter(const FObjectInitializer& ObjectInitializer)
 	Combatant->StaggerDuration = 1.8f; // 2026-11-23 council: so the charged heavy has a window (was 1.25 s)
 	Attacks = CreateDefaultSubobject<UAttackComponent>(TEXT("Attacks"));
 	Attacks->MontageSlot = MontageSlot;
+	Delivery = CreateDefaultSubobject<UDeliveryComponent>(TEXT("Delivery"));
 }
 
 void ABossCharacter::OnConstruction(const FTransform& Transform)
@@ -120,6 +122,31 @@ void ABossCharacter::BeginPlay()
 	}
 
 	Combatant->OnHitResolved.AddUObject(this, &ABossCharacter::OnHitResolved);
+
+	// Step 5: his actions. Sequences chain inside the attack component; a pending stagger stops the chain.
+	Rng.Initialize(Seed != 0 ? Seed : FMath::Rand());
+	UE_LOG(LogBossTest, Log, TEXT("Sevarog: seed %d"), Rng.GetInitialSeed());
+	Delivery->AddTickPrerequisiteComponent(Attacks); // a ring sees this frame's sweep results before it checks
+	Cooldowns.Init(0.f, Actions.Num());
+	Attacks->CanContinue = [this]() { return States.GetState() == EBossState::Attack && !States.HasPendingSafePoint(); };
+	Attacks->OnStepStarted.AddUObject(this, &ABossCharacter::OnStepStarted);
+	if (Actions.Num() == 0)
+	{
+		UE_LOG(LogBossTest, Warning, TEXT("%s has no actions: Executioner's Swing only (Docs/tools/setup_boss.py fills them)"), *GetName());
+	}
+	for (const FBossAction& A : Actions)
+	{
+		for (const FBossActionVariant& V : A.Variants)
+		{
+			for (const TObjectPtr<UAttackDefinition>& Step : V.Steps)
+			{
+				if (!Step || !Step->Clip)
+				{
+					UE_LOG(LogBossTest, Error, TEXT("%s: action %s has a step with no attack or no clip"), *GetName(), *A.Name.ToString());
+				}
+			}
+		}
+	}
 	States.OnTransition = [this](EBossState From, EBossState To) { OnStateChanged(From, To); };
 	// Every request, its outcome and every timeout go to the log (spec section 17); timeouts as warnings.
 	States.OnRecord = [](const FBossRequestRecord& R, bool bTimeout)
@@ -155,6 +182,10 @@ void ABossCharacter::Tick(float DeltaSeconds)
 	// The state clock steps like the attack clock (dilated, at most 1/30 s per tick), so a slow frame
 	// rate stretches both together and an attack never outlives its own timeout.
 	States.Tick(ClampAttackStep(DeltaSeconds));
+	for (float& Left : Cooldowns)
+	{
+		Left = FMath::Max(0.f, Left - ClampAttackStep(DeltaSeconds));
+	}
 
 	switch (States.GetState())
 	{
@@ -183,6 +214,12 @@ void ABossCharacter::Tick(float DeltaSeconds)
 	case EBossState::Attack:
 		TickAttack();
 		break;
+	case EBossState::CastBroken:
+		if (States.GetStateTime() >= CastBrokenTime)
+		{
+			States.Complete(EBossState::Evaluate, TEXT("recoil over"));
+		}
+		break;
 	case EBossState::Stagger:
 		// The poise model owns the stagger's length; the state's timeout is only a backstop.
 		if (!Combatant->State.Poise.IsStaggered())
@@ -208,6 +245,27 @@ void ABossCharacter::Evaluate()
 	if (!Player())
 	{
 		States.Request(EBossState::Neutral, EBossPriority::Decision, TEXT("no player"), NeutralBeat + 1.f);
+		return;
+	}
+	if (Actions.Num() > 0)
+	{
+		const TArray<FBossActionOption> Options = ActionOptions();
+		const FBossChoiceResult Choice = ChooseBossAction(Situation(), Options, Rng);
+		switch (Choice.Choice)
+		{
+		case EBossChoice::Attack:
+			StartAction(Choice.ActionId, TEXT("picked"));
+			break;
+		case EBossChoice::Turn:
+			States.Request(EBossState::Turn, EBossPriority::Decision, TEXT("an action fits once he faces you"));
+			break;
+		case EBossChoice::Approach:
+			States.Request(EBossState::Approach, EBossPriority::Decision, TEXT("closing in"), ApproachTime + 1.f);
+			break;
+		default:
+			States.Request(EBossState::Neutral, EBossPriority::Decision, TEXT("player down: waiting"), NeutralBeat + 1.f);
+			break;
+		}
 		return;
 	}
 	FBossPlaceholderTuning Tuning;
@@ -253,7 +311,19 @@ void ABossCharacter::TickApproach(float DeltaSeconds)
 		States.Complete(EBossState::Evaluate, TEXT("player gone or down"));
 		return;
 	}
-	if (EdgeDistanceToPlayer() <= SwingRange() && AngleToPlayer() <= 90.f)
+	if (Actions.Num() > 0)
+	{
+		// Stop closing in as soon as something fits; Evaluate rolls among what fits. A copy of the stream, so checking
+		// doesn't shift the seeded rolls.
+		FRandomStream Peek = Rng;
+		const TArray<FBossActionOption> Options = ActionOptions();
+		if (ChooseBossAction(Situation(), Options, Peek).Choice == EBossChoice::Attack)
+		{
+			States.Complete(EBossState::Evaluate, TEXT("in range of an action"));
+			return;
+		}
+	}
+	else if (EdgeDistanceToPlayer() <= SwingRange() && AngleToPlayer() <= 90.f)
 	{
 		StartSwing(TEXT("reached range"));
 		return;
@@ -285,6 +355,12 @@ void ABossCharacter::TickAttack()
 	{
 		States.Complete(EBossState::Neutral, TEXT("swing over"), NeutralBeat + 1.f);
 		return;
+	}
+	// A cast can be broken only during its windup (spec section 9).
+	if (bCastOpen && Attacks->GetSample().Phase >= EAttackPhase::Active)
+	{
+		Combatant->State.Cast.Close();
+		bCastOpen = false;
 	}
 	// Recovery is the safe point: a stagger deferred by his armour starts here.
 	if (!bRecoveringSent && Attacks->GetSample().Phase >= EAttackPhase::Recovery)
@@ -353,8 +429,12 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 	case EBossState::Attack:
 		if (Attacks->IsAttacking())
 		{
-			Attacks->StopAttack(0.15f); // interrupted: a stagger, death or a timeout (clears his armour)
+			Attacks->StopAttack(0.15f); // interrupted: a stagger, death or a timeout (clears his armour and the queue)
 		}
+		Combatant->State.Cast.Close(); // a cast never stays open into the next attack
+		bCastOpen = false;
+		PendingSteps.Reset();
+		CurrentAction = -1;
 		bRecoveringSent = false;
 		if (To == EBossState::Dead)
 		{
@@ -380,11 +460,29 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 		GetCharacterMovement()->StopMovementImmediately(); // no glide momentum carried into the windup
 		if (PendingAttack)
 		{
-			Attacks->StartAttack(PendingAttack, Player());
+			const bool bLast = PendingSteps.Num() <= 1;
+			Attacks->StartAttack(PendingAttack, Player(), PendingAttack->BlendIn, PendingAttack->bEaseBlendIn, bLast ? LastStepHold : 0.f);
+			StepIndex = 0;
+			if (PendingSteps.IsValidIndex(1) && PendingSteps[1])
+			{
+				Attacks->QueueNext(PendingSteps[1], PendingSteps.Num() == 2 ? LastStepHold : 0.f);
+			}
+			if (Actions.IsValidIndex(CurrentAction) && Actions[CurrentAction].CastBreakThreshold > 0.f)
+			{
+				Combatant->State.Cast.Open(Actions[CurrentAction].CastBreakThreshold);
+				bCastOpen = true;
+			}
 		}
 		PendingAttack = nullptr;
 		bRecoveringSent = false;
 		break;
+	case EBossState::CastBroken:
+	{
+		StopGlide();
+		UAnimSequenceBase* Clip = CastBrokenClip ? CastBrokenClip.Get() : StaggerClip.Get();
+		PlayClip(Clip, Clip ? Clip->GetPlayLength() / FMath::Max(CastBrokenTime, 0.1f) : 1.f, 0.1f, 0.2f);
+		break;
+	}
 	case EBossState::Stagger:
 	{
 		StopGlide();
@@ -398,6 +496,7 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 	}
 	case EBossState::Dead:
 		Attacks->StopAttack(0.1f);
+		ClearCombat(); // rings and projectiles in flight die with him (spec section 12)
 		StopGlide();
 		if (PlayClip(DeathClip, 1.f, 0.1f, 0.f))
 		{
@@ -424,6 +523,12 @@ void ABossCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacker)
 	{
 		return;
 	}
+	if (Outcome.DamageDealt > 0.f && Attacker && Attacker == Player())
+	{
+		const double Now = GetWorld()->GetTimeSeconds();
+		PlayerHitTimes.RemoveAll([this, Now](double T) { return Now - T > PunishWindow; });
+		PlayerHitTimes.Add(Now); // Punishment Sweep's stand-in trigger (not a perfect guard's poise)
+	}
 	if (Outcome.bKilled)
 	{
 		Attacks->StopAttack(0.05f); // his weapon stops this frame, before anything else ticks
@@ -440,6 +545,129 @@ void ABossCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacker)
 	{
 		States.RequestAtSafePoint(EBossState::Stagger, EBossPriority::Stagger, TEXT("poise broken under armour"), StaggerTimeout);
 	}
+	else if (Outcome.bCastBroken && Attacks->GetSample().Phase < EAttackPhase::Active)
+	{
+		// Only before the release: the attack ticks first, so a hit landing the frame the grasp leaves can't break it.
+		bCastOpen = false;
+		States.Request(EBossState::CastBroken, EBossPriority::Stagger, TEXT("cast broken"), CastBrokenTime + 1.f);
+	}
+}
+
+TArray<FBossActionOption> ABossCharacter::ActionOptions() const
+{
+	TArray<FBossActionOption> Options;
+	for (int32 i = 0; i < Actions.Num(); ++i)
+	{
+		const FBossAction& A = Actions[i];
+		FBossActionOption& O = Options.AddDefaulted_GetRef();
+		O.Id = i;
+		O.MinRange = A.MinRange;
+		O.MaxRange = A.MaxRange;
+		O.Angle = static_cast<EBossAngleRule>(A.Angle);
+		O.RearWeight = A.RearWeight;
+		O.Weight = A.Weight;
+		O.CooldownLeft = Cooldowns.IsValidIndex(i) ? Cooldowns[i] : 0.f;
+		O.bNeedsPunishTrigger = A.bNeedsPunishTrigger;
+	}
+	return Options;
+}
+
+FBossSituation ABossCharacter::Situation() const
+{
+	FBossSituation S;
+	S.EdgeDistance = EdgeDistanceToPlayer();
+	S.AngleDeg = AngleToPlayer();
+	S.bPlayerDown = PlayerDown();
+	S.bPunishTrigger = PunishTriggered();
+	S.LastActionId = LastAction;
+	return S;
+}
+
+bool ABossCharacter::PunishTriggered() const
+{
+	const double Now = GetWorld()->GetTimeSeconds();
+	int32 Recent = 0;
+	for (const double T : PlayerHitTimes)
+	{
+		Recent += Now - T <= PunishWindow ? 1 : 0;
+	}
+	return Recent >= PunishHits;
+}
+
+bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriority Priority)
+{
+	if (!Actions.IsValidIndex(Index) || Actions[Index].Variants.Num() == 0 || !FBossStateMachine::IsLegal(States.GetState(), EBossState::Attack))
+	{
+		return false; // checked before any roll, so a rejected request (key 3 mid-attack) can't disturb the running action
+	}
+	const FBossAction& A = Actions[Index];
+	// The variant is rolled when he commits (spec section 5: Double Execution's 60/25/15).
+	float Total = 0.f;
+	for (const FBossActionVariant& V : A.Variants)
+	{
+		Total += FMath::Max(0.f, V.Chance);
+	}
+	float Roll = Rng.FRand() * Total;
+	int32 Pick = A.Variants.Num() - 1;
+	for (int32 i = 0; i < A.Variants.Num(); ++i)
+	{
+		Roll -= FMath::Max(0.f, A.Variants[i].Chance);
+		if (Roll <= 0.f)
+		{
+			Pick = i;
+			break;
+		}
+	}
+	const FBossActionVariant& V = A.Variants[Pick];
+	if (V.Steps.Num() == 0 || !V.Steps[0])
+	{
+		return false;
+	}
+	PendingSteps = V.Steps;
+	LastStepHold = V.HoldExtraMax > V.HoldExtraMin ? Rng.FRandRange(V.HoldExtraMin, V.HoldExtraMax) : V.HoldExtraMin;
+	PendingAttack = V.Steps[0];
+	CurrentAction = Index;
+	const float FirstHold = V.Steps.Num() == 1 ? LastStepHold : 0.f;
+	const float Timeout = V.Steps[0]->GetTiming().Total() + FirstHold + 1.f;
+	const FString Label = FString::Printf(TEXT("%s (%d of %d): %s"), *A.Name.ToString(), Pick + 1, A.Variants.Num(), *Reason);
+	if (!States.Request(EBossState::Attack, Priority, Label, Timeout))
+	{
+		PendingAttack = nullptr;
+		PendingSteps.Reset();
+		CurrentAction = -1;
+		return false;
+	}
+	if (Cooldowns.IsValidIndex(Index))
+	{
+		Cooldowns[Index] = A.Cooldown;
+	}
+	LastAction = Index;
+	return true;
+}
+
+void ABossCharacter::OnStepStarted(const UAttackDefinition* Step, uint32 InstanceId)
+{
+	// The attack component already started the step; the machine treats it as a fresh commitment.
+	++StepIndex;
+	const bool bLast = StepIndex == PendingSteps.Num() - 1;
+	const float Timeout = Step ? Step->GetTiming().Total() + (bLast ? LastStepHold : 0.f) + 1.f : -1.f;
+	if (!States.NextStep(FString::Printf(TEXT("next step: %s"), Step ? *Step->GetName() : TEXT("?")), Timeout))
+	{
+		return; // a pending request played instead; leaving the attack state stops the step
+	}
+	bRecoveringSent = false;
+	if (PendingSteps.IsValidIndex(StepIndex + 1) && PendingSteps[StepIndex + 1])
+	{
+		Attacks->QueueNext(PendingSteps[StepIndex + 1], StepIndex + 1 == PendingSteps.Num() - 1 ? LastStepHold : 0.f);
+	}
+}
+
+void ABossCharacter::ClearCombat()
+{
+	Delivery->ClearAll();
+	Attacks->ClearEffects();
+	Combatant->State.Cast.Close();
+	bCastOpen = false;
 }
 
 UAnimMontage* ABossCharacter::PlayClip(UAnimSequenceBase* Clip, float Rate, float BlendIn, float BlendOut, int32 Loops)
@@ -527,6 +755,12 @@ TArray<FString> ABossCharacter::DebugLines() const
 		Poise.IsImmune() ? TEXT(" (immune)") : TEXT(""), Poise.HasDeferredStagger() ? TEXT(" (stagger deferred)") : TEXT(""),
 		ArmorName(C.Armor), FBossStateMachine::StateName(States.GetState()), States.GetStateTime(), States.GetTimeout(),
 		bAIEnabled ? TEXT("on") : TEXT("off")));
+	if (Actions.Num() > 0)
+	{
+		Lines.Add(FString::Printf(TEXT("  action %s  |  key 3 forces: %s (4 picks the next)%s"),
+			Actions.IsValidIndex(CurrentAction) ? *Actions[CurrentAction].Name.ToString() : TEXT("-"), *GetSelectedActionName().ToString(),
+			PunishTriggered() ? TEXT("  [punish ready]") : TEXT("")));
+	}
 
 	if (const UAttackDefinition* Def = Attacks->GetCurrent())
 	{
@@ -567,8 +801,32 @@ void ABossCharacter::ToggleAI()
 	}
 }
 
+FName ABossCharacter::GetSelectedActionName() const
+{
+	return Actions.IsValidIndex(SelectedAction) ? Actions[SelectedAction].Name : FName(TEXT("ExecutionersSwing"));
+}
+
+void ABossCharacter::SelectNextAction()
+{
+	SelectedAction = Actions.Num() > 0 ? (SelectedAction + 1) % Actions.Num() : 0;
+}
+
+bool ABossCharacter::ForceAction(int32 Index)
+{
+	if (States.GetState() == EBossState::Neutral)
+	{
+		States.Complete(EBossState::Evaluate, TEXT("forced action"));
+	}
+	return StartAction(Index, TEXT("forced"), EBossPriority::Scripted);
+}
+
 void ABossCharacter::ForceSwing()
 {
+	if (Actions.Num() > 0)
+	{
+		ForceAction(SelectedAction);
+		return;
+	}
 	if (States.GetState() == EBossState::Neutral)
 	{
 		States.Complete(EBossState::Evaluate, TEXT("forced swing"));
@@ -597,6 +855,14 @@ void ABossCharacter::ResetBoss()
 	ClipMontage = nullptr;
 	GlideClip = nullptr;
 	PendingAttack = nullptr;
+	PendingSteps.Reset();
+	CurrentAction = -1;
+	LastAction = -1;
+	Cooldowns.Init(0.f, Actions.Num());
+	PlayerHitTimes.Reset();
+	ClearCombat();
+	Rng.Initialize(Seed != 0 ? Seed : FMath::Rand()); // a retry starts its own rolls (the same ones with a fixed seed)
+	UE_LOG(LogBossTest, Log, TEXT("Sevarog: seed %d"), Rng.GetInitialSeed());
 	bRecoveringSent = false;
 	Combatant->ResetCombatant();
 	TeleportTo(HomeTransform.GetLocation(), HomeTransform.Rotator());

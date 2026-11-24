@@ -1,6 +1,7 @@
 // Step 3, Task 3: the player's action rules (spec section 4).
 #include "Misc/AutomationTest.h"
 #include "Player/PlayerActions.h"
+#include "Player/KnockdownPlan.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -680,13 +681,11 @@ bool FActionsGuardBreak::RunTest(const FString& Parameters)
 	TestTrue(TEXT("broken and exhausted"), A.GetState() == EPlayerState::GuardBroken && A.Stamina.bExhausted && !A.IsGuardActive());
 	A.Tick(Frame(0.99f).Guard());
 	TestTrue(TEXT("staggered at 0.99 s"), A.GetState() == EPlayerState::GuardBroken);
-	TestTrue(TEXT("the break ends at 1.0 s (so its held pose is released)"), Same(A.Tick(Frame(0.01f).Guard()), { C::EndGuardBreak }));
-	TestTrue(TEXT("free, and no guard while exhausted"), A.GetState() == EPlayerState::Free && !A.IsGuardActive());
-	A.Tick(Frame(0.8f));
-	TestTrue(TEXT("no dodge 1.8 s after the break"), PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()).IsEmpty());
-	A.Buffer.Clear();
-	A.Tick(Frame(0.05f));
-	TestTrue(TEXT("a dodge by 1.85 s (the exhaustion clock ran from the break)"), Same(PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()), { C::StartDodge }));
+	TestTrue(TEXT("the break ends at 1.0 s (so its held pose is released)"), Same(A.Tick(Frame(0.01f)), { C::EndGuardBreak }));
+	// After the Step 5 play (the user: "the boss is already a bit hard"): stamina regenerates through the break stun,
+	// so the break costs the turn but never a free hit. 1.0 s at 40/s is past exhaustion's 25.
+	TestTrue(FString::Printf(TEXT("free, no longer exhausted (%.0f stamina)"), A.Stamina.Current), A.GetState() == EPlayerState::Free && !A.Stamina.bExhausted);
+	TestTrue(TEXT("a dodge the moment the break ends"), Same(PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()), { C::StartDodge }));
 	return true;
 }
 
@@ -1311,6 +1310,21 @@ bool FActionsEndFrameHeavy2::RunTest(const FString& Parameters)
 	A.Tick(Frame(1.46f).Running());
 	A.Press(EPlayerInput::Heavy);
 	TestTrue(TEXT("heavy 2 on the free frame"), Has(A.Tick(Frame(0.01f)), C::ChainHeavyTwo));
+	return true;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsKnockdownPlan, "BossTest.Player.Actions.KnockdownPlan", ActionsTestFlags)
+bool FActionsKnockdownPlan::RunTest(const FString& Parameters)
+{
+	// After the Step 5 play: he floated when knocked down (the knock clips are airborne). The stun fall from its drop
+	// (0.35-0.97 s) and the stun get-up (1.07 s) share one rate so he's standing when the 1.4 s knockdown ends.
+	const FKnockdownPlan P = PlanKnockdown(0.35f, 0.97f, 1.07f, 1.4f);
+	TestEqual(TEXT("one rate: 1.69 s of clips in 1.4 s"), P.Rate, 1.69f / 1.4f, 0.001f);
+	TestEqual(TEXT("the get-up starts when the fall reaches the floor"), P.GetUpAt, 0.62f / P.Rate, 0.001f);
+	TestEqual(TEXT("and ends with the knockdown"), P.GetUpAt + 1.07f / P.Rate, 1.4f, 0.001f);
+	const FKnockdownPlan None = PlanKnockdown(0.f, 0.f, 0.f, 1.4f);
+	TestTrue(TEXT("no clips: a rate of 1, nothing scheduled"), None.Rate == 1.f && None.GetUpAt == 0.f);
 	return true;
 }
 

@@ -1,6 +1,6 @@
 # Cinderwake
 
-A one-on-one souls-like boss fight in Unreal Engine 5.8, written in C++. You play a fast sword fighter against a 3.7 m hovering executioner with a hammer. It's a portfolio project and a work in progress: the player's whole kit, the combat core and the boss's foundation with his first attack are built. His other attacks, his decision system and the second phase come next.
+A one-on-one souls-like boss fight in Unreal Engine 5.8, written in C++. You play a fast sword fighter against a 3.7 m hovering executioner with a hammer. It's a portfolio project and a work in progress: the player's whole kit, the combat core and the boss's phase-one moveset (nine actions, including a shockwave and a soul projectile) with a stand-in brain are built. His real decision system and the second phase come next.
 
 ## How it's put together
 
@@ -9,6 +9,7 @@ The combat rules are plain C++ with no engine types: the player's action rules, 
 - Attacks are data assets timed in real seconds and mapped onto measured points in each animation clip. The montage is paused and posed from the gameplay clock every tick, so hit windows, hit-stop and animation can't drift apart. Weapons hit through spheres swept between two sockets.
 - Every hit goes through one function, `ResolveCombatHit`, in a fixed order: dead, immune, already hit, dodged, perfect guard, blocked, then health and poise.
 - The boss's state belongs to `FBossStateMachine`. Requests carry a priority and are checked against a transition table, a stagger earned under armour waits for a safe point, and states time out so he can't get stuck.
+- An attack can run across several clips (a lead-in, the main clip, a return tail) and chain into the next one as a sequence; shockwaves and projectiles run on the attacker's own clock (`Combat/DeliveryComponent.cpp`).
 - The HUD is drawn on the canvas from C++, and input is read from the player controller in one function.
 
 Good places to start: `Source/BossTest/Combat/HitResolver.cpp`, `Combat/AttackComponent.cpp`, `Player/PlayerActions.cpp` and `Boss/BossStateMachine.cpp`.

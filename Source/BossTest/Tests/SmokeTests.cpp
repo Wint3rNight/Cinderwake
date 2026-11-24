@@ -14,6 +14,7 @@
 #include "Animation/AnimInstance.h"
 #include "Combat/AttackComponent.h"
 #include "Combat/CombatantComponent.h"
+#include "Combat/DeliveryComponent.h"
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -279,7 +280,9 @@ bool FCheckDeferredStagger::Update()
 	if (!W.bHit)
 	{
 		const FPoiseModel& Poise = Combatant->State.Poise;
-		const bool bCleanWindup = Attacks->IsAttacking() && Attacks->GetSample().Phase == EAttackPhase::Windup && !Poise.IsImmune() && !Poise.IsStaggered();
+		// An armoured windup (Soul Mark's cast has none, so a light hit staggers it at once).
+		const bool bCleanWindup = Attacks->IsAttacking() && Attacks->GetSample().Phase == EAttackPhase::Windup && !Poise.IsImmune() && !Poise.IsStaggered()
+			&& Combatant->State.Armor == EArmor::Windup;
 		if (!bCleanWindup)
 		{
 			return false;
@@ -301,7 +304,11 @@ bool FCheckDeferredStagger::Update()
 		return false;
 	}
 	const TArray<FBossRequestRecord>& H = Boss->GetStates().GetHistory();
-	Test->TestTrue(TEXT("the stagger started at his recovery"), H.Num() > 0 && H.Last().To == EBossState::Stagger && H.Last().Reason.Contains(TEXT("recovery")));
+	// A safe point: his recovery, or the end of a sequence step with no recovery of its own (Double Execution's first
+	// hit, the Advance's dash), so a stagger earned on hit one lands before hit two (Step 5).
+	const bool bSafePoint = H.Num() > 0 && H.Last().To == EBossState::Stagger
+		&& (H.Last().Reason.Contains(TEXT("recovery")) || H.Last().Reason.Contains(TEXT("attack's end")) || H.Last().Reason.Contains(TEXT("between steps")));
+	Test->TestTrue(FString::Printf(TEXT("the stagger started at a safe point (%s)"), H.Num() > 0 ? *H.Last().Reason : TEXT("-")), bSafePoint);
 	return true;
 }
 
@@ -384,6 +391,26 @@ struct FBlockWatch
 	float LastStamina = -1.f;
 };
 
+// The guard tests time their press to Executioner's Swing, so they keep him to that one action (Step 5 gave him
+// nine), from the moment play starts: his first pick comes as soon as his intro ends.
+DEFINE_LATENT_AUTOMATION_COMMAND(FPinBossToSwing);
+bool FPinBossToSwing::Update()
+{
+	UWorld* World = PlayWorld();
+	if (World)
+	{
+		if (TActorIterator<ABossCharacter> It(World); It)
+		{
+			if (It->Actions.Num() > 1)
+			{
+				It->Actions.SetNum(1);
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FGuardNextSwing, FAutomationTestBase*, Test, TSharedRef<FBlockWatch>, Watch);
 bool FGuardNextSwing::Update()
 {
@@ -407,6 +434,11 @@ bool FGuardNextSwing::Update()
 	{
 		Test->AddError(TEXT("no player or boss"));
 		return true;
+	}
+	// These guard tests time the press to Executioner's Swing: keep him to that one action (Step 5 gave him nine).
+	if (Boss->Actions.Num() > 1)
+	{
+		Boss->Actions.SetNum(1);
 	}
 	if (FPlatformTime::Seconds() - W.Start > 40.0)
 	{
@@ -463,6 +495,7 @@ bool FSmokeGuardAndCharge::RunTest(const FString& Parameters)
 {
 	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FPinBossToSwing());
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(6.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FGuardNextSwing(this, MakeShared<FBlockWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(0.5f));
@@ -511,6 +544,11 @@ bool FPerfectGuardNextSwing::Update()
 		Test->AddError(TEXT("no player or boss"));
 		return true;
 	}
+	// These guard tests time the press to Executioner's Swing: keep him to that one action (Step 5 gave him nine).
+	if (Boss->Actions.Num() > 1)
+	{
+		Boss->Actions.SetNum(1);
+	}
 	if (FPlatformTime::Seconds() - W.Start > 40.0)
 	{
 		Test->AddError(FString::Printf(TEXT("no guarded swing in 40 s (pressed %s, last event \"%s\")"), W.bPressed ? TEXT("yes") : TEXT("no"), *Player->LastEventText()));
@@ -543,6 +581,7 @@ bool FSmokePerfectGuard::RunTest(const FString& Parameters)
 {
 	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FPinBossToSwing());
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(6.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FPerfectGuardNextSwing(this, MakeShared<FPerfectWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(0.3f));
@@ -873,6 +912,312 @@ bool FSmokeBorrowedMoves::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FPlayBorrowedMoves(this, MakeShared<FBorrowWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- Step 5, played live: his phase-one actions ----
+
+namespace
+{
+	// Puts the player Edge cm (edge to edge) from the boss, AngleDeg off his facing.
+	void PlaceSmokePlayer(APlayerCharacter* Player, const ABossCharacter* Boss, float Edge, float AngleDeg)
+	{
+		const float Radii = Boss->GetCapsuleComponent()->GetScaledCapsuleRadius() + Player->GetCapsuleComponent()->GetScaledCapsuleRadius();
+		const FVector Dir = Boss->GetActorForwardVector().GetSafeNormal2D().RotateAngleAxis(AngleDeg, FVector::UpVector);
+		FVector At = Boss->GetActorLocation() + Dir * (Edge + Radii);
+		At.Z = Player->GetActorLocation().Z;
+		Player->SetActorLocation(At, false, nullptr, ETeleportType::TeleportPhysics);
+		Player->GetCharacterMovement()->StopMovementImmediately();
+	}
+
+	float SmokeEdge(const ACharacter* A, const ACharacter* B)
+	{
+		return FVector::Dist2D(A->GetActorLocation(), B->GetActorLocation()) - A->GetCapsuleComponent()->GetScaledCapsuleRadius() - B->GetCapsuleComponent()->GetScaledCapsuleRadius();
+	}
+
+	// Past the intro with his AI off, so only forced actions run.
+	bool SmokeBossReady(ABossCharacter* Boss)
+	{
+		const EBossState S = Boss->GetStates().GetState();
+		if (S == EBossState::Intro)
+		{
+			return false;
+		}
+		if (Boss->bAIEnabled)
+		{
+			Boss->ToggleAI();
+		}
+		return S == EBossState::Paused || S == EBossState::Evaluate || S == EBossState::Neutral;
+	}
+}
+
+struct FActionsWatch
+{
+	double Start = 0.0;
+	double ActionStart = 0.0;
+	int32 Index = 0;
+	bool bForced = false;
+	bool bSawActive = false;
+	bool bSawDelivery = false;
+	int32 Timeouts = 0;
+};
+
+// Forces each action in turn with the player (immune, so nothing ends early) placed inside its range, and checks it
+// reaches its hit window and ends by itself, without a timeout.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FForceEachAction, FAutomationTestBase*, Test, TSharedRef<FActionsWatch>, Watch);
+bool FForceEachAction::Update()
+{
+	FActionsWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	if (W.Start <= 0.0)
+	{
+		W.Start = FPlatformTime::Seconds();
+		W.Timeouts = Boss->GetStates().GetTimeoutCount();
+	}
+	if (FPlatformTime::Seconds() - W.Start > 90.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time at action %d"), W.Index));
+		return true;
+	}
+	if (W.Index >= Boss->GetActionCount())
+	{
+		Test->TestEqual(TEXT("nine actions"), Boss->GetActionCount(), 9);
+		Test->TestEqual(TEXT("no timeouts"), Boss->GetStates().GetTimeoutCount(), W.Timeouts);
+		return true;
+	}
+	if (!W.bForced)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+		const float Edges[] = { 250.f, 250.f, 200.f, 250.f, 250.f, 200.f, 450.f, 500.f, 700.f };
+		PlaceSmokePlayer(Player, Boss, Edges[FMath::Min(W.Index, 8)], 0.f);
+		W.bForced = Boss->ForceAction(W.Index);
+		W.bSawActive = W.bSawDelivery = false;
+		W.ActionStart = FPlatformTime::Seconds();
+		return false;
+	}
+	const EBossState S = Boss->GetStates().GetState();
+	if (S == EBossState::Attack)
+	{
+		W.bSawActive |= Boss->GetAttacks()->GetSample().Phase == EAttackPhase::Active;
+		W.bSawDelivery |= Boss->GetDelivery()->GetLiveCount() > 0;
+		if (FPlatformTime::Seconds() - W.ActionStart > 8.0)
+		{
+			Test->AddError(FString::Printf(TEXT("action %d never ended"), W.Index));
+			return true;
+		}
+		return false;
+	}
+	const FString Name = Boss->GetActionCount() > W.Index ? FString::FromInt(W.Index) : TEXT("?");
+	Test->TestTrue(FString::Printf(TEXT("action %s reached its hit window"), *Name), W.bSawActive);
+	if (W.Index == 6 || W.Index == 7)
+	{
+		Test->TestTrue(FString::Printf(TEXT("action %s launched its delivery"), *Name), W.bSawDelivery);
+	}
+	++W.Index;
+	W.bForced = false;
+	return false;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeBossActions, "BossTest.Smoke.BossActions", SmokeTestFlags)
+bool FSmokeBossActions::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FForceEachAction(this, MakeShared<FActionsWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FDeliveryWatch
+{
+	double Start = 0.0;
+	double PhaseStart = 0.0;
+	int32 Phase = 0;
+	float Health = 0.f;
+};
+
+// The ring hits a player standing beyond the hammer's reach for 35, without a knockdown; Soul Mark's grasp takes 30
+// and a fragment; a reset with a ring in flight leaves nothing behind and no hit afterwards.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FDeliveriesLive, FAutomationTestBase*, Test, TSharedRef<FDeliveryWatch>, Watch);
+bool FDeliveriesLive::Update()
+{
+	FDeliveryWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 60.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const FCombatantState& P = Player->GetCombatant()->State;
+	const UDeliveryComponent* Delivery = Boss->GetDelivery();
+	auto Force = [&](int32 Action, float Edge)
+	{
+		PlaceSmokePlayer(Player, Boss, Edge, 0.f);
+		W.Health = P.Health.Current;
+		W.PhaseStart = Now;
+		return Boss->ForceAction(Action);
+	};
+	switch (W.Phase)
+	{
+	case 0: // Judgment Slam from 7.5 m: the hammer can't reach, the ring can
+		if (SmokeBossReady(Boss) && Force(6, 750.f))
+		{
+			W.Phase = 1;
+		}
+		return false;
+	case 1:
+		if (Boss->GetStates().GetState() == EBossState::Attack || Delivery->GetLiveCount() > 0)
+		{
+			return false;
+		}
+		Test->TestEqual(TEXT("the ring hit for 35"), W.Health - P.Health.Current, 35.f, 0.5f);
+		W.Phase = 2;
+		return false;
+	case 2: // Soul Mark from 6 m
+		if (SmokeBossReady(Boss) && Now - W.PhaseStart > 2.0 && Force(7, 600.f))
+		{
+			W.Phase = 3;
+		}
+		return false;
+	case 3:
+		if (Boss->GetStates().GetState() == EBossState::Attack || Delivery->GetLiveCount() > 0)
+		{
+			return false;
+		}
+		Test->TestEqual(TEXT("the soul grasp hit for 30"), W.Health - P.Health.Current, 30.f, 0.5f);
+		Test->TestEqual(TEXT("and took a fragment"), P.Health.Fragments, 1);
+		W.Phase = 4;
+		return false;
+	case 4: // Judgment Slam again; reset the boss while the ring is out
+		if (SmokeBossReady(Boss) && Now - W.PhaseStart > 2.0 && Force(6, 750.f))
+		{
+			W.Phase = 5;
+		}
+		return false;
+	case 5:
+		if (Delivery->GetLiveCount() == 0)
+		{
+			if (Now - W.PhaseStart > 6.0)
+			{
+				Test->AddError(TEXT("the second ring never launched"));
+				return true;
+			}
+			return false;
+		}
+		W.Health = P.Health.Current;
+		Boss->ResetBoss();
+		Test->TestEqual(TEXT("a reset clears the ring"), Delivery->GetLiveCount(), 0);
+		Test->TestEqual(TEXT("and every effect it spawned"), Delivery->GetEffectCount(), 0);
+		W.PhaseStart = Now;
+		W.Phase = 6;
+		return false;
+	default:
+		if (Now - W.PhaseStart < 1.0)
+		{
+			return false;
+		}
+		Test->TestEqual(TEXT("no hit after the reset"), P.Health.Current, W.Health, 0.5f);
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeDeliveries, "BossTest.Smoke.Deliveries", SmokeTestFlags)
+bool FSmokeDeliveries::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDeliveriesLive(this, MakeShared<FDeliveryWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FAdvanceWatch
+{
+	double Start = 0.0;
+	double Forced = 0.0;
+	float StartEdge = 0.f;
+};
+
+// The Advance from 120 degrees off his facing (behind his side): the dash still closes the distance.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FAdvanceFromBehind, FAutomationTestBase*, Test, TSharedRef<FAdvanceWatch>, Watch);
+bool FAdvanceFromBehind::Update()
+{
+	FAdvanceWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 30.0)
+	{
+		Test->AddError(TEXT("the Advance never started"));
+		return true;
+	}
+	if (W.Forced <= 0.0)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+		PlaceSmokePlayer(Player, Boss, 700.f, 120.f);
+		W.StartEdge = SmokeEdge(Boss, Player);
+		if (Boss->ForceAction(8))
+		{
+			W.Forced = Now;
+		}
+		return false;
+	}
+	if (Now - W.Forced < 0.7)
+	{
+		return false; // the coil and the dash (0.50 s), with a little slack
+	}
+	const float Edge = SmokeEdge(Boss, Player);
+	Test->TestTrue(FString::Printf(TEXT("the dash closed from %.0f to %.0f cm"), W.StartEdge, Edge), Edge < 350.f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeAdvanceFromBehind, "BossTest.Smoke.AdvanceFromBehind", SmokeTestFlags)
+bool FSmokeAdvanceFromBehind::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FAdvanceFromBehind(this, MakeShared<FAdvanceWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }
