@@ -10,6 +10,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/SkeletalMeshSocket.h"
 #include "Particles/ParticleSystem.h"
+#include "Boss/BossCharacter.h"
 
 namespace
 {
@@ -192,6 +193,146 @@ bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
 		TestTrue(TEXT("fast band, latest: 0.60 s windup"), FMath::IsNearlyEqual(Fast->GetTiming().Windup + 0.05f, 0.60f, 0.001f));
 		TestTrue(FString::Printf(TEXT("delayed band, earliest: %.2f s apart"), Gap(Late, 0.f)), Gap(Late, 0.f) >= 0.70f);
 		TestTrue(TEXT("delayed band: 0.95-1.15 s windup"), FMath::IsNearlyEqual(Late->GetTiming().Windup, 0.95f, 0.001f));
+	}
+	return true;
+}
+
+namespace
+{
+	const ABossCharacter* BossDefaults()
+	{
+		const UClass* Class = LoadClass<ABossCharacter>(nullptr, TEXT("/Game/BossTest/BP_Sevarog.BP_Sevarog_C"));
+		return Class ? Class->GetDefaultObject<ABossCharacter>() : nullptr;
+	}
+
+	const FBossAction* FindAction(const ABossCharacter* Boss, FName Name)
+	{
+		return Boss->Actions.FindByPredicate([Name](const FBossAction& A) { return A.Name == Name; });
+	}
+
+	// From the action's start to its hitting active start, through its first variant's steps (the Advance: the dash's
+	// whole length, then the swing's windup), with an extra hold on its last step.
+	float ActiveStartOf(const FBossAction& A, float ExtraHold)
+	{
+		const TArray<TObjectPtr<UAttackDefinition>>& Steps = A.Variants[0].Steps;
+		float T = 0.f;
+		for (int32 i = 0; i + 1 < Steps.Num(); ++i)
+		{
+			T += Steps[i]->GetTiming().Total();
+		}
+		return T + Steps.Last()->GetTiming().Windup + ExtraHold;
+	}
+
+	const FAttackTiming LastStepTiming(const FBossAction& A)
+	{
+		return A.Variants[0].Steps.Last()->GetTiming();
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAttackDataBossCombos, "BossTest.Data.BossCombos", AttackDataTestFlags)
+bool FAttackDataBossCombos::RunTest(const FString& Parameters)
+{
+	// Step 6: section 5's combos as built, and the punish-window rules (DECISIONS.md): every follow-up active at least
+	// 1.40 s after the opener's active start (one dodge light is always safe), Combo F's swing 0.70 s after the grasp
+	// arrives at its range, chain points inside the recovery, and every follow-up able to track 90 deg (validated there).
+	const ABossCharacter* Boss = BossDefaults();
+	if (!TestNotNull(TEXT("BP_Sevarog"), Boss))
+	{
+		return false;
+	}
+	struct FExpect { const TCHAR* Name; const TCHAR* Opener; TArray<const TCHAR*> FollowUps; };
+	const FExpect Expected[] = {
+		{ TEXT("A"), TEXT("ExecutionersSwing"), { TEXT("PunishmentSweep") } },
+		{ TEXT("B"), TEXT("ExecutionersSwing"), { TEXT("DelayedExecution") } },
+		{ TEXT("C"), TEXT("ReverseSweep"), { TEXT("CrushingOverhead") } },
+		{ TEXT("D"), TEXT("CrushingOverhead"), { TEXT("DelayedExecution") } },
+		{ TEXT("E"), TEXT("ExecutionersSwing"), { TEXT("ExecutionersSwing"), TEXT("JudgmentSlam") } },
+		{ TEXT("F"), TEXT("SoulMark"), { TEXT("ExecutionersAdvance") } },
+	};
+	TestEqual(TEXT("six combos"), Boss->Combos.Num(), 6);
+	for (const FExpect& E : Expected)
+	{
+		const FBossCombo* C = Boss->Combos.FindByPredicate([&E](const FBossCombo& X) { return X.Name == FName(E.Name); });
+		if (!TestNotNull(FString::Printf(TEXT("combo %s"), E.Name), C) || !TestEqual(FString::Printf(TEXT("%s: its opener"), E.Name), C->Opener, FName(E.Opener))
+			|| !TestEqual(FString::Printf(TEXT("%s: its follow-ups"), E.Name), C->FollowUps.Num(), E.FollowUps.Num()))
+		{
+			continue;
+		}
+		const FBossAction* Prev = FindAction(Boss, C->Opener);
+		for (int32 i = 0; i < C->FollowUps.Num(); ++i)
+		{
+			const FBossComboLink& Link = C->FollowUps[i];
+			TestEqual(FString::Printf(TEXT("%s: follow-up %d"), E.Name, i + 1), Link.Action, FName(E.FollowUps[i]));
+			const FBossAction* Next = FindAction(Boss, Link.Action);
+			if (!TestTrue(FString::Printf(TEXT("%s: its actions exist"), E.Name), Prev && Next))
+			{
+				break;
+			}
+			const FAttackTiming Opener = LastStepTiming(*Prev);
+			TestTrue(FString::Printf(TEXT("%s: chain point %.2f inside the %.2f s recovery"), E.Name, Link.ChainIntoRecovery, Opener.Recovery),
+				Link.ChainIntoRecovery >= 0.f && Link.ChainIntoRecovery < Opener.Recovery);
+			// The follow-up's shortest timing: its hold at the low end of its variation.
+			const float Gap = Opener.Active + Link.ChainIntoRecovery + ActiveStartOf(*Next, Next->Variants[0].HoldExtraMin);
+			TestTrue(FString::Printf(TEXT("%s: follow-up %d goes active %.2f s after the previous one (at least 1.40)"), E.Name, i + 1, Gap), Gap >= 1.40f - 0.001f);
+			const UAttackDefinition* First = Next->Variants[0].Steps[0];
+			const float Turn = First->TrackingRate * FMath::Max(0.f, First->GetTiming().Windup - First->TrackingStopsBeforeActive);
+			TestTrue(FString::Printf(TEXT("%s: follow-up %d tracks %.0f deg before its cutoff (at least 90)"), E.Name, i + 1, Turn), Turn >= 90.f);
+			Prev = Next;
+		}
+	}
+	// Combo F: the Advance's swing at least 0.70 s after the grasp reaches the Advance's 11.5 m (the dodge lock plus a reaction).
+	const FBossAction* Mark = FindAction(Boss, TEXT("SoulMark"));
+	const FBossAction* Advance = FindAction(Boss, TEXT("ExecutionersAdvance"));
+	const FBossCombo* F = Boss->Combos.FindByPredicate([](const FBossCombo& X) { return X.Name == FName(TEXT("F")); });
+	if (Mark && Advance && F && F->FollowUps.Num() == 1)
+	{
+		const UAttackDefinition* Cast = Mark->Variants[0].Steps[0];
+		const FAttackTiming T = Cast->GetTiming();
+		const float Arrival = T.Windup + Advance->MaxRange / Cast->DeliverySpeed;
+		const float Strike = T.Windup + T.Active + F->FollowUps[0].ChainIntoRecovery + ActiveStartOf(*Advance, 0.f);
+		TestTrue(FString::Printf(TEXT("F: the swing %.2f s after the grasp arrives (at least 0.70)"), Strike - Arrival), Strike - Arrival >= 0.70f - 0.001f);
+	}
+	// Delayed Execution keeps its +-0.10 s as a follow-up (B and D), carried per step.
+	const FBossAction* Delayed = FindAction(Boss, TEXT("DelayedExecution"));
+	TestTrue(TEXT("Delayed Execution varies +-0.10 s"), Delayed && FMath::IsNearlyEqual(Delayed->Variants[0].HoldExtraMin, -0.10f) && FMath::IsNearlyEqual(Delayed->Variants[0].HoldExtraMax, 0.10f));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAttackDataPunishLadder, "BossTest.Data.PunishLadder", AttackDataTestFlags)
+bool FAttackDataPunishLadder::RunTest(const FString& Parameters)
+{
+	// The council's ladder (DECISIONS.md, the punish windows): after a clean dodge (t = 0 at his active start), each
+	// opening's listed answer frees you at least 0.20 s before his fastest next attack can land: his active window and
+	// recovery, the 0.25 s pause floor (a hit can't cut it shorter), then Reverse Sweep's 0.72 s windup. The answers'
+	// free times are the council's, composed from the player's attacks.
+	const ABossCharacter* Boss = BossDefaults();
+	if (!TestNotNull(TEXT("BP_Sevarog"), Boss))
+	{
+		return false;
+	}
+	struct FRung { const TCHAR* Action; const TCHAR* Answer; float Free; };
+	const FRung Ladder[] = {
+		{ TEXT("ExecutionersSwing"), TEXT("dodge light and finisher"), 1.59f },
+		{ TEXT("ExecutionersAdvance"), TEXT("dodge light and finisher"), 1.59f },
+		{ TEXT("ReverseSweep"), TEXT("three hits"), 1.93f },
+		{ TEXT("PunishmentSweep"), TEXT("three hits"), 1.93f },
+		{ TEXT("DelayedExecution"), TEXT("the dodge slam"), 2.06f },
+		{ TEXT("CrushingOverhead"), TEXT("slam, stand-up Light 1, Light 2"), 2.62f },
+		{ TEXT("JudgmentSlam"), TEXT("dodge light, charged heavy, Light 1"), 2.83f },
+	};
+	const float PauseFloor = 0.25f;
+	const float FastestOpener = 0.72f;
+	for (const FRung& R : Ladder)
+	{
+		const FBossAction* A = FindAction(Boss, R.Action);
+		if (!TestNotNull(FString::Printf(TEXT("%s exists"), R.Action), A))
+		{
+			continue;
+		}
+		const FAttackTiming T = LastStepTiming(*A);
+		const float NextHit = T.Active + T.Recovery + PauseFloor + FastestOpener;
+		TestTrue(FString::Printf(TEXT("%s: %s frees you at %.2f, his next hit at %.2f (0.20 s to spare)"), R.Action, R.Answer, R.Free, NextHit),
+			R.Free + 0.20f <= NextHit + 0.001f);
 	}
 	return true;
 }

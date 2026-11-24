@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
-#include "Boss/BossBrain.h"
+#include "Boss/BossDirector.h"
 #include "Boss/BossStateMachine.h"
 #include "BossCharacter.generated.h"
 
@@ -46,7 +46,58 @@ struct FBossActionVariant
 	float HoldExtraMax = 0.f;
 };
 
-// One of his actions as the stand-in brain sees it (Step 5).
+// Section 10's weight table row for one action (Step 6).
+USTRUCT()
+struct FBossActionWeights
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Action")
+	float Close = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Action")
+	float Medium = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Action")
+	float Far = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Action")
+	float Extreme = 0.f;
+};
+
+// One link of a combo: the follow-up action, and its chain point into the previous action's recovery (Step 6).
+USTRUCT()
+struct FBossComboLink
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Combo")
+	FName Action;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "Seconds into the previous action's recovery that this one starts (section 5: 0.2 by default)"))
+	float ChainIntoRecovery = 0.2f;
+};
+
+// A combo (spec section 5): an opener and its follow-ups, one purpose each.
+USTRUCT()
+struct FBossCombo
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Combo")
+	FName Name;
+
+	UPROPERTY(EditAnywhere, Category = "Combo")
+	FName Opener;
+
+	UPROPERTY(EditAnywhere, Category = "Combo")
+	TArray<FBossComboLink> FollowUps;
+
+	UPROPERTY(EditAnywhere, Category = "Combo")
+	float Weight = 1.f;
+};
+
+// One of his actions as the director sees it (Step 5, weights by band since Step 6).
 USTRUCT()
 struct FBossAction
 {
@@ -70,8 +121,8 @@ struct FBossAction
 	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "FrontSidesAndRear: the weight's scale in his rear quarter"))
 	float RearWeight = 1.f;
 
-	UPROPERTY(EditAnywhere, Category = "Action")
-	float Weight = 1.f;
+	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Section 10's weight in each distance band"))
+	FBossActionWeights Weights;
 
 	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Seconds before it can be picked again"))
 	float Cooldown = 0.f;
@@ -98,9 +149,34 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Attacks")
 	TObjectPtr<UAttackDefinition> ExecutionersSwing;
 
-	// Everything the stand-in brain can pick (Step 5). Empty: Executioner's Swing only, as in Step 4.
+	// Everything the director can pick (Step 5). Empty: Executioner's Swing only, as in Step 4.
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Attacks")
 	TArray<FBossAction> Actions;
+
+	// Section 5's combos A-F (Step 6).
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Attacks")
+	TArray<FBossCombo> Combos;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm from his spawn point: his movement stays inside (section 14: 13 m; 6b's arena sets it)"))
+	float ArenaRadius = 1300.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm/s"))
+	float CircleSpeed = 200.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm/s"))
+	float RepositionSpeed = 250.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm/s: after 4 s of you far away"))
+	float PursuitSpeed = 500.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "Seconds he pauses after an action (the commitment cooldown; a hit can't cut it shorter)"))
+	float CommitPause = 0.25f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "Seconds of breather after every second action (a hit cuts it to the pause)"))
+	float Breather = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "At commit: the weight of stopping after the opener, against each combo it opens at 1"))
+	float ComboStopWeight = 0.3f;
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Attacks", meta = (ToolTip = "The rolls' seed (variants, timing variation, picks). 0 = a new one every play"))
 	int32 Seed = 0;
@@ -183,6 +259,12 @@ public:
 	void ForceSwing();          // the selected action (Executioner's Swing until another is picked)
 	void SelectNextAction();    // cycles which action ForceSwing forces
 	bool ForceAction(int32 Index);
+	void PinAction(int32 Index);  // tests: that action whenever it fits, no combos (-1 = none)
+	const FBossDirector& GetDirector() const { return Director; }
+	bool ForceCombo(int32 ComboIndex);                  // tests and debugging: its opener, then its follow-ups
+	int32 GetCurrentCombo() const { return CurrentCombo; }
+	float GetPauseLength() const { return PauseLength; }
+	FVector GetArenaCentre() const { return HomeTransform.GetLocation(); }
 	int32 GetActionCount() const { return Actions.Num(); }
 	FName GetSelectedActionName() const;
 	const UDeliveryComponent* GetDelivery() const { return Delivery; }
@@ -205,10 +287,14 @@ private:
 	void StartIntro();
 	void Evaluate();
 	void StartSwing(const FString& Reason);
-	bool StartAction(int32 Index, const FString& Reason, EBossPriority Priority = EBossPriority::CommittedAttack);
-	TArray<struct FBossActionOption> ActionOptions() const;
-	struct FBossSituation Situation() const;
+	bool StartAction(int32 Index, const FString& Reason, EBossPriority Priority = EBossPriority::CommittedAttack, int32 Combo = -1);
+	void InitDirector();
+	FBossPerception Perception() const;
 	bool PunishTriggered() const;
+	bool CanContinuePlan() const;
+	void TickMovement(float DeltaSeconds);
+	void SteerAndGlide(const FVector& Dir, float Speed, float DeltaSeconds);
+	bool CheckProgress(float DeltaSeconds, EBossMove Move);
 	void OnStepStarted(const UAttackDefinition* Step, uint32 InstanceId);
 	void ClearCombat();
 	void TickApproach(float DeltaSeconds);
@@ -231,15 +317,37 @@ private:
 	UPROPERTY()
 	TObjectPtr<UAttackDefinition> PendingAttack;
 
-	UPROPERTY()
-	TArray<TObjectPtr<UAttackDefinition>> PendingSteps; // the running action's steps
+	// The committed action, flattened: its steps, then each follow-up's (Step 6). The attacks are held by Actions.
+	struct FPlannedStep
+	{
+		UAttackDefinition* Attack = nullptr;
+		float ExtraHold = 0.f;
+		float ChainIntoRecovery = -1.f; // below 0: a sequence join (at the previous step's end)
+		int32 Action = -1;
+		bool bFirstOfAction = false;
+	};
+	TArray<FPlannedStep> Plan;
 	int32 StepIndex = 0;
-	float LastStepHold = 0.f;
+	int32 CurrentCombo = -1;
+	FBossDirector Director;
+	TArray<FName> ComboNames;
+	float PauseLength = 0.25f;
+	EBossMove CurrentMove = EBossMove::Wait;
+	float MoveLength = 0.f;
+	int32 CircleSign = 1;
+	bool bCircleFlipped = false;
+	FVector ProgressFrom = FVector::ZeroVector;
+	float ProgressTime = 0.f;
+	double LastStaggerTime = -1.0;
+	FString LastWhy;
+	bool bTickOrdered = false;
+	bool bKeepCircle = false;
+	float CircleLeft = 0.f;
+	double FightStartTime = 0.0;
 	int32 CurrentAction = -1;
 	int32 LastAction = -1;
 	int32 SelectedAction = 0;
 	bool bCastOpen = false;
-	TArray<float> Cooldowns;
 	TArray<double> PlayerHitTimes;
 	FRandomStream Rng;
 

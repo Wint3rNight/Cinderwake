@@ -284,4 +284,19 @@ bool FBossStatesNextStep::RunTest(const FString& Parameters)
 	return true;
 }
 
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBossStatesMovement, "BossTest.Boss.States.MovementStatesTimeOut", BossStateTestFlags)
+bool FBossStatesMovement::RunTest(const FString& Parameters)
+{
+	// Step 6: circling and repositioning are states of their own, entered from Evaluate, and they time out like the rest.
+	FBossStateMachine M = Evaluating();
+	TestTrue(TEXT("he can circle"), M.Request(S::Circle, P::Decision, TEXT("circle"), 2.0f));
+	TestTrue(TEXT("and attack out of it"), FBossStateMachine::IsLegal(S::Circle, S::Attack) && FBossStateMachine::IsLegal(S::Reposition, S::Attack));
+	TestTrue(TEXT("a circle times out"), M.Tick(2.05f) && M.GetState() == S::Evaluate);
+	TestTrue(TEXT("repositioning, by default within 2.3 s"), M.Request(S::Reposition, P::Decision, TEXT("reposition")) && FMath::IsNearlyEqual(M.GetTimeout(), 2.3f));
+	TestTrue(TEXT("a circle's default is 3.6 s"), FBossStateMachine::DefaultTimeout(S::Circle) > 3.5f);
+	TestTrue(TEXT("a stagger can interrupt a movement"), M.Request(S::Stagger, P::Stagger, TEXT("poise")));
+	return true;
+}
+
 #endif

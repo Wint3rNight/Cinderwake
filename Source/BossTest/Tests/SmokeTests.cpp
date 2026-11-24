@@ -391,8 +391,8 @@ struct FBlockWatch
 	float LastStamina = -1.f;
 };
 
-// The guard tests time their press to Executioner's Swing, so they keep him to that one action (Step 5 gave him
-// nine), from the moment play starts: his first pick comes as soon as his intro ends.
+// The guard tests time their press to Executioner's Swing, so they pin him to that one action and no combos (Step 5
+// gave him nine, Step 6 combos), from the moment play starts: his first pick comes as soon as his intro ends.
 DEFINE_LATENT_AUTOMATION_COMMAND(FPinBossToSwing);
 bool FPinBossToSwing::Update()
 {
@@ -401,10 +401,7 @@ bool FPinBossToSwing::Update()
 	{
 		if (TActorIterator<ABossCharacter> It(World); It)
 		{
-			if (It->Actions.Num() > 1)
-			{
-				It->Actions.SetNum(1);
-			}
+			It->PinAction(0); // through the director: that action whenever it fits, never a combo
 			return true;
 		}
 	}
@@ -436,10 +433,7 @@ bool FGuardNextSwing::Update()
 		return true;
 	}
 	// These guard tests time the press to Executioner's Swing: keep him to that one action (Step 5 gave him nine).
-	if (Boss->Actions.Num() > 1)
-	{
-		Boss->Actions.SetNum(1);
-	}
+	Boss->PinAction(0);
 	if (FPlatformTime::Seconds() - W.Start > 40.0)
 	{
 		Test->AddError(FString::Printf(TEXT("no blocked swing in 40 s (raised %s, player state %d)"), W.bRaised ? TEXT("yes") : TEXT("no"), static_cast<int32>(Player->GetActions().GetState())));
@@ -545,10 +539,7 @@ bool FPerfectGuardNextSwing::Update()
 		return true;
 	}
 	// These guard tests time the press to Executioner's Swing: keep him to that one action (Step 5 gave him nine).
-	if (Boss->Actions.Num() > 1)
-	{
-		Boss->Actions.SetNum(1);
-	}
+	Boss->PinAction(0);
 	if (FPlatformTime::Seconds() - W.Start > 40.0)
 	{
 		Test->AddError(FString::Printf(TEXT("no guarded swing in 40 s (pressed %s, last event \"%s\")"), W.bPressed ? TEXT("yes") : TEXT("no"), *Player->LastEventText()));
@@ -1218,6 +1209,253 @@ bool FSmokeAdvanceFromBehind::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FAdvanceFromBehind(this, MakeShared<FAdvanceWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- Step 6, played live: his director ----
+
+struct FDirectorWatch
+{
+	double Start = 0.0;
+	double NextMove = 0.0;
+	int32 Spot = 0;
+	int32 Timeouts = 0;
+	bool bCombo = false;
+	bool bCircle = false;
+	bool bBreather = false;
+	float MaxFromCentre = 0.f;
+};
+
+// A minute of fighting with an immune player moved between the bands every 5 s: he fights in combos, circles, takes his
+// breather, stays inside the 13 m disc, and nothing times out.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FDirectorFights, FAutomationTestBase*, Test, TSharedRef<FDirectorWatch>, Watch);
+bool FDirectorFights::Update()
+{
+	FDirectorWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+		W.Timeouts = Boss->GetStates().GetTimeoutCount();
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+	}
+	const EBossState S = Boss->GetStates().GetState();
+	W.bCombo |= Boss->GetCurrentCombo() >= 0 && Boss->GetAttacks()->IsAttacking();
+	W.bCircle |= S == EBossState::Circle;
+	W.bBreather |= S == EBossState::Neutral && Boss->GetPauseLength() >= 0.99f;
+	W.MaxFromCentre = FMath::Max(W.MaxFromCentre, static_cast<float>(FVector::Dist2D(Boss->GetActorLocation(), Boss->GetArenaCentre())));
+	if (Now >= W.NextMove)
+	{
+		// Close, medium, far, close at his side, extreme: in front of him, so every band and both angle rules come up.
+		const float Edges[] = { 150.f, 450.f, 800.f, 200.f, 1100.f };
+		const float Angles[] = { 0.f, 20.f, 0.f, 70.f, 0.f };
+		PlaceSmokePlayer(Player, Boss, Edges[W.Spot % 5], Angles[W.Spot % 5]);
+		// Never outside the arena: 6b's wall keeps you in; his own movement is what this checks (his dash and lunges
+		// follow you, and only get the boundary clamp with that wall).
+		const FVector Centre = Boss->GetArenaCentre();
+		FVector At = Player->GetActorLocation();
+		const FVector Flat(At.X - Centre.X, At.Y - Centre.Y, 0.f);
+		if (Flat.Size() > 1200.f)
+		{
+			At = FVector(Centre.X, Centre.Y, At.Z) + Flat.GetSafeNormal() * 1200.f;
+			Player->SetActorLocation(At, false, nullptr, ETeleportType::TeleportPhysics);
+		}
+		++W.Spot;
+		W.NextMove = Now + 5.0;
+	}
+	if (Now - W.Start < 60.0)
+	{
+		return false;
+	}
+	Test->TestEqual(TEXT("no state timed out"), Boss->GetStates().GetTimeoutCount(), W.Timeouts);
+	Test->TestTrue(TEXT("at least one combo"), W.bCombo);
+	Test->TestTrue(TEXT("he circled"), W.bCircle);
+	Test->TestTrue(TEXT("he took a breather"), W.bBreather);
+	Test->TestTrue(FString::Printf(TEXT("he stayed inside the disc (%.0f cm at most; 13 m plus a lunge's reach)"), W.MaxFromCentre), W.MaxFromCentre <= 1300.f + 250.f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeDirectorFights, "BossTest.Smoke.DirectorFights", SmokeTestFlags)
+bool FSmokeDirectorFights::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FDirectorFights(this, MakeShared<FDirectorWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FComboWatch
+{
+	double Start = 0.0;
+	int32 Phase = 0;
+	bool bForced = false;
+	float OpenerElapsed = 0.f;
+	bool bFollowUp = false;
+	bool bArmourFromStart = false;
+	float LastOpenerElapsed = 0.f;
+};
+
+// Combo C (Reverse Sweep into Crushing Overhead) forced at 2 m: the follow-up starts at its chain point with windup armour
+// from its first frame. Forced again with the player moved to 6 m once the sweep starts: no follow-up, and the sweep
+// plays its whole recovery.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FComboChain, FAutomationTestBase*, Test, TSharedRef<FComboWatch>, Watch);
+bool FComboChain::Update()
+{
+	FComboWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+	}
+	if (Now - W.Start > 40.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const UAttackComponent* Attacks = Boss->GetAttacks();
+	const FString Current = Attacks->GetCurrent() ? Attacks->GetCurrent()->GetName() : FString();
+	if (!W.bForced)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 200.f, 0.f);
+		const int32 C = Boss->Combos.IndexOfByPredicate([](const FBossCombo& X) { return X.Name == FName(TEXT("C")); });
+		W.bForced = Boss->ForceCombo(C);
+		W.bFollowUp = false;
+		W.LastOpenerElapsed = 0.f;
+		return false;
+	}
+	if (Current == TEXT("DA_ReverseSweep"))
+	{
+		W.LastOpenerElapsed = Attacks->GetElapsed();
+		if (W.Phase == 1 && Attacks->GetElapsed() < 0.3f)
+		{
+			PlaceSmokePlayer(Player, Boss, 600.f, 0.f); // out of Crushing Overhead's 4 m before the chain point
+		}
+		return false;
+	}
+	if (Current == TEXT("DA_CrushingOverhead") && !W.bFollowUp)
+	{
+		W.bFollowUp = true;
+		W.bArmourFromStart = Boss->GetCombatant()->State.Armor == EArmor::Windup && Attacks->GetElapsed() < 0.05f;
+		W.OpenerElapsed = W.LastOpenerElapsed;
+		return false;
+	}
+	if (Boss->GetStates().GetState() == EBossState::Attack)
+	{
+		return false;
+	}
+	if (W.Phase == 0)
+	{
+		Test->TestTrue(TEXT("at 2 m the follow-up came"), W.bFollowUp);
+		Test->TestTrue(TEXT("with windup armour from its first frame"), W.bArmourFromStart);
+		Test->TestTrue(FString::Printf(TEXT("at the chain point (the sweep at %.2f s; 0.16 + 0.72 + 0.20 = 1.08)"), W.OpenerElapsed),
+			W.OpenerElapsed >= 1.05f && W.OpenerElapsed <= 1.13f);
+		W.Phase = 1;
+		W.bForced = false;
+		return false;
+	}
+	Test->TestFalse(TEXT("at 6 m: no follow-up"), W.bFollowUp);
+	Test->TestTrue(FString::Printf(TEXT("and the sweep played its whole recovery (%.2f s of 1.98)"), W.LastOpenerElapsed), W.LastOpenerElapsed >= 1.9f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeComboChain, "BossTest.Smoke.ComboChain", SmokeTestFlags)
+bool FSmokeComboChain::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FComboChain(this, MakeShared<FComboWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FHugWatch
+{
+	double Start = 0.0;
+	double LastTick = 0.0;
+	bool bAttacked = false;
+	float LongestIdle = 0.f;
+};
+
+// A runner trying to stay at his back at contact range (moving at 4 m/s, a little under what holding it takes): he moves
+// the backstab spot, gets an attack in within 10 s, and no state other than an attack lasts past 3 s.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FHugBack, FAutomationTestBase*, Test, TSharedRef<FHugWatch>, Watch);
+bool FHugBack::Update()
+{
+	FHugWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		if (Boss->GetStates().GetState() == EBossState::Intro)
+		{
+			return false;
+		}
+		W.Start = W.LastTick = Now;
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+		PlaceSmokePlayer(Player, Boss, 30.f, 170.f);
+	}
+	const float Dt = static_cast<float>(Now - W.LastTick);
+	W.LastTick = Now;
+	// Toward the spot right behind him, at most 4 m/s.
+	const float Radii = Boss->GetCapsuleComponent()->GetScaledCapsuleRadius() + Player->GetCapsuleComponent()->GetScaledCapsuleRadius();
+	FVector Spot = Boss->GetActorLocation() - Boss->GetActorForwardVector().GetSafeNormal2D() * (Radii + 30.f);
+	Spot.Z = Player->GetActorLocation().Z;
+	const FVector Step = (Spot - Player->GetActorLocation()).GetClampedToMaxSize(400.f * Dt);
+	Player->SetActorLocation(Player->GetActorLocation() + Step, false, nullptr, ETeleportType::TeleportPhysics);
+	const EBossState S = Boss->GetStates().GetState();
+	W.bAttacked |= S == EBossState::Attack;
+	if (S != EBossState::Attack && S != EBossState::Stagger && S != EBossState::Intro)
+	{
+		W.LongestIdle = FMath::Max(W.LongestIdle, Boss->GetStates().GetStateTime());
+	}
+	if (Now - W.Start < 10.0)
+	{
+		return false;
+	}
+	Test->TestTrue(TEXT("he got an attack in"), W.bAttacked);
+	Test->TestTrue(FString::Printf(TEXT("no other state lasted past 3 s (%.2f)"), W.LongestIdle), W.LongestIdle <= 3.05f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeHugBack, "BossTest.Smoke.HugBack", SmokeTestFlags)
+bool FSmokeHugBack::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FHugBack(this, MakeShared<FHugWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }

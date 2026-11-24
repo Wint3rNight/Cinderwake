@@ -20,6 +20,8 @@ const TCHAR* FBossStateMachine::StateName(EBossState S)
 	case EBossState::Paused: return TEXT("paused");
 	case EBossState::Dead: return TEXT("dead");
 	case EBossState::CastBroken: return TEXT("cast broken");
+	case EBossState::Circle: return TEXT("circle");
+	case EBossState::Reposition: return TEXT("reposition");
 	}
 	return TEXT("?");
 }
@@ -62,9 +64,12 @@ bool FBossStateMachine::IsLegal(EBossState From, EBossState To)
 	case EBossState::Intro:
 		return To == EBossState::Evaluate || To == EBossState::Paused;
 	case EBossState::Evaluate:
-		return To == EBossState::Approach || To == EBossState::Turn || To == EBossState::Neutral || To == EBossState::Attack || To == EBossState::Paused;
+		return To == EBossState::Approach || To == EBossState::Turn || To == EBossState::Neutral || To == EBossState::Attack || To == EBossState::Paused
+			|| To == EBossState::Circle || To == EBossState::Reposition;
 	case EBossState::Approach:
 	case EBossState::Turn:
+	case EBossState::Circle:
+	case EBossState::Reposition:
 		return To == EBossState::Evaluate || To == EBossState::Attack || To == EBossState::Paused;
 	case EBossState::Neutral:
 		return To == EBossState::Evaluate || To == EBossState::Paused;
@@ -92,6 +97,8 @@ float FBossStateMachine::DefaultTimeout(EBossState S)
 	case EBossState::Attack: return 5.f;       // callers pass the attack's length plus 1 s
 	case EBossState::Stagger: return 2.8f;     // 1.8 s plus 1 s (callers pass the stagger's own length plus 1 s)
 	case EBossState::CastBroken: return 1.8f;  // the 0.8 s recoil plus 1 s
+	case EBossState::Circle: return 3.6f;      // at most 2.6 s plus 1 s (callers pass the rolled length plus 1 s)
+	case EBossState::Reposition: return 2.3f;  // at most 1.3 s plus 1 s
 	default: return -1.f;                      // paused (a debug state) and dead never time out
 	}
 }

@@ -134,12 +134,45 @@ void UAttackComponent::QueueNext(UAttackDefinition* Next, float ExtraHold)
 {
 	QueuedNext = Next;
 	QueuedHold = ExtraHold;
+	QueuedChainAt = -1.f;
+}
+
+void UAttackComponent::QueueNextAt(UAttackDefinition* Next, float ExtraHold, float ChainIntoRecovery)
+{
+	QueuedNext = Next;
+	QueuedHold = ExtraHold;
+	QueuedChainAt = FMath::Max(0.f, ChainIntoRecovery);
 }
 
 void UAttackComponent::ClearQueue()
 {
 	QueuedNext = nullptr;
 	QueuedHold = 0.f;
+	QueuedChainAt = -1.f;
+}
+
+bool UAttackComponent::StartQueued()
+{
+	// Asked once: a refusal (a pending stagger, or the follow-up no longer fits) clears the queue for good.
+	UAttackDefinition* Next = QueuedNext;
+	const float NextHold = QueuedHold;
+	if (!Next)
+	{
+		return false;
+	}
+	if (CanContinue && !CanContinue())
+	{
+		UE_LOG(LogTemp, Log, TEXT("BossTest: %s doesn't continue into %s"), *GetOwner()->GetName(), *Next->GetName());
+		ClearQueue();
+		return false;
+	}
+	AActor* KeepTarget = Target.Get();
+	if (StartAttack(Next, KeepTarget, Next->BlendIn, Next->bEaseBlendIn, NextHold))
+	{
+		OnStepStarted.Broadcast(Next, InstanceId);
+		return true;
+	}
+	return false;
 }
 
 void UAttackComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -436,6 +469,15 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 	TrackTarget(Step); // before advancing: tracking covers every moment up to the cutoff
 	Elapsed += Step;
 	const FAttackSample Sample = EvaluateAttack(Timing, Elapsed);
+	// A combo's follow-up at its chain point in this attack's recovery: same tick, so no frame without armour.
+	if (QueuedNext && QueuedChainAt >= 0.f && Elapsed >= Timing.Windup + Timing.Active + QueuedChainAt && StartQueued())
+	{
+		return;
+	}
+	if (!CurrentDefinition)
+	{
+		return; // a queued step that couldn't start (a missing clip) already ended this attack
+	}
 	Pose(Sample);
 	SetOwnerArmor(ArmorAt(Sample.Phase, CurrentDefinition->GetWindupArmor(), CurrentDefinition->GetActiveArmor()));
 	UpdateCues(Sample.ClipTime);
@@ -466,17 +508,10 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 
 	if (Sample.Phase == EAttackPhase::Done && CurrentDefinition)
 	{
-		// A queued step starts here, in the same tick: no frame without armour, a new instance, its own blend-in.
-		UAttackDefinition* Next = QueuedNext;
-		const float NextHold = QueuedHold;
-		if (Next && (!CanContinue || CanContinue()))
+		// A queued sequence step starts here, in the same tick: no frame without armour, a new instance, its own blend-in.
+		if (QueuedNext && QueuedChainAt < 0.f && StartQueued())
 		{
-			AActor* KeepTarget = Target.Get();
-			if (StartAttack(Next, KeepTarget, Next->BlendIn, Next->bEaseBlendIn, NextHold))
-			{
-				OnStepStarted.Broadcast(Next, InstanceId);
-				return;
-			}
+			return;
 		}
 		StopAttack(0.2f);
 	}

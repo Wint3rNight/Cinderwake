@@ -46,7 +46,11 @@ public:
 	// without armour), as a new instance with its own blend-in, unless CanContinue says no (a stagger is pending).
 	// Cleared whenever an attack ends.
 	void QueueNext(UAttackDefinition* Next, float ExtraHold = 0.f);
+	// Step 6: a combo's follow-up starts at a chain point this far into the running attack's recovery. CanContinue is
+	// asked once, then; refused, the queue clears and the running attack plays its full recovery (spec section 10, rule 4).
+	void QueueNextAt(UAttackDefinition* Next, float ExtraHold, float ChainIntoRecovery);
 	void ClearQueue();
+	bool HasQueued() const { return QueuedNext != nullptr; }
 	TFunction<bool()> CanContinue;
 	FOnAttackStepStarted OnStepStarted;
 
@@ -94,6 +98,7 @@ private:
 	void UpdateTrails(bool bActive);
 	void EndTrails();
 	void Deliver();
+	bool StartQueued(); // true if the queued step started (the running attack is replaced)
 	UAnimMontage* PlayPaused(UAnimSequenceBase* Clip, float BlendIn, bool bEased);
 	void SweepWeapon();
 	void ApplyLunge(float Duration);
@@ -127,6 +132,7 @@ private:
 	UPROPERTY()
 	TObjectPtr<UAttackDefinition> QueuedNext;
 	float QueuedHold = 0.f;
+	float QueuedChainAt = -1.f; // into the running attack's recovery; below 0: when it's done (a sequence join)
 
 	UPROPERTY()
 	TArray<TObjectPtr<UParticleSystemComponent>> CueComponents; // looping cues, by cue index (null when none)
