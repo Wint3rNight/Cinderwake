@@ -44,6 +44,13 @@ public:
 
 	// Fills in the target key, resolves the hit and broadcasts the outcome.
 	FHitOutcome ReceiveHit(FCombatHitContext Hit, FHitRegistry& Registry, AActor* Attacker);
+
+	// Where attackers may aim ahead of this fighter (the Advance's dash, Soul Mark, his approach): the owner reports its
+	// velocity only while it moves freely, zero while dodging, attacking or reacting. Owners that don't report it fall
+	// back to the velocity, zero under root motion.
+	FVector LeadVelocity = FVector::ZeroVector;
+	bool bReportsLeadVelocity = false;
+	static FVector LeadVelocityOf(const AActor* Target);
 	// Freezes the owner for Duration (real time). With a tremble, its mesh shakes TrembleCm along TrembleDir (world space), decaying.
 	void StartHitStop(float Duration, const FVector& TrembleDir = FVector::ZeroVector, float TrembleCm = 0.f);
 	void ResetCombatant();       // also undoes a ragdoll (the mesh goes back on the capsule)

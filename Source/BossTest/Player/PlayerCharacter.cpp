@@ -24,6 +24,8 @@
 #include "Misc/App.h"
 #include "Player/KnockdownPlan.h"
 #include "Player/LockOnComponent.h"
+#include "Player/OrientationWarp.h"
+#include "Player/PlayerAnimInstance.h"
 #include "Player/PlayerMovementComponent.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -239,6 +241,7 @@ void APlayerCharacter::Tick(float DeltaSeconds)
 	TickMovement();
 	TickEvadeVisuals(DeltaSeconds);
 	TickGuardVisuals();
+	TickWarp(DeltaSeconds);
 	TickChargeEffect();
 	TickCamera();
 
@@ -331,21 +334,27 @@ void APlayerCharacter::Execute(const FPlayerCommands& Commands)
 		case EPlayerCommand::EndDodge:
 			EndDodgePush();
 			break;
+		case EPlayerCommand::ReleaseDodge:
+			ReleaseDodgePush();
+			break;
 		case EPlayerCommand::StopAttack:
 			Attacks->StopAttack(0.05f);
 			break;
 		case EPlayerCommand::StartHeal:
 			FaceForAction();
-			PlayClip(HealClip, 1.f, 0.15f, 0.25f);
+			// The committed heal: the clip's old landing moment arrives at the rules' Heal Land At (1.30 s).
+			PlayClip(HealClip, HealClipLandAt / FMath::Max(Actions.Tuning.HealLandAt, 0.1f), 0.15f, 0.25f);
 			break;
 		case EPlayerCommand::CancelHeal:
 			StopClip(0.15f);
 			SetEvent(TEXT("heal interrupted"), 1.f);
 			break;
 		case EPlayerCommand::FinishHeal:
-			Combatant->State.Health.Heal(Actions.Tuning.HealAmount);
-			StopClip(0.3f);
+			Combatant->State.Health.Heal(Actions.Tuning.HealAmount); // the clip plays on through the tail
 			SetEvent(FString::Printf(TEXT("healed +%.0f"), Actions.Tuning.HealAmount), 1.2f);
+			break;
+		case EPlayerCommand::EndHeal:
+			StopClip(0.25f);
 			break;
 		case EPlayerCommand::StartSprint:
 			SetSprinting(true);
@@ -479,6 +488,10 @@ void APlayerCharacter::StartAttack(UAttackDefinition* Definition, float MinBlend
 			SetActorRotation(FRotator(0.f, To.Rotation().Yaw, 0.f));
 		}
 	}
+	if (Definition && Definition->LungeCap <= 0.f)
+	{
+		GetCharacterMovement()->StopMovementImmediately(); // no carried speed (a run, a dodge's tail) into a planted attack
+	}
 	Attacks->StartAttack(Definition, Target, BlendIn, bEasedBlend);
 }
 
@@ -591,6 +604,7 @@ void APlayerCharacter::StartDodge(bool bBackstep)
 		Clip = BackstepClip;
 		EvadeClipStart = BackstepClipStart;
 		EvadeClipEnd = BackstepClipEnd;
+		bEvadeBackstep = true;
 	}
 	else
 	{
@@ -598,15 +612,17 @@ void APlayerCharacter::StartDodge(bool bBackstep)
 		Dir = InputDirection();
 		SetActorRotation(FRotator(0.f, Dir.Rotation().Yaw, 0.f));
 		Clip = DodgeClip;
-		EvadeClipStart = DodgeClipStart;
-		EvadeClipEnd = DodgeClipEnd;
+		EvadeClipStart = DodgeLeanFrom;
+		EvadeClipEnd = DodgeLeanTo;
+		bEvadeBackstep = false;
 	}
+	EvadePhase = 0;
 
 	// The pose follows the dodge's clock, like attacks do: paused, and set every tick.
 	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
 	if (Anim && Clip)
 	{
-		EvadeMontage = Anim->PlaySlotAnimationAsDynamicMontage(Clip, MontageSlot, 0.05f, 0.15f, 1.f);
+		EvadeMontage = Anim->PlaySlotAnimationAsDynamicMontage(Clip, MontageSlot, 0.02f, 0.15f, 1.f); // leaning on the first frame
 		if (EvadeMontage)
 		{
 			Anim->Montage_Pause(EvadeMontage);
@@ -615,8 +631,7 @@ void APlayerCharacter::StartDodge(bool bBackstep)
 	}
 	ClipMontage = nullptr; // the evade replaced whatever clip was on the slot
 
-	AfterimagesLeft = Afterimages.Num();
-	AfterimageClock = AfterimageInterval; // the first copy appears where he leaves, this tick
+	AfterimagesShown = 0; // copies follow the dodge's clock, from its next tick (this tick's pose is still the old one)
 	const FVector Feet = GetActorLocation() - FVector(0.f, 0.f, GetCapsuleComponent()->GetScaledCapsuleHalfHeight());
 	if (EvadeStartEffect)
 	{
@@ -651,16 +666,47 @@ void APlayerCharacter::TickEvadeVisuals(float DeltaSeconds)
 {
 	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
 	TickAfterimages(DeltaSeconds);
+	TickDodgeStop();
 	if (Actions.GetState() == EPlayerState::Dodging)
 	{
-		if (Anim && EvadeMontage && Anim->Montage_IsActive(EvadeMontage))
+		if (!Anim || !EvadeMontage || !Anim->Montage_IsActive(EvadeMontage))
 		{
-			const float Alpha = FMath::Clamp(Actions.GetStateTime() / FMath::Max(Actions.Tuning.DodgeDuration, KINDA_SMALL_NUMBER), 0.f, 1.f);
+			return;
+		}
+		const float T = Actions.GetStateTime();
+		if (bEvadeBackstep)
+		{
+			const float Alpha = FMath::Clamp(T / FMath::Max(Actions.Tuning.DodgeDuration, KINDA_SMALL_NUMBER), 0.f, 1.f);
 			Anim->Montage_SetPosition(EvadeMontage, FMath::Lerp(EvadeClipStart, EvadeClipEnd, Alpha));
+			return;
+		}
+		const float ReDodge = FMath::Max(Actions.Tuning.ReDodgeAt, KINDA_SMALL_NUMBER);
+		if (EvadePhase == 0 && T < ReDodge)
+		{
+			// Faster than a run: the deepest lean, creeping, so the pose never shows strides at walking speed.
+			Anim->Montage_SetPosition(EvadeMontage, FMath::Lerp(DodgeLeanFrom, DodgeLeanTo, T / ReDodge));
+		}
+		else if (EvadePhase == 0 && Actions.CanSteer())
+		{
+			EvadePhase = 1; // the stick took over: the push-off at 1x, then a blend into the run
+			Anim->Montage_SetPosition(EvadeMontage, DodgeLeanTo);
+			Anim->Montage_SetPlayRate(EvadeMontage, 1.f);
+			Anim->Montage_Resume(EvadeMontage);
+		}
+		else if (EvadePhase == 0 && DodgeStopClip)
+		{
+			EvadePhase = 2; // no stick: plant, absorb and settle into his idle (it may run a little past free)
+			DodgeStopMontage = PlayClip(DodgeStopClip, 1.f, 0.10f, 0.15f, 1, DodgeStopFrom);
+			EvadeMontage = nullptr;
+			return;
+		}
+		if (EvadePhase == 1 && Anim->Montage_GetPosition(EvadeMontage) >= DodgePushOffTo)
+		{
+			EndEvadeVisuals(0.20f);
 		}
 		return;
 	}
-	// The evade ended (finished, or an attack, reaction or death took over).
+	// The evade ended (finished, or an attack, reaction or death took over). The plant, if playing, settles on its own.
 	EndEvadeVisuals(0.15f);
 }
 
@@ -728,19 +774,16 @@ void APlayerCharacter::TickAfterimages(float DeltaSeconds)
 	{
 		return;
 	}
-	if (AfterimagesLeft > 0 && Actions.GetState() == EPlayerState::Dodging)
+	if (Actions.GetState() == EPlayerState::Dodging)
 	{
-		AfterimageClock += DeltaSeconds;
-		if (AfterimageClock >= AfterimageInterval)
+		// Copy i appears once the dodge's clock passes i x the interval, from its first tick after the press: at any frame
+		// rate all five appear inside the i-frames (QA: a per-spawn clock spread them past it at 30 fps).
+		const float T = Actions.GetStateTime();
+		while (T > 0.f && AfterimagesShown < Afterimages.Num() && T >= AfterimagesShown * AfterimageInterval - KINDA_SMALL_NUMBER)
 		{
-			AfterimageClock = 0.f;
-			--AfterimagesLeft;
+			++AfterimagesShown;
 			SpawnAfterimage();
 		}
-	}
-	else
-	{
-		AfterimagesLeft = 0; // the evade ended early (an attack or a hit took over): no more copies
 	}
 	for (int32 i = 0; i < Afterimages.Num(); ++i)
 	{
@@ -767,7 +810,12 @@ void APlayerCharacter::HideAfterimages()
 		Afterimages[i]->SetVisibility(false);
 		AfterimageAge[i] = -1.f;
 	}
-	AfterimagesLeft = 0;
+	AfterimagesShown = 0;
+}
+
+bool APlayerCharacter::IsLockedOn() const
+{
+	return LockOn && LockOn->IsLocked();
 }
 
 int32 APlayerCharacter::GetVisibleAfterimages() const
@@ -796,6 +844,43 @@ void APlayerCharacter::EndEvadeVisuals(float BlendOut)
 		}
 	}
 	EvadeTrails.Reset();
+}
+
+void APlayerCharacter::ReleaseDodgePush()
+{
+	// The stick took over at the re-dodge point: the push goes, but its speed carries into the run (its finish velocity
+	// is zero, for dodges an action ends, so switch it to keep the last speed first).
+	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
+	const FVector Keep = MoveComp->Velocity;
+	if (DodgeMoveId != 0)
+	{
+		if (TSharedPtr<FRootMotionSource> Source = MoveComp->GetRootMotionSourceByID(DodgeMoveId))
+		{
+			Source->FinishVelocityParams.Mode = ERootMotionFinishVelocityMode::MaintainLastRootMotionVelocity;
+		}
+	}
+	EndDodgePush();
+	MoveComp->Velocity = FVector(Keep.X, Keep.Y, MoveComp->Velocity.Z);
+}
+
+void APlayerCharacter::TickDodgeStop()
+{
+	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
+	if (!DodgeStopMontage || !Anim || !Anim->Montage_IsActive(DodgeStopMontage) || DodgeStopMontage != ClipMontage)
+	{
+		DodgeStopMontage = nullptr; // replaced (an action, moving off) or finished
+		return;
+	}
+	const float Pos = Anim->Montage_GetPosition(DodgeStopMontage);
+	if (Pos >= DodgeStopTo)
+	{
+		StopClip(0.15f);
+		DodgeStopMontage = nullptr;
+	}
+	else if (Pos >= DodgeStopSlowUntil)
+	{
+		Anim->Montage_SetPlayRate(DodgeStopMontage, 1.5f); // the rise back to idle, quicker than the absorb
+	}
 }
 
 void APlayerCharacter::EndDodgePush()
@@ -829,6 +914,7 @@ void APlayerCharacter::SetSprinting(bool bOn)
 
 void APlayerCharacter::TickMovement()
 {
+	WarpTarget = 0.f; // the strafe or the guard walk sets it again below, if he's doing one
 	UCharacterMovementComponent* MoveComp = GetCharacterMovement();
 	const bool bSteer = Actions.CanSteer();
 	const FVector Dir = InputDirection();
@@ -837,9 +923,11 @@ void APlayerCharacter::TickMovement()
 
 	// Sprint and guard walking both play their own clips on the slot, so the animation blueprint mustn't
 	// see his acceleration (it would play the slot on the upper body only, over a forward jog).
+	// Locked on and moving freely (not sprinting): a strafe.
+	const bool bStrafe = bMoving && LockOn->IsLocked() && !Actions.IsSprinting() && Actions.GetState() == EPlayerState::Free && HasStrafeClips();
 	if (UPlayerMovementComponent* PlayerMove = Cast<UPlayerMovementComponent>(MoveComp))
 	{
-		PlayerMove->bHideAccelerationFromAnimation = Actions.IsSprinting() || bGuarding;
+		PlayerMove->bHideAccelerationFromAnimation = Actions.IsSprinting() || bGuarding || bStrafe;
 	}
 	MoveComp->MaxWalkSpeed = Actions.IsSprinting() ? SprintSpeed : bGuarding ? GuardWalkSpeed : RunSpeed;
 	if (bGuarding)
@@ -848,6 +936,35 @@ void APlayerCharacter::TickMovement()
 		MoveComp->bOrientRotationToMovement = false;
 		MoveComp->bUseControllerDesiredRotation = true;
 		if (!Dir.IsNearlyZero())
+		{
+			AddMovementInput(Dir, 1.f);
+		}
+		return;
+	}
+
+	if (bStrafe)
+	{
+		// He keeps facing the target (the camera looks at it) and steps the way you steer; sideways and back are slower.
+		MoveComp->bOrientRotationToMovement = false;
+		MoveComp->bUseControllerDesiredRotation = true;
+		const FVector Local = GetActorRotation().UnrotateVector(Dir);
+		MoveComp->MaxWalkSpeed = FMath::Lerp(StrafeSideSpeed, RunSpeed, FMath::Clamp(Local.X, 0.f, 1.f));
+		AddMovementInput(Dir, 1.f);
+		TickStrafeVisuals();
+		return;
+	}
+	if (StrafeClipShown)
+	{
+		StopStrafe(); // let go of the stick, unlocked, sprinting or an action: the strafe clip blends out
+	}
+
+	if (Actions.GetState() == EPlayerState::Dodging)
+	{
+		// Steering in the dodge's tail (from the re-dodge point): he keeps facing the dodge's way until it ends (QA: turning
+		// to the target here would whip him round mid-clip).
+		MoveComp->bOrientRotationToMovement = false;
+		MoveComp->bUseControllerDesiredRotation = false;
+		if (bMoving)
 		{
 			AddMovementInput(Dir, 1.f);
 		}
@@ -871,6 +988,107 @@ void APlayerCharacter::TickMovement()
 	AddMovementInput(Dir, 1.f);
 }
 
+void APlayerCharacter::TickStrafeVisuals()
+{
+	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
+	const FVector Local = GetActorRotation().UnrotateVector(GetVelocity().GetSafeNormal2D() * GetVelocity().Size2D());
+	const float Speed = Local.Size2D();
+	const float Angle = FMath::RadiansToDegrees(FMath::Atan2(Local.Y, Local.X)); // 0 ahead, +90 right
+	UAnimSequenceBase* Wanted = StrafeClipShown ? StrafeClipShown.Get() : StrafeForward.Get();
+	if (Speed > 40.f)
+	{
+		// The jog clip by direction relative to his facing, with 15 degrees of hysteresis at the diagonals (as the guard walk).
+		Wanted = PickDirectionalClip(Angle, StrafeClipShown, StrafeForward, StrafeRight, StrafeBack, StrafeLeft);
+	}
+	const float Rate = FMath::Max(0.75f, Speed / FMath::Max(StrafeAuthoredSpeed, 1.f));
+	StrafeClipAge += FApp::GetDeltaTime();
+	const bool bPlaying = Anim && ClipMontage && Anim->Montage_IsActive(ClipMontage) && StrafeClipShown;
+	if (!bPlaying || (Wanted != StrafeClipShown && StrafeClipAge >= 0.2f))
+	{
+		// A new direction starts at the old clip's phase, so the feet stay in step.
+		float StartAt = 0.f;
+		if (bPlaying && StrafeClipShown->GetPlayLength() > 0.f)
+		{
+			const float Phase = FMath::Fmod(Anim->Montage_GetPosition(ClipMontage), StrafeClipShown->GetPlayLength()) / StrafeClipShown->GetPlayLength();
+			StartAt = Phase * Wanted->GetPlayLength();
+		}
+		PlayClip(Wanted, Rate, 0.15f, 0.2f, 1000, StartAt);
+		StrafeClipShown = Wanted;
+		StrafeClipAge = 0.f;
+	}
+	else if (bPlaying)
+	{
+		Anim->Montage_SetPlayRate(ClipMontage, Rate);
+	}
+	if (Speed > 40.f)
+	{
+		WarpTarget = WarpFor(Angle, StrafeClipShown, StrafeForward, StrafeRight, StrafeBack, StrafeLeft);
+	}
+}
+
+namespace
+{
+	TOptional<OrientationWarp::EDir> DirOfClip(const UAnimSequenceBase* Clip, const UAnimSequenceBase* Forward, const UAnimSequenceBase* Right,
+		const UAnimSequenceBase* Back, const UAnimSequenceBase* Left)
+	{
+		using OrientationWarp::EDir;
+		if (!Clip)
+		{
+			return {};
+		}
+		return Clip == Forward ? EDir::Forward : Clip == Right ? EDir::Right : Clip == Back ? EDir::Back : Clip == Left ? EDir::Left : TOptional<EDir>();
+	}
+}
+
+UAnimSequenceBase* APlayerCharacter::PickDirectionalClip(float AngleDeg, const UAnimSequenceBase* Current, UAnimSequenceBase* Forward,
+	UAnimSequenceBase* Right, UAnimSequenceBase* Back, UAnimSequenceBase* Left)
+{
+	switch (OrientationWarp::Pick(AngleDeg, DirOfClip(Current, Forward, Right, Back, Left)).Dir)
+	{
+	case OrientationWarp::EDir::Right: return Right;
+	case OrientationWarp::EDir::Back: return Back;
+	case OrientationWarp::EDir::Left: return Left;
+	default: return Forward;
+	}
+}
+
+float APlayerCharacter::WarpFor(float AngleDeg, const UAnimSequenceBase* Shown, const UAnimSequenceBase* Forward, const UAnimSequenceBase* Right,
+	const UAnimSequenceBase* Back, const UAnimSequenceBase* Left) const
+{
+	// From the clip actually on the slot (a switch waits out a short dwell), capped at the hysteresis band's edge.
+	const TOptional<OrientationWarp::EDir> Dir = DirOfClip(Shown, Forward, Right, Back, Left);
+	return Dir ? FMath::Clamp(FMath::FindDeltaAngleDegrees(OrientationWarp::Centre(*Dir), AngleDeg), -60.f, 60.f) : 0.f;
+}
+
+void APlayerCharacter::TickWarp(float DeltaSeconds)
+{
+	WarpAngle = FMath::FInterpTo(WarpAngle, WarpTarget, DeltaSeconds, WarpInterpSpeed);
+	if (WarpTarget == 0.f && FMath::Abs(WarpAngle) < 0.05f)
+	{
+		WarpAngle = 0.f;
+	}
+	if (UPlayerAnimInstance* Anim = Cast<UPlayerAnimInstance>(GetMesh()->GetAnimInstance()))
+	{
+		Anim->WarpAngle = WarpAngle;
+		Anim->ChestCounter = WarpChestCounter;
+	}
+	else if (!bWarpWarned && WarpAngle != 0.f)
+	{
+		bWarpWarned = true;
+		UE_LOG(LogTemp, Warning, TEXT("Feng Mao's animation blueprint isn't a UPlayerAnimInstance: run Docs/tools/setup_player.py, or the diagonals won't warp"));
+	}
+}
+
+void APlayerCharacter::StopStrafe()
+{
+	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
+	if (Anim && ClipMontage && Anim->Montage_IsActive(ClipMontage) && StrafeClipShown)
+	{
+		StopClip(0.2f); // any other clip would have cleared StrafeClipShown, so this one is the strafe's
+	}
+	StrafeClipShown = nullptr;
+}
+
 void APlayerCharacter::TickGuardVisuals()
 {
 	const EPlayerState State = Actions.GetState();
@@ -891,6 +1109,7 @@ void APlayerCharacter::TickGuardVisuals()
 
 	UAnimSequenceBase* Wanted = GuardLoopClip;
 	float Rate = 1.f;
+	TOptional<float> WalkAngle; // set while walking with the guard up
 	if (Actions.GetStateTime() < Actions.Tuning.GuardRaiseTime)
 	{
 		Wanted = GuardRaiseClip; // lifting the sword: only its first 0.18 s play before the loop takes over
@@ -902,11 +1121,8 @@ void APlayerCharacter::TickGuardVisuals()
 		if (Speed > 40.f)
 		{
 			// The walk clip by direction relative to his facing, with 15 degrees of hysteresis at the diagonals.
-			const float Angle = FMath::RadiansToDegrees(FMath::Atan2(Local.Y, Local.X)); // 0 ahead, +90 right
-			auto InBand = [Angle](float Centre, float Half) { return FMath::Abs(FMath::FindDeltaAngleDegrees(Centre, Angle)) <= Half; };
-			const bool bKeep = (GuardClipShown == GuardWalkForward && InBand(0.f, 60.f)) || (GuardClipShown == GuardWalkRight && InBand(90.f, 60.f))
-				|| (GuardClipShown == GuardWalkBack && InBand(180.f, 60.f)) || (GuardClipShown == GuardWalkLeft && InBand(-90.f, 60.f));
-			Wanted = bKeep ? GuardClipShown.Get() : InBand(0.f, 45.f) ? GuardWalkForward.Get() : InBand(90.f, 45.f) ? GuardWalkRight.Get() : InBand(-90.f, 45.f) ? GuardWalkLeft.Get() : GuardWalkBack.Get();
+			WalkAngle = FMath::RadiansToDegrees(FMath::Atan2(Local.Y, Local.X)); // 0 ahead, +90 right
+			Wanted = PickDirectionalClip(WalkAngle.GetValue(), GuardClipShown, GuardWalkForward, GuardWalkRight, GuardWalkBack, GuardWalkLeft);
 			Rate = FMath::Max(0.75f, Speed / FMath::Max(GuardWalkAuthoredSpeed, 1.f)); // slower plays the legs too slowly
 		}
 	}
@@ -930,6 +1146,10 @@ void APlayerCharacter::TickGuardVisuals()
 	else if (Anim && ClipMontage && Wanted != GuardRaiseClip && Wanted != GuardLoopClip)
 	{
 		Anim->Montage_SetPlayRate(ClipMontage, Rate);
+	}
+	if (WalkAngle)
+	{
+		WarpTarget = WarpFor(WalkAngle.GetValue(), GuardClipShown, GuardWalkForward, GuardWalkRight, GuardWalkBack, GuardWalkLeft);
 	}
 }
 
@@ -989,6 +1209,11 @@ void APlayerCharacter::SyncCombatant()
 	// Written after every model call, so a hit landing later this frame sees the current i-frames.
 	Combatant->State.bInvulnerable = Actions.IsInvulnerable();
 	Combatant->State.bGuarding = Actions.IsGuardActive();
+	// Where his aims may lead you: your velocity only while you move freely (QA: a dodge whose push ended early is still a
+	// dodge, and must never drag the Advance's dash or Soul Mark's aim).
+	const EPlayerState S = Actions.GetState();
+	Combatant->bReportsLeadVelocity = true;
+	Combatant->LeadVelocity = (S == EPlayerState::Free || S == EPlayerState::Guard) ? GetVelocity() * FVector(1.f, 1.f, 0.f) : FVector::ZeroVector;
 	if (Actions.GetState() != EPlayerState::Guard && Actions.GetState() != EPlayerState::BlockStun)
 	{
 		Combatant->State.GuardPressTime = -1.0; // the guard is down: no press to measure from
@@ -1031,6 +1256,7 @@ UAnimMontage* APlayerCharacter::PlayClip(UAnimSequenceBase* Clip, float Rate, fl
 		return nullptr;
 	}
 	GuardClipShown = nullptr;
+	StrafeClipShown = nullptr; // whoever plays a clip owns the slot now (the strafe sets it again after its own)
 	ClipMontage = Anim->PlaySlotAnimationAsDynamicMontage(Clip, MontageSlot, BlendIn, BlendOut, Rate, Loops, -1.f, StartAt);
 	return ClipMontage;
 }
@@ -1145,8 +1371,19 @@ void APlayerCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacke
 
 void APlayerCharacter::OnHitLanded(const FHitOutcome& Outcome, AActor* Victim)
 {
-	// Damage dealt reclaims soul fragments (spec section 8).
+	// Damage dealt reclaims soul fragments (spec section 8), with a burst on you when one comes back.
+	const int32 FragmentsBefore = Combatant->State.Health.Fragments;
 	Combatant->State.Health.OnDamageDealtToBoss(Outcome.DamageDealt);
+	if (Combatant->State.Health.Fragments < FragmentsBefore)
+	{
+		if (FragmentReturnEffect)
+		{
+			UGameplayStatics::SpawnEmitterAttached(FragmentReturnEffect, GetMesh(), NAME_None, FVector(0.f, 0.f, 100.f), FRotator::ZeroRotator,
+				EAttachLocation::KeepRelativeOffset, true);
+		}
+		SetEvent(TEXT("soul reclaimed"), 1.5f);
+		return;
+	}
 	// "Tick, tick, thud": lights don't kick the camera; the heavy does, the charged heavy and the slam harder.
 	if (const UAttackDefinition* Landed = Attacks->GetCurrent(); Landed && Landed->bHeavy)
 	{

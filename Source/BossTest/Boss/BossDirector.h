@@ -53,6 +53,10 @@ struct FBossComboOption
 	int32 Opener = 0;
 	TArray<int32> FollowUps;
 	float Weight = 1.f;
+	float Cooldown = 0.f;               // seconds before it can be rolled again (Combo G: 25)
+	bool bNeedsFreshBeat = false;       // only with no major since his last breather (QA: never five swings with one break)
+	bool bNeedsSeen = false;            // only once its opener and every follow-up have played this attempt
+	int32 Majors = 1;                   // how many majors it counts as for the breather (Combo G: 2)
 };
 
 struct FBossPerception
@@ -84,6 +88,8 @@ struct FBossDirectorTuning
 	float AngleHysteresis = 5.f;
 	FBossBandWeights ApproachWeights = { 0.f, 0.8f, 1.0f, 1.0f };
 	FBossBandWeights CircleWeights = { 0.8f, 1.0f, 0.5f, 0.f };
+	FBossBandWeights RepositionWeights = { 0.25f, 0.f, 0.f, 0.f }; // making space on purpose brings his Medium moves in (2026-11-25)
+	float MustAttackAfter = 2.5f;       // seconds of neutral after which a movement never beats a scoring attack
 	float StopShare = 0.5f;             // at commit: stopping weighs this times the sum of the opener's valid combos' base
 	                                    // weights, so every opener stops alone about a third of the time (council, 2026-11-24)
 	float CommitPause = 0.25f;          // the commitment cooldown after any action
@@ -99,6 +105,31 @@ struct FBossDirectorTuning
 	float RedecideAfter = 0.4f;         // a movement re-decides on a band change only after this long in it
 	int32 RepetitionWindow = 5;         // his last five offensive entries
 };
+
+// The aura circle (the user, 2026-11-25: "he's been beating my shi off and maybe once he just circles us like this is who you
+// messing with... decrease the frequency to very less"): a rare, earned beat that replaces a breather. Pure, so it's tested.
+struct FPostureInputs
+{
+	int32 RecentHitsOnPlayer = 0;       // his hits that landed in the last window
+	bool bRecentKnockdown = false;      // he knocked you down in the last window
+	float SinceLastPosture = 1000.f;    // seconds
+	EBossBand Band = EBossBand::Close;
+	EBossAngleBand Angle = EBossAngleBand::Front;
+	bool bPursuit = false;
+	float SincePlayerAttack = 1000.f;   // seconds since you were last attacking
+	bool bBeatBroken = false;           // a hit just broke his beat
+	float Roll = 0.f;                   // 0-1, from his seeded stream
+};
+
+struct FPostureRules
+{
+	int32 HitsNeeded = 2;
+	float Cooldown = 60.f;
+	float QuietFor = 2.f;
+	float Chance = 0.5f;
+};
+
+BOSSTEST_API bool ShouldPosture(const FPostureInputs& In, const FPostureRules& Rules);
 
 class BOSSTEST_API FBossDirector
 {
@@ -146,6 +177,7 @@ private:
 	TArray<FBossComboOption> Combos;
 	FBossDirectorTuning Tuning;
 	TMap<int32, float> Cooldowns;
+	TSet<int32> Seen;                 // actions that have played this attempt
 	TArray<int32> History;            // offensive entries, newest last
 	int32 LastCombo = -1;
 	int32 Majors = 0;

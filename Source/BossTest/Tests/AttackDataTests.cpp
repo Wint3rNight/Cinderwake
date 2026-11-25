@@ -11,6 +11,7 @@
 #include "Engine/SkeletalMeshSocket.h"
 #include "Particles/ParticleSystem.h"
 #include "Boss/BossCharacter.h"
+#include "Player/PlayerActions.h"
 
 namespace
 {
@@ -30,7 +31,7 @@ bool FAttackDataChainPoints::RunTest(const FString& Parameters)
 	struct FEdge { const TCHAR* Attack; const TCHAR* NextLight; const TCHAR* ChainFrom; const TCHAR* NextHeavy = TEXT("DA_Heavy"); };
 	const FEdge Edges[] = {
 		{ TEXT("DA_Light1"), TEXT("DA_Light2"), TEXT("0.38") },
-		{ TEXT("DA_Light2"), TEXT("DA_Light3"), TEXT("0.28") },
+		{ TEXT("DA_Light2"), TEXT("DA_Light3"), TEXT("0.32") },
 		{ TEXT("DA_Light3"), TEXT("DA_Light4"), TEXT("0.34") },
 		{ TEXT("DA_Light4"), TEXT("DA_Light1"), TEXT("0.45") },
 		{ TEXT("DA_SprintAttack"), TEXT("DA_Light2"), TEXT("0.55") },
@@ -147,7 +148,7 @@ bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
 		{ TEXT("DA_CrushingOverhead"), 55.f, true }, { TEXT("DA_DoubleExecution1"), 35.f, false }, { TEXT("DA_DoubleExecutionStop"), 35.f, false },
 		{ TEXT("DA_DoubleExecution2Fast"), 40.f, false }, { TEXT("DA_DoubleExecution2Delayed"), 40.f, false }, { TEXT("DA_PunishmentSweep"), 40.f, false },
 		{ TEXT("DA_JudgmentSlam"), 60.f, true }, { TEXT("DA_SoulMark"), 0.f, false }, { TEXT("DA_AdvanceDash"), 0.f, false }, { TEXT("DA_AdvanceSwing"), 40.f, false },
-		{ TEXT("DA_DoubleExecutionBreak"), 35.f, false }, { TEXT("DA_ReverseSweepE"), 35.f, false },
+		{ TEXT("DA_DoubleExecutionBreak"), 35.f, false }, { TEXT("DA_ReverseSweepE"), 35.f, false }, { TEXT("DA_DoubleExecution1Delayed"), 35.f, false },
 	};
 	for (const FExpect& E : All)
 	{
@@ -195,6 +196,9 @@ bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
 	const UAttackDefinition* Mark = Load(TEXT("DA_SoulMark"));
 	TestTrue(TEXT("Soul Mark: a 30-damage soul projectile at 14 m/s, no sweep"), Mark && Mark->Delivery == EAttackDelivery::Projectile
 		&& Mark->DeliveryDamage == 30.f && Mark->DeliverySpeed == 1400.f && Mark->bDeliverySoulFragment && Mark->SocketStart.IsNone());
+	// QA (2026-11-25): from 12 m a grasp chasing a sprinter meets them about 23 m out, and a sideways sprinter needs up to 6 m of lead.
+	TestTrue(TEXT("Soul Mark: 12 m, reaching 23 m or more, leading up to 6 m"), Mark && Mark->Range == 1200.f && Mark->DeliveryReach >= 2300.f
+		&& Mark->DeliveryLeadMax == 600.f);
 	const UAttackDefinition* Dash = Load(TEXT("DA_AdvanceDash"));
 	TestTrue(TEXT("the Advance's dash: no sweep, aims at an interception point"), Dash && Dash->SocketStart.IsNone() && Dash->LungeAim == ELungeAim::Intercept);
 
@@ -217,10 +221,15 @@ bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
 	// clip and timing so he can swap to it mid-swing.
 	const UAttackDefinition* Stop = Load(TEXT("DA_DoubleExecutionStop"));
 	const UAttackDefinition* Break = Load(TEXT("DA_DoubleExecutionBreak"));
-	if (Hit1 && Fast && Late && Stop && Break)
+	const UAttackDefinition* Hit1Late = Load(TEXT("DA_DoubleExecution1Delayed"));
+	if (Hit1 && Fast && Late && Stop && Break && Hit1Late)
 	{
+		// The delayed branch's tell (2026-11-25): its first hit is hit 1 with embers from the raise, so the guard-break swap
+		// (same clip and timing) still works on either branch.
+		TestTrue(TEXT("the delayed branch's hit 1: hit 1's clip and timing, plus embers"), Hit1Late->Clip == Hit1->Clip
+			&& FMath::IsNearlyEqual(Hit1Late->GetTiming().Windup, Hit1->GetTiming().Windup) && Hit1Late->Cues.Num() > 0 && Hit1->Cues.Num() == 0);
 		auto Mirrored = [](const UAnimSequenceBase* C) { return C == nullptr || C->GetPathName().StartsWith(TEXT("/Game/Retargeted/Sevarog/")); };
-		for (const UAttackDefinition* A : { Hit1, Stop, Break, Fast, Late })
+		for (const UAttackDefinition* A : { Hit1, Hit1Late, Stop, Break, Fast, Late })
 		{
 			TestTrue(FString::Printf(TEXT("%s: mirrored clips only"), *A->GetName()), A->Clip && Mirrored(A->Clip) && Mirrored(A->LeadInClip) && Mirrored(A->TailClip));
 		}
@@ -281,8 +290,15 @@ bool FAttackDataBossCombos::RunTest(const FString& Parameters)
 		{ TEXT("D"), TEXT("CrushingOverhead"), { TEXT("DelayedExecution") } },
 		{ TEXT("E"), TEXT("ExecutionersSwing"), { TEXT("ReverseSweep"), TEXT("JudgmentSlam") } },
 		{ TEXT("F"), TEXT("SoulMark"), { TEXT("ExecutionersAdvance") } },
+		{ TEXT("G"), TEXT("DoubleExecution"), { TEXT("CrushingOverhead"), TEXT("DelayedExecution") } },
 	};
-	TestEqual(TEXT("six combos"), Boss->Combos.Num(), 6);
+	TestEqual(TEXT("seven combos"), Boss->Combos.Num(), 7);
+	const FBossCombo* G = Boss->Combos.FindByPredicate([](const FBossCombo& X) { return X.Name == FName(TEXT("G")); });
+	TestTrue(TEXT("G: after a breather, once its moves are known, every 25 s, counting as two majors"),
+		G && G->bNeedsFreshBeat && G->bNeedsSeen && G->Cooldown == 25.f && G->Majors == 2);
+	const FBossAction* Double = Boss->Actions.FindByPredicate([](const FBossAction& A) { return A.Name == FName(TEXT("DoubleExecution")); });
+	TestTrue(TEXT("Double Execution's stop branch ends alone"), Double && Double->Variants.Num() == 3 && Double->Variants[2].bEndsAlone
+		&& !Double->Variants[0].bEndsAlone && !Double->Variants[1].bEndsAlone);
 	for (const FExpect& E : Expected)
 	{
 		const FBossCombo* C = Boss->Combos.FindByPredicate([&E](const FBossCombo& X) { return X.Name == FName(E.Name); });
@@ -330,7 +346,8 @@ bool FAttackDataBossCombos::RunTest(const FString& Parameters)
 		TestTrue(TEXT("E: Reverse Sweep's own clip and damage, from its start, no blend"), Sweep->Clip == Plain->Clip && Sweep->Damage == Plain->Damage
 			&& Sweep->ClipStartAt == 0.f && Sweep->BlendIn == 0.f && S1->Clip && S1->Clip->GetName() == TEXT("Swing1_Slow"));
 	}
-	// Combo F: the Advance's swing at least 0.70 s after the grasp reaches the Advance's 11.5 m (the dodge lock plus a reaction).
+	// Combo F: the Advance's swing at least 0.70 s after the grasp lands from its farthest (the dodge lock plus a reaction): its
+	// 12 m range edge to edge plus your capsule (QA, 2026-11-25: the 12 m grasp moved F's chain point from 0.52 to 0.54).
 	const FBossAction* Mark = FindAction(Boss, TEXT("SoulMark"));
 	const FBossAction* Advance = FindAction(Boss, TEXT("ExecutionersAdvance"));
 	const FBossCombo* F = Boss->Combos.FindByPredicate([](const FBossCombo& X) { return X.Name == FName(TEXT("F")); });
@@ -338,7 +355,7 @@ bool FAttackDataBossCombos::RunTest(const FString& Parameters)
 	{
 		const UAttackDefinition* Cast = Mark->Variants[0].Steps[0];
 		const FAttackTiming T = Cast->GetTiming();
-		const float Arrival = T.Windup + Advance->MaxRange / Cast->DeliverySpeed;
+		const float Arrival = T.Windup + (FMath::Max(Advance->MaxRange, Mark->MaxRange) + 38.f) / Cast->DeliverySpeed;
 		const float Strike = T.Windup + T.Active + F->FollowUps[0].ChainIntoRecovery + ActiveStartOf(*Advance, 0.f);
 		TestTrue(FString::Printf(TEXT("F: the swing %.2f s after the grasp arrives (at least 0.70)"), Strike - Arrival), Strike - Arrival >= 0.70f - 0.001f);
 	}
@@ -360,15 +377,38 @@ bool FAttackDataPunishLadder::RunTest(const FString& Parameters)
 	{
 		return false;
 	}
+	// The answers' free times, composed from the player's attack data (QA, 2026-11-25: typed-in times couldn't notice a change
+	// like Light 2's draw). A dodge attack comes out at the dodge-attack point; each chain starts the next at its chain point.
+	const float DodgeAttack = FPlayerTuning().DodgeAttackFrom;
+	auto Def = [](const TCHAR* Name) { return LoadAttack(Name); };
+	const UAttackDefinition* DL1 = Def(TEXT("DA_DodgeLight1"));
+	const UAttackDefinition* DL2 = Def(TEXT("DA_DodgeLight2"));
+	const UAttackDefinition* L1 = Def(TEXT("DA_Light1"));
+	const UAttackDefinition* L2 = Def(TEXT("DA_Light2"));
+	const UAttackDefinition* L1R = Def(TEXT("DA_Light1Rise"));
+	const UAttackDefinition* DH = Def(TEXT("DA_DodgeHeavy"));
+	const UAttackDefinition* H = Def(TEXT("DA_Heavy"));
+	const UAttackDefinition* CH = Def(TEXT("DA_ChargedHeavy"));
+	if (!TestTrue(TEXT("the player's attacks exist"), DL1 && DL2 && L1 && L2 && L1R && DH && H && CH))
+	{
+		return false;
+	}
+	auto Chain = [](const UAttackDefinition* A) { return A->GetTiming().ChainFrom; };
+	auto Total = [](const UAttackDefinition* A) { return A->GetTiming().Total(); };
+	const float DodgeLightFinisher = DodgeAttack + Chain(DL1) + Total(DL2);
+	const float ThreeHits = DodgeAttack + Chain(DL1) + Chain(DL2) + Total(L2);
+	const float DodgeSlam = DodgeAttack + Total(DH);
+	const float SlamRiseLight2 = DodgeAttack + Chain(DH) + Chain(L1R) + Total(L2);
+	const float ChargedLine = DodgeAttack + Chain(DL1) + (H->BranchAt + Chain(CH)) + Total(L1);
 	struct FRung { const TCHAR* Action; const TCHAR* Answer; float Free; };
 	const FRung Ladder[] = {
-		{ TEXT("ExecutionersSwing"), TEXT("dodge light and finisher"), 1.59f },
-		{ TEXT("ExecutionersAdvance"), TEXT("dodge light and finisher"), 1.59f },
-		{ TEXT("ReverseSweep"), TEXT("three hits"), 1.93f },
-		{ TEXT("PunishmentSweep"), TEXT("three hits"), 1.93f },
-		{ TEXT("DelayedExecution"), TEXT("the dodge slam"), 2.06f },
-		{ TEXT("CrushingOverhead"), TEXT("slam, stand-up Light 1, Light 2"), 2.62f },
-		{ TEXT("JudgmentSlam"), TEXT("dodge light, charged heavy, Light 1"), 2.83f },
+		{ TEXT("ExecutionersSwing"), TEXT("dodge light and finisher"), DodgeLightFinisher },
+		{ TEXT("ExecutionersAdvance"), TEXT("dodge light and finisher"), DodgeLightFinisher },
+		{ TEXT("ReverseSweep"), TEXT("three hits"), ThreeHits },
+		{ TEXT("PunishmentSweep"), TEXT("three hits"), ThreeHits },
+		{ TEXT("DelayedExecution"), TEXT("the dodge slam"), DodgeSlam },
+		{ TEXT("CrushingOverhead"), TEXT("slam, stand-up Light 1, Light 2"), SlamRiseLight2 },
+		{ TEXT("JudgmentSlam"), TEXT("dodge light, charged heavy, Light 1"), ChargedLine },
 	};
 	const float PauseFloor = 0.25f;
 	const float FastestOpener = 0.72f;

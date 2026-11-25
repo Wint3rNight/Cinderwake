@@ -61,6 +61,9 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The finishing blow on his slumped stagger: the charged heavy's crash from its crouch, a guaranteed hit (the council's run, 2026-11-24)"))
 	TObjectPtr<UAttackDefinition> RiposteAttack;
 
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Clips", meta = (ToolTip = "Heal clip seconds where the health lands; the clip plays faster so this lands at the rules' Heal Land At"))
+	float HealClipLandAt = 2.0f;
+
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Seconds the finishing blow's snap to its spot in front of him takes"))
 	float RiposteSnapTime = 0.15f;
 
@@ -107,6 +110,9 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Guard", meta = (ToolTip = "A small spark: a normal block"))
 	TObjectPtr<UParticleSystem> BlockEffect;
 
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Soul", meta = (ToolTip = "On you when a hit wins back a soul fragment (the newer player: the curse needed a sign it can be won back)"))
+	TObjectPtr<UParticleSystem> FragmentReturnEffect;
+
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Guard", meta = (ToolTip = "The big spark of a perfect guard"))
 	TObjectPtr<UParticleSystem> PerfectGuardEffect;
 
@@ -127,6 +133,29 @@ public:
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Clip seconds reached when the dodge ends"))
 	float DodgeClipEnd = 0.f;
+
+	// The dodge's pose follows his speed, not the clock (the feel pass, 2026-11-25): the deepest lean creeps while he's faster
+	// than a run; at Re Dodge At, with the stick held he plays on into the push-off, with none he plants into a stop.
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Clip seconds: the lean the dodge snaps into..."))
+	float DodgeLeanFrom = 0.33f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "... crept to by Re Dodge At (the clip's deepest lean)"))
+	float DodgeLeanTo = 0.43f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Clip seconds: the push-off played on at 1x when the stick takes over, then blended out"))
+	float DodgePushOffTo = 0.63f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "The plant when the dodge ends with no stick (Jog_Fwd_Stop)"))
+	TObjectPtr<UAnimSequenceBase> DodgeStopClip;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Stop clip seconds: from the plant, at 1x to Dodge Stop Slow Until, then 1.5x to Dodge Stop To (his idle)"))
+	float DodgeStopFrom = 1.35f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade")
+	float DodgeStopSlowUntil = 1.50f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade")
+	float DodgeStopTo = 2.05f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade")
 	TObjectPtr<UAnimSequenceBase> BackstepClip;
@@ -151,10 +180,10 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Translucent, used with skeletal meshes, with Opacity and Color parameters (create_afterimage_material.py). None: no afterimages"))
 	TObjectPtr<UMaterialInterface> AfterimageMaterial;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Copies per evade (the pool's size)"))
-	int32 AfterimageCount = 4;
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Copies per evade (the pool's size); copy i appears when the dodge's clock passes i x the interval, so new copies mean invulnerable"))
+	int32 AfterimageCount = 5;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Seconds between copies, from the evade's start (he covers most of the distance in the first 0.25 s)"))
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Seconds of dodge clock between copies (five at 0.05 s all appear inside the 0.22 s of i-frames)"))
 	float AfterimageInterval = 0.05f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Seconds each copy takes to fade out"))
@@ -211,6 +240,34 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Player|Movement", meta = (ToolTip = "cm/s. His jog clip is authored for about 400; faster slides"))
 	float RunSpeed = 400.f;
 
+	// Strafing when locked on (the gap study, 2026-11-25): he keeps facing the target and the jog clip follows the direction
+	// he moves in, played full body on the slot like the guard walk. Sprinting breaks it, as in souls games.
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Strafe")
+	TObjectPtr<UAnimSequenceBase> StrafeForward;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Strafe")
+	TObjectPtr<UAnimSequenceBase> StrafeBack;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Strafe")
+	TObjectPtr<UAnimSequenceBase> StrafeLeft;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Strafe")
+	TObjectPtr<UAnimSequenceBase> StrafeRight;
+
+	UPROPERTY(EditAnywhere, Category = "Player|Strafe", meta = (ToolTip = "cm/s the jog clips are authored for; slower plays the legs slower, down to 0.75x"))
+	float StrafeAuthoredSpeed = 400.f;
+
+	UPROPERTY(EditAnywhere, Category = "Player|Strafe", meta = (ToolTip = "cm/s moving sideways or back while locked on (forward stays Run Speed)"))
+	float StrafeSideSpeed = 350.f;
+
+	// Orientation warping (after the 6d play, 2026-11-25): on a diagonal the nearest of the four clips steps up to 60 degrees off,
+	// so the skeleton turns by the difference and the spine turns back part of it (OrientationWarp.h). Strafe and guard walk.
+	UPROPERTY(EditAnywhere, Category = "Player|Strafe", meta = (ToolTip = "Share of the warp the spine turns back so the chest stays toward the target (0 none, 1 all)"))
+	float WarpChestCounter = 0.5f;
+
+	UPROPERTY(EditAnywhere, Category = "Player|Strafe", meta = (ToolTip = "How fast the warp follows its target, per second (15: about 90% in 0.15 s, the clip switch's blend)"))
+	float WarpInterpSpeed = 15.f;
+
 	UPROPERTY(EditAnywhere, Category = "Player|Movement", meta = (ToolTip = "cm/s"))
 	float SprintSpeed = 650.f;
 
@@ -238,6 +295,11 @@ public:
 	bool IsStaminaFlashing() const;   // a press was just refused (the HUD flashes the stamina bar)
 	UAttackComponent* GetAttacks() const { return Attacks; }
 	int32 GetVisibleAfterimages() const;
+	const UAnimSequenceBase* GetStrafeClip() const { return StrafeClipShown; }
+	const UAnimSequenceBase* GetGuardClip() const { return GuardClipShown; }
+	float GetWarpAngle() const { return WarpAngle; } // degrees the skeleton is turned now (+ right)
+	float GetWarpTarget() const { return WarpTarget; }
+	bool IsLockedOn() const;
 	FString DebugLine() const;
 	FString LastEventText() const { return LastEventTime > 0.f ? LastEvent : FString(); }
 
@@ -272,6 +334,18 @@ private:
 	void StartDodge(bool bBackstep);
 	void EndDodgePush();
 	void TickEvadeVisuals(float DeltaSeconds);
+	void TickDodgeStop();
+	void TickStrafeVisuals();
+	void StopStrafe();
+	void TickWarp(float DeltaSeconds);
+	// Which of four clips shows a movement at AngleDeg (0 ahead, +90 right), keeping Current within its hysteresis.
+	UAnimSequenceBase* PickDirectionalClip(float AngleDeg, const UAnimSequenceBase* Current, UAnimSequenceBase* Forward, UAnimSequenceBase* Right,
+		UAnimSequenceBase* Back, UAnimSequenceBase* Left);
+	// The warp that makes Shown step along AngleDeg; 0 if Shown isn't one of the four.
+	float WarpFor(float AngleDeg, const UAnimSequenceBase* Shown, const UAnimSequenceBase* Forward, const UAnimSequenceBase* Right,
+		const UAnimSequenceBase* Back, const UAnimSequenceBase* Left) const;
+	bool HasStrafeClips() const { return StrafeForward && StrafeBack && StrafeLeft && StrafeRight; }
+	void ReleaseDodgePush();
 	void EndEvadeVisuals(float BlendOut);
 	void MakeAfterimagePool();
 	void SpawnAfterimage();
@@ -332,8 +406,20 @@ private:
 	TArray<TObjectPtr<class UMaterialInstanceDynamic>> AfterimageMaterials;
 
 	TArray<float> AfterimageAge;    // per copy, seconds since it appeared; below 0 when hidden
-	int32 AfterimagesLeft = 0;      // still to appear in this evade
-	float AfterimageClock = 0.f;    // since the last one appeared
+	int32 AfterimagesShown = 0;     // copies spawned in this evade so far
+	int32 EvadePhase = 0;           // 0 the creeping lean, 1 the push-off, 2 the plant
+	bool bEvadeBackstep = false;
+
+	UPROPERTY()
+	TObjectPtr<UAnimMontage> DodgeStopMontage; // the plant, played as an ordinary clip so moving ends it
+
+	UPROPERTY()
+	TObjectPtr<UAnimSequenceBase> StrafeClipShown; // which jog clip the strafe has on the slot
+	float StrafeClipAge = 0.f;
+
+	float WarpAngle = 0.f;   // degrees the skeleton is turned (smoothed toward WarpTarget)
+	float WarpTarget = 0.f;  // set each tick by the strafe or the guard walk; 0 otherwise
+	bool bWarpWarned = false;
 
 	float EvadeClipStart = 0.f;
 	float EvadeClipEnd = 0.f;

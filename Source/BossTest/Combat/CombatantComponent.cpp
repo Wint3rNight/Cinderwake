@@ -6,6 +6,7 @@
 #include "Engine/CollisionProfile.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "HAL/PlatformTime.h"
 
 int32 UCombatantComponent::NextTargetKey = 0;
@@ -234,4 +235,19 @@ void UCombatantComponent::StopRagdoll()
 		}
 	}
 	Mesh->SetRelativeTransform(MeshRelative);
+}
+
+FVector UCombatantComponent::LeadVelocityOf(const AActor* Target)
+{
+	if (!Target)
+	{
+		return FVector::ZeroVector;
+	}
+	if (const UCombatantComponent* C = Target->FindComponentByClass<UCombatantComponent>(); C && C->bReportsLeadVelocity)
+	{
+		return C->LeadVelocity;
+	}
+	const ACharacter* Character = Cast<ACharacter>(Target);
+	const bool bRootMotion = Character && Character->GetCharacterMovement()->HasRootMotionSources();
+	return bRootMotion ? FVector::ZeroVector : Target->GetVelocity();
 }

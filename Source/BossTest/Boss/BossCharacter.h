@@ -44,6 +44,9 @@ struct FBossActionVariant
 
 	UPROPERTY(EditAnywhere, Category = "Action")
 	float HoldExtraMax = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "A branch that ends the action (Double Execution's stop): no combo follows it"))
+	bool bEndsAlone = false;
 };
 
 // Section 10's weight table row for one action (Step 6).
@@ -98,6 +101,18 @@ struct FBossCombo
 
 	UPROPERTY(EditAnywhere, Category = "Combo")
 	float Weight = 1.f;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "Seconds before it can be rolled again"))
+	float Cooldown = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "Only with no major action since his last breather"))
+	bool bNeedsFreshBeat = false;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "Only once its opener and every follow-up have played this attempt"))
+	bool bNeedsSeen = false;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "How many majors it counts as for the breather"))
+	int32 Majors = 1;
 };
 
 // One of his actions as the director sees it (Step 5, weights by band since Step 6).
@@ -140,6 +155,25 @@ struct FBossAction
 	TObjectPtr<UAttackDefinition> GuardBreakRecovery;
 };
 
+// The aura circle's rules as Blueprint data (copied into the director's plain FPostureRules).
+USTRUCT()
+struct FPostureRulesData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Aura", meta = (ToolTip = "His hits on you within the window that earn it (a knockdown earns it too)"))
+	int32 HitsNeeded = 2;
+
+	UPROPERTY(EditAnywhere, Category = "Aura", meta = (ToolTip = "Seconds before he can do it again"))
+	float Cooldown = 60.f;
+
+	UPROPERTY(EditAnywhere, Category = "Aura", meta = (ToolTip = "Seconds you must have held back"))
+	float QuietFor = 2.f;
+
+	UPROPERTY(EditAnywhere, Category = "Aura", meta = (ToolTip = "Chance when all the rest hold"))
+	float Chance = 0.5f;
+};
+
 UCLASS()
 class BOSSTEST_API ABossCharacter : public ACharacter
 {
@@ -174,6 +208,9 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm/s: after 4 s of you far away"))
 	float PursuitSpeed = 500.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm/s: his approach at Medium range while you haven't attacked for 2 s, a stalk (more menace, more time to read him)"))
+	float StalkSpeed = 200.f;
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "Seconds he pauses after an action (the commitment cooldown; a hit can't cut it shorter)"))
 	float CommitPause = 0.25f;
@@ -226,6 +263,40 @@ public:
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "Candelas"))
 	float FinisherGlowIntensity = 40.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Encounter", meta = (ToolTip = "Swirls around him while you're missing soul fragments: your stolen soul is on him (hit him to take it back)"))
+	TObjectPtr<class UParticleSystem> StolenSoulEffect;
+
+	// ---- The aura circle (the user, 2026-11-25): rare and earned, after he's been winning; replaces a breather ----
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Aura", meta = (ToolTip = "Travel_Mode_Idle: hammer held out at his side, far from both windups' silhouettes"))
+	TObjectPtr<UAnimSequenceBase> PostureClip;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Aura", meta = (ToolTip = "Smoke drifting off him while he circles"))
+	TObjectPtr<class UParticleSystem> PostureSmoke;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Aura", meta = (ToolTip = "On the hammer head while he circles"))
+	TObjectPtr<class UParticleSystem> PostureHammerEffect;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura", meta = (ToolTip = "When: his hits needed in the window, the cooldown, your quiet time and the chance"))
+	FPostureRulesData PostureRules;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura", meta = (ToolTip = "Seconds his hits count toward earning it"))
+	float PostureHitWindow = 15.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura")
+	float PostureMin = 2.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura")
+	float PostureMax = 2.5f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura", meta = (ToolTip = "cm/s: a slow circle around you"))
+	float PostureSpeed = 110.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura", meta = (ToolTip = "Degrees per second: he watches rather than tracks"))
+	float PostureTurnRate = 60.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Aura", meta = (ToolTip = "Seconds of rouse when it ends: it is the commitment pause, not extra"))
+	float PostureRouse = 0.30f;
 
 
 	// ---- Clips (played on MontageSlot) ----
@@ -324,6 +395,8 @@ public:
 	FName GetSelectedActionName() const;
 	const UDeliveryComponent* GetDelivery() const { return Delivery; }
 	void ForceStagger();
+	void ForcePosture();        // tests and debugging: the aura circle now (AI off)
+	bool IsPostureFXActive() const { return PostureFX.Num() > 0; }
 	void ResetBoss();
 
 	// ---- The finishing blow ----
@@ -353,9 +426,17 @@ private:
 	void StartIntro();
 	void Evaluate();
 	void StartSwing(const FString& Reason);
-	bool StartAction(int32 Index, const FString& Reason, EBossPriority Priority = EBossPriority::CommittedAttack, int32 Combo = -1, int32 ForcedVariant = -1);
+	// With bRollCombo, the combo is rolled after the variant, and a branch that ends alone takes none (QA: Combo G could follow
+	// Double Execution's stop branch when the combo was rolled first).
+	bool StartAction(int32 Index, const FString& Reason, EBossPriority Priority = EBossPriority::CommittedAttack, int32 Combo = -1, int32 ForcedVariant = -1, bool bRollCombo = false);
 	void OnOwnSweep(const FHitOutcome& Outcome, AActor* Victim, uint32 InstanceId);
 	void TickStagger(float DeltaSeconds);
+	void TickPosture(float DeltaSeconds);
+	bool TryPosture();
+	void OnPlayerHit(const FHitOutcome& Outcome, AActor* Attacker);
+	void EndPostureEffects();
+	void SampleSwing();
+	void FlushSwing();
 	bool HasStunClips() const { return StunStartClip && StunLoopClip && StunEndClip; }
 	UAnimMontage* PlayClipEased(UAnimSequenceBase* Clip, float Rate, float BlendIn, float BlendOut, int32 Loops = 1);
 	void InitDirector();
@@ -419,6 +500,7 @@ private:
 	int32 SelectedAction = 0;
 	bool bCastOpen = false;
 	TArray<double> PlayerHitTimes;
+	double LastPlayerAttackTime = -100.0; // world seconds the player was last seen attacking
 	FRandomStream Rng;
 
 	UPROPERTY()
@@ -433,6 +515,40 @@ private:
 
 	UPROPERTY()
 	TObjectPtr<class UPointLightComponent> FinisherGlow;
+
+	UPROPERTY()
+	TObjectPtr<class UParticleSystemComponent> StolenSoulFX;
+
+	UPROPERTY()
+	TArray<TObjectPtr<class UParticleSystemComponent>> PostureFX;
+	TArray<double> HitsOnPlayerTimes;      // world seconds his hits landed on you
+	double LastKnockdownOnPlayer = -100.0;
+	double LastPostureTime = -1000.0;
+	double PostureStartTime = 0.0;
+	double LastPlayerAttackStart = -100.0; // world seconds you started an attack (the aura's exit, seen 0.25 s later)
+	double LastPlayerHealStart = -100.0;
+	bool bPlayerWasAttacking = false;
+	bool bPlayerWasHealing = false;
+	bool bPlayerHitBound = false;
+	float PostureLength = 2.f;
+
+	// The per-swing log (the gap study, 2026-11-25): one line per swept step, so a play tells his misses from your spacing.
+	struct FSwingRecord
+	{
+		uint32 Instance = 0;
+		FString Step;
+		FString Action;
+		float EdgeAtWindup = -1.f;
+		float RadialSpeed = 0.f;       // you moving away (+) or in (-) at windup start, cm/s
+		float EdgeAtActive = -1.f;
+		float ClosestGap = 1e9f;       // hammer to your capsule during the active window, cm (0 = touching)
+		FString Outcome;               // what the sweep resolved, empty if it never touched you
+		bool bDodged = false;
+		bool bGuarded = false;
+	};
+	FSwingRecord Swing;
+	int32 PostureSign = 1;
+	bool bPostureFlipped = false;
 	bool bFinisherTaken = false;  // this stagger's one finishing blow has started
 	int32 StunPhase = 0;          // 0 slumping, 1 slumped (the loop), 2 standing
 	float StaggerYaw = 0.f;       // his facing when the stagger began (the turn's limit is measured from it)

@@ -87,6 +87,8 @@ void ABossTestHUD::DrawHUD()
 		const float OneFragment = Health.FragmentFraction * Health.BaseMax * HealthPixelsPerPoint;
 		const float Progress = Health.ReclaimPerFragment > 0.f ? FMath::Clamp(Health.GetReclaimProgress() / Health.ReclaimPerFragment, 0.f, 1.f) : 0.f;
 		DrawRect(FLinearColor(0.70f, 0.55f, 0.95f), LostX, Y + HealthHeight - 3.f, OneFragment * Progress, 3.f);
+		// Say what the purple part is and how to get it back (the newer player didn't know why the bar shrank).
+		DrawText(TEXT("soul taken: hit him to take it back"), FLinearColor(0.70f, 0.55f, 0.95f), LostX + Bar.Lost + 8.f, Y - 1.f, GEngine->GetSmallFont());
 	}
 	Y += HealthHeight + Border * 2.f + 4.f;
 

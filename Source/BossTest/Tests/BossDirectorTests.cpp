@@ -34,7 +34,7 @@ namespace
 			Opt(Double, 0.f, 430.f, EBossAngleRule::FrontAndSides, { 1.0f, 0.2f, 0.f, 0.f }),
 			Opt(Punish, 0.f, 350.f, EBossAngleRule::FrontAndSides, { 0.6f, 0.f, 0.f, 0.f }),
 			Opt(Judgment, 0.f, 800.f, EBossAngleRule::FrontOnly, { 0.3f, 0.8f, 0.2f, 0.f }, 12.f),
-			Opt(SoulMark, 250.f, 800.f, EBossAngleRule::FrontOnly, { 0.f, 0.5f, 0.7f, 0.f }, 10.f),
+			Opt(SoulMark, 250.f, 1200.f, EBossAngleRule::FrontOnly, { 0.f, 0.5f, 0.7f, 0.5f }, 10.f),
 			Opt(Advance, 400.f, 1150.f, EBossAngleRule::Any, { 0.f, 0.3f, 0.8f, 1.2f }, 7.f),
 		};
 		O[Reverse].RearWeight = 1.5f;
@@ -89,6 +89,7 @@ namespace
 
 	constexpr int32 ApproachKey = -1 - static_cast<int32>(EBossMove::Approach);
 	constexpr int32 CircleKey = -1 - static_cast<int32>(EBossMove::Circle);
+	constexpr int32 RepositionKey = -1 - static_cast<int32>(EBossMove::Reposition);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorBandHysteresis, "BossTest.Boss.Director.BandHysteresis", DirectorTestFlags)
@@ -128,16 +129,17 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorWeightTables, "BossTest.Boss.Director.
 bool FDirectorWeightTables::RunTest(const FString& Parameters)
 {
 	// Close, in front: section 10's close column (Swing 1.0, Double 1.0, Reverse 0.8, Delayed 0.5, Crushing 0.6,
-	// Judgment 0.3, Circle 0.8; Punishment needs its trigger, Soul Mark its 2.5 m minimum).
+	// Judgment 0.3, Circle 0.8, Reposition 0.25 since 2026-11-25; Punishment needs its trigger, Soul Mark its 2.5 m minimum).
 	FBossDirector D = Make();
 	D.Observe(See(150.f), true, 0.1f);
 	const TMap<int32, int32> R = Picks(D, See(150.f), 6000);
-	const float Total = 1.0f + 1.0f + 0.8f + 0.5f + 0.6f + 0.3f + 0.8f;
+	const float Total = 1.0f + 1.0f + 0.8f + 0.5f + 0.6f + 0.3f + 0.8f + 0.25f;
 	auto Share = [&R](int32 K) { return R.FindRef(K) / 6000.f; };
 	TestTrue(FString::Printf(TEXT("the swing about %.2f (%.2f)"), 1.f / Total, Share(Swing)), FMath::Abs(Share(Swing) - 1.f / Total) < 0.03f);
 	TestTrue(FString::Printf(TEXT("Judgment Slam about %.2f (%.2f)"), 0.3f / Total, Share(Judgment)), FMath::Abs(Share(Judgment) - 0.3f / Total) < 0.02f);
 	TestTrue(FString::Printf(TEXT("circling about %.2f (%.2f)"), 0.8f / Total, Share(CircleKey)), FMath::Abs(Share(CircleKey) - 0.8f / Total) < 0.03f);
 	TestFalse(TEXT("no approach when close"), R.Contains(ApproachKey));
+	TestTrue(FString::Printf(TEXT("backing off about %.2f (%.2f)"), 0.25f / Total, Share(RepositionKey)), FMath::Abs(Share(RepositionKey) - 0.25f / Total) < 0.02f);
 	TestFalse(TEXT("no Soul Mark inside 2.5 m"), R.Contains(SoulMark));
 	FBossDirector Far = Make();
 	Far.Observe(See(800.f), true, 0.1f);
@@ -241,6 +243,68 @@ bool FDirectorComboStopBase::RunTest(const FString& Parameters)
 	}
 	const float Stop = Stops / 6000.f;
 	TestTrue(FString::Printf(TEXT("stops about 1.5/2.7 of the time (%.3f)"), Stop), FMath::Abs(Stop - 1.5f / 2.7f) < 0.02f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorMustAttack, "BossTest.Boss.Director.MustAttackAfterNeutral", DirectorTestFlags)
+bool FDirectorMustAttack::RunTest(const FString& Parameters)
+{
+	// QA (2026-11-25): past 2.5 s of neutral no movement is picked while any attack scores; with none scoring he still moves.
+	FBossDirector D = Make();
+	D.Observe(See(150.f), true, 2.6f);
+	const TMap<int32, int32> R = Picks(D, See(150.f), 2000);
+	TestFalse(TEXT("close, 2.6 s of neutral: no circling or backing off"), R.Contains(CircleKey) || R.Contains(RepositionKey) || R.Contains(ApproachKey));
+	FBossDirector Far = Make();
+	Far.Observe(See(1300.f, 0.f), true, 2.6f);
+	Far.NoteStepStarted(Advance); // the Advance cools down: nothing scores at 13 m
+	const TMap<int32, int32> F = Picks(Far, See(1300.f, 0.f), 200);
+	TestTrue(TEXT("nothing scoring: he still moves"), F.Contains(ApproachKey) || F.Contains(CircleKey));
+	FBossDirector Hit = Make();
+	Hit.Observe(See(150.f), true, 0.1f);
+	Hit.NoteBeatBroken();
+	const TMap<int32, int32> H = Picks(Hit, See(150.f), 2000);
+	TestFalse(TEXT("right after a hit he never backs off"), H.Contains(RepositionKey));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorComboGGates, "BossTest.Boss.Director.ComboGGates", DirectorTestFlags)
+bool FDirectorComboGGates::RunTest(const FString& Parameters)
+{
+	// Combo G (the gap study, 2026-11-25): Double Execution, Crushing Overhead, Delayed Execution. Only once all three have
+	// played this attempt, only with no major since his last breather, every 25 s at most, and it counts as two majors.
+	TArray<FBossComboOption> Combos = CombosAF();
+	FBossComboOption G = Combo(6, Double, { Crushing, Delayed });
+	G.Cooldown = 25.f;
+	G.bNeedsFreshBeat = true;
+	G.bNeedsSeen = true;
+	G.Majors = 2;
+	Combos.Add(G);
+	FBossDirector D = Make(Combos);
+	FRandomStream Rng(21);
+	auto Rolls = [&D, &Rng]() { bool bG = false; for (int32 i = 0; i < 400; ++i) { bG |= D.RollCombo(Double, Rng) == 6; } return bG; };
+	TestFalse(TEXT("not before its moves have played"), Rolls());
+	D.NoteStepStarted(Double);
+	D.NoteStepStarted(Crushing);
+	TestFalse(TEXT("not with one still unseen"), Rolls());
+	D.NoteStepStarted(Delayed);
+	TestTrue(TEXT("once all three have played"), Rolls());
+	D.NoteCommitted(Swing, -1);
+	TestFalse(TEXT("not right after another major"), Rolls());
+	TestEqual(TEXT("one major: a pause, not a breather"), D.PauseAfterAttack(), 0.25f, 0.001f);
+	D.NoteCommitted(Swing, -1);
+	TestEqual(TEXT("two majors: the breather resets the count"), D.PauseAfterAttack(), 1.f, 0.001f);
+	TestTrue(TEXT("after a breather it can come"), Rolls());
+	D.NoteCommitted(Double, 6);
+	TestEqual(TEXT("it counts as two majors: a breather follows at once"), D.PauseAfterAttack(), 1.f, 0.001f);
+	D.Observe(See(200.f), true, 24.f);
+	TestFalse(TEXT("24 s later, still cooling down"), Rolls());
+	D.Observe(See(200.f), true, 1.1f);
+	D.NoteCommitted(Reverse, 2); // another combo in between, so G isn't "the same combo twice"
+	D.PauseAfterAttack();
+	D.Observe(See(200.f), true, 1.1f); // a second of neutral clears the majors
+	TestTrue(TEXT("after 25 s it can come again"), Rolls());
+	D.Reset();
+	TestFalse(TEXT("a retry forgets what he has shown"), Rolls());
 	return true;
 }
 
@@ -618,6 +682,39 @@ bool FDirectorTouching::RunTest(const FString& Parameters)
 	TestTrue(TEXT("touching: close"), D.GetBand() == EBossBand::Close);
 	TestTrue(TEXT("the swing fits"), D.IsValidNow(Swing, See(-5.f, 20.f), false));
 	TestTrue(TEXT("and he attacks"), Picks(D, See(-5.f, 20.f), 200).Contains(Swing));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorPostureRule, "BossTest.Boss.Director.PostureIsEarnedAndRare", DirectorTestFlags)
+bool FDirectorPostureRule::RunTest(const FString& Parameters)
+{
+	// The aura circle (the user, 2026-11-25): only after he's been winning, at Medium or Far in front, with you holding back,
+	// not while chasing or right after a hit broke his beat, at most once a minute, and half the time when all that holds.
+	FPostureInputs In;
+	In.RecentHitsOnPlayer = 2;
+	In.Band = EBossBand::Medium;
+	In.Angle = EBossAngleBand::Front;
+	In.Roll = 0.2f;
+	const FPostureRules R;
+	TestTrue(TEXT("two hits, mid range, in front, quiet: yes"), ShouldPosture(In, R));
+	FPostureInputs X = In; X.RecentHitsOnPlayer = 1;
+	TestFalse(TEXT("one hit: not earned"), ShouldPosture(X, R));
+	X.bRecentKnockdown = true;
+	TestTrue(TEXT("a knockdown earns it too"), ShouldPosture(X, R));
+	X = In; X.Band = EBossBand::Close;
+	TestFalse(TEXT("never close"), ShouldPosture(X, R));
+	X = In; X.Angle = EBossAngleBand::RearQuarter;
+	TestFalse(TEXT("never with you round his back"), ShouldPosture(X, R));
+	X = In; X.SincePlayerAttack = 1.9f;
+	TestFalse(TEXT("not when you attacked 1.9 s ago"), ShouldPosture(X, R));
+	X = In; X.bPursuit = true;
+	TestFalse(TEXT("not while chasing"), ShouldPosture(X, R));
+	X = In; X.bBeatBroken = true;
+	TestFalse(TEXT("not right after a hit broke his beat"), ShouldPosture(X, R));
+	X = In; X.SinceLastPosture = 59.f;
+	TestFalse(TEXT("at most once a minute"), ShouldPosture(X, R));
+	X = In; X.Roll = 0.6f;
+	TestFalse(TEXT("only half the time"), ShouldPosture(X, R));
 	return true;
 }
 

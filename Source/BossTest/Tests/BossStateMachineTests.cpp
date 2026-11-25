@@ -154,6 +154,12 @@ bool FBossStatesStaggerEnd::RunTest(const FString& Parameters)
 	Paused.SetTimeout(3.4f);
 	TestEqual(TEXT("a finisher lengthens the stagger's backstop"), Paused.GetTimeout(), 3.4f);
 	TestTrue(TEXT("or into the commitment pause (the council's run, 2026-11-24)"), Paused.Complete(S::Neutral, TEXT("stagger over")));
+	// The aura circle (2026-11-25): it replaces a breather after an attack, never goes straight into one, and ends in the pause.
+	TestTrue(TEXT("an attack can end into the aura"), FBossStateMachine::IsLegal(S::Attack, S::Posture));
+	TestFalse(TEXT("the aura never goes straight into an attack"), FBossStateMachine::IsLegal(S::Posture, S::Attack));
+	TestTrue(TEXT("it ends into the pause"), FBossStateMachine::IsLegal(S::Posture, S::Neutral));
+	TestTrue(TEXT("a stagger interrupts it"), FBossStateMachine::IsLegal(S::Posture, S::Stagger));
+	TestTrue(TEXT("it times out"), FBossStateMachine::DefaultTimeout(S::Posture) > 0.f);
 	FBossStateMachine N;
 	N.Reset(4.5f);
 	TestEqual(TEXT("the intro's timeout follows its clip"), N.GetTimeout(), 4.5f);

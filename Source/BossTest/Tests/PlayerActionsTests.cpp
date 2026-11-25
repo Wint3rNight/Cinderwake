@@ -155,10 +155,83 @@ bool FActionsDodgeTimings::RunTest(const FString& Parameters)
 	TestTrue(TEXT("invulnerable at 0.21 s"), A.IsInvulnerable());
 	A.Tick(Frame(0.02f).Move());
 	TestFalse(TEXT("not at 0.23 s"), A.IsInvulnerable());
-	A.Tick(Frame(0.17f).Move());
-	TestTrue(TEXT("no second dodge at 0.40 s"), PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()).IsEmpty());
-	TestTrue(TEXT("held through to 0.50 s, where it comes out"), Same(A.Tick(Frame(0.10f).Move()), { C::EndDodge, C::StartDodge }));
+	A.Tick(Frame(0.07f).Move());
+	TestTrue(TEXT("a second dodge at 0.30 s is held"), PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()).IsEmpty());
+	TestTrue(TEXT("and comes out at 0.40 s (the feel pass, 2026-11-25)"), Same(A.Tick(Frame(0.10f).Move()), { C::EndDodge, C::StartDodge }));
 	TestEqual(TEXT("another 28"), A.Stamina.Current, 64.f, ActionsTol);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsDodgePressSweep, "BossTest.Player.Actions.DodgePressSweep", ActionsTestFlags)
+bool FActionsDodgePressSweep::RunTest(const FString& Parameters)
+{
+	// A dodge pressed during a dodge (game feel and QA, 2026-11-25): before 0.15 s it's dropped silently (no refusal
+	// flash: the flash means "can't afford"); from 0.15 s it's held and comes out at max(press, 0.40), never lost.
+	for (int32 i = 0; i < 72; ++i)
+	{
+		const float PressAt = i * 0.01f;
+		FPlayerActions A = MakeActions();
+		PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+		float T = 0.f;
+		while (T < PressAt - 0.001f)
+		{
+			A.Tick(Frame(0.01f));
+			T += 0.01f;
+		}
+		const FPlayerCommands AtPress = PressNow(A, EPlayerInput::Dodge, Frame(0.f));
+		float FiredAt = AtPress.Contains(C::StartDodge) || AtPress.Contains(C::StartBackstep) ? T : -1.f;
+		bool bRefused = AtPress.Contains(C::RefuseInput);
+		while (FiredAt < 0.f && T < 0.72f)
+		{
+			const FPlayerCommands Out = A.Tick(Frame(0.01f));
+			T += 0.01f;
+			bRefused |= Out.Contains(C::RefuseInput);
+			if (Out.Contains(C::StartDodge) || Out.Contains(C::StartBackstep))
+			{
+				FiredAt = T;
+			}
+		}
+		if (PressAt < 0.15f - 0.001f)
+		{
+			TestTrue(FString::Printf(TEXT("pressed at %.2f s: dropped"), PressAt), FiredAt < 0.f);
+		}
+		else
+		{
+			const float Want = FMath::Max(PressAt, 0.40f);
+			TestTrue(FString::Printf(TEXT("pressed at %.2f s: out at %.2f (got %.2f)"), PressAt, Want, FiredAt), FMath::Abs(FiredAt - Want) <= 0.011f);
+		}
+		TestFalse(FString::Printf(TEXT("pressed at %.2f s: never a refusal flash"), PressAt), bRefused);
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsLightReplacesHeldDodge, "BossTest.Player.Actions.LightReplacesHeldDodge", ActionsTestFlags)
+bool FActionsLightReplacesHeldDodge::RunTest(const FString& Parameters)
+{
+	// One held slot, latest press wins: a dodge held at 0.30, then a light at 0.35, gives the dodge light at 0.50 (the
+	// punish ladder's answers don't move).
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.30f).Move());
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.05f).Move());
+	PressNow(A, EPlayerInput::Light, Frame(0.f).Move());
+	TestFalse(TEXT("no second dodge at 0.40"), A.Tick(Frame(0.05f).Move()).Contains(C::StartDodge));
+	TestTrue(TEXT("the dodge light at 0.50"), A.Tick(Frame(0.10f).Move()).Contains(C::StartDodgeLight));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHeldDodgeExhausted, "BossTest.Player.Actions.HeldDodgeExhaustedRefused", ActionsTestFlags)
+bool FActionsHeldDodgeExhausted::RunTest(const FString& Parameters)
+{
+	// A dodge that overdrew the bar: the held second dodge meets exhaustion at 0.40 and is refused, with the flash.
+	FPlayerActions A = MakeActions();
+	A.Stamina.Current = 10.f;
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.20f).Move());
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	const FPlayerCommands Out = A.Tick(Frame(0.20f).Move());
+	TestTrue(TEXT("refused and shown"), Out.Contains(C::RefuseInput) && !Out.Contains(C::StartDodge));
 	return true;
 }
 
@@ -173,15 +246,43 @@ bool FActionsBackstepWithoutDirection::RunTest(const FString& Parameters)
 	return true;
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsMoveWaitsForDodgeEnd, "BossTest.Player.Actions.MoveWaitsForDodgeEnd", ActionsTestFlags)
-bool FActionsMoveWaitsForDodgeEnd::RunTest(const FString& Parameters)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsSteerFromReDodge, "BossTest.Player.Actions.SteerFromReDodge", ActionsTestFlags)
+bool FActionsSteerFromReDodge::RunTest(const FString& Parameters)
 {
+	// The feel pass (2026-11-25): from 0.40 s the stick takes over (the push hands its speed to the run) while the state
+	// stays Dodging, so attacks still wait for 0.50. With no stick it settles to 0.72 as before.
 	FPlayerActions A = MakeActions();
 	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
-	TestTrue(TEXT("holding a direction doesn't cut the dodge at the lock"), A.Tick(Frame(0.50f).Move()).IsEmpty());
-	TestTrue(TEXT("still dodging"), A.GetState() == EPlayerState::Dodging);
-	TestTrue(TEXT("free at 0.72 s, with no push to remove"), A.Tick(Frame(0.22f).Move()).IsEmpty());
-	TestTrue(TEXT("free"), A.GetState() == EPlayerState::Free);
+	TestTrue(TEXT("nothing before 0.40"), A.Tick(Frame(0.39f).Move()).IsEmpty());
+	TestFalse(TEXT("no steering yet"), A.CanSteer());
+	TestTrue(TEXT("at 0.40 the push hands over"), Same(A.Tick(Frame(0.01f).Move()), { C::ReleaseDodge }));
+	TestTrue(TEXT("he steers, still dodging"), A.CanSteer() && A.GetState() == EPlayerState::Dodging);
+	TestTrue(TEXT("only once"), A.Tick(Frame(0.05f).Move()).IsEmpty());
+	A.Tick(Frame(0.27f).Move());
+	TestTrue(TEXT("free at 0.72"), A.GetState() == EPlayerState::Free);
+
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Dodge, Frame(0.f).Move());
+	TestTrue(TEXT("no stick: no hand-over"), B.Tick(Frame(0.45f)).IsEmpty());
+	TestFalse(TEXT("and no steering"), B.CanSteer());
+	TestTrue(TEXT("free at 0.72, nothing to remove"), B.Tick(Frame(0.27f)).IsEmpty() && B.GetState() == EPlayerState::Free);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsDodgeEndsOnInputFromLock, "BossTest.Player.Actions.DodgeEndsOnInputFromLock", ActionsTestFlags)
+bool FActionsDodgeEndsOnInputFromLock::RunTest(const FString& Parameters)
+{
+	// From 0.50 s the guard, a sprint or a heal ends the dodge at once; before it they wait.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	A.Tick(Frame(0.45f).Guard());
+	TestTrue(TEXT("guard held at 0.45: still dodging"), A.GetState() == EPlayerState::Dodging);
+	TestTrue(TEXT("at 0.50 the guard rises"), A.Tick(Frame(0.05f).Guard()).Contains(C::StartGuard) && A.GetState() == EPlayerState::Guard);
+
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Dodge, Frame(0.f).Move());
+	B.Tick(Frame(0.45f).Move());
+	TestTrue(TEXT("at 0.50 a held sprint takes over"), B.Tick(Frame(0.05f).Move().Sprint()).Contains(C::StartSprint) && B.GetState() == EPlayerState::Free);
 	return true;
 }
 
@@ -299,17 +400,41 @@ bool FActionsKnockdownInvulnerable::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsKnockdownHeldDodge, "BossTest.Player.Actions.KnockdownHeldDodge", ActionsTestFlags)
+bool FActionsKnockdownHeldDodge::RunTest(const FString& Parameters)
+{
+	// The get-up dodge (the player's kit pass, 2026-11-25): a dodge pressed from 0.80 s into the 1.4 s knockdown is held
+	// and comes out the moment it ends; earlier ones are dropped (the buffer used to lose a single press at 1.0 s).
+	FPlayerActions A = MakeActions();
+	A.OnHit(true);
+	A.Tick(Frame(0.85f));
+	A.Press(EPlayerInput::Dodge);
+	TestTrue(TEXT("held through the get-up"), A.Tick(Frame(0.5f).Move()).IsEmpty());
+	TestTrue(TEXT("out at 1.40"), A.Tick(Frame(0.05f).Move()).Contains(C::StartDodge));
+
+	FPlayerActions B = MakeActions();
+	B.OnHit(true);
+	B.Tick(Frame(0.70f));
+	B.Press(EPlayerInput::Dodge);
+	B.Tick(Frame(0.65f).Move());
+	TestFalse(TEXT("pressed at 0.70: dropped"), B.Tick(Frame(0.10f).Move()).Contains(C::StartDodge));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHealFlow, "BossTest.Player.Actions.HealFlow", ActionsTestFlags)
 bool FActionsHealFlow::RunTest(const FString& Parameters)
 {
 	FPlayerActions A = MakeActions();
+	// The committed heal (the user's call, 2026-11-25): the health lands at 1.30 s, then a tail to 1.70.
 	TestTrue(TEXT("the heal starts"), Same(PressNow(A, EPlayerInput::Heal), { C::StartHeal }));
-	TestTrue(TEXT("nothing at 1.99 s"), A.Tick(Frame(1.99f)).IsEmpty());
-	TestTrue(TEXT("lands at 2.0 s"), Same(A.Tick(Frame(0.01f)), { C::FinishHeal }));
+	TestTrue(TEXT("nothing at 1.29 s"), A.Tick(Frame(1.29f)).IsEmpty());
+	TestTrue(TEXT("lands at 1.30 s"), Same(A.Tick(Frame(0.01f)), { C::FinishHeal }));
 	TestEqual(TEXT("one charge left"), A.GetHealCharges(), 1);
-	TestTrue(TEXT("free again"), A.GetState() == EPlayerState::Free);
+	TestTrue(TEXT("still in its tail"), A.GetState() == EPlayerState::Healing);
+	A.Tick(Frame(0.40f));
+	TestTrue(TEXT("free at 1.70"), A.GetState() == EPlayerState::Free);
 	PressNow(A, EPlayerInput::Heal);
-	A.Tick(Frame(2.0f));
+	A.Tick(Frame(1.7f));
 	TestEqual(TEXT("none left"), A.GetHealCharges(), 0);
 	TestTrue(TEXT("refused with no charges"), PressNow(A, EPlayerInput::Heal).IsEmpty());
 	return true;
@@ -331,14 +456,46 @@ bool FActionsHealInterruptedKeepsCharge::RunTest(const FString& Parameters)
 	return true;
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsDodgeInterruptsHeal, "BossTest.Player.Actions.DodgeInterruptsHeal", ActionsTestFlags)
-bool FActionsDodgeInterruptsHeal::RunTest(const FString& Parameters)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHealIsCommitted, "BossTest.Player.Actions.HealIsCommitted", ActionsTestFlags)
+bool FActionsHealIsCommitted::RunTest(const FString& Parameters)
 {
+	// No dodging out before the health lands: a dodge pressed before 1.00 s is refused with the flash; from 1.00 s it's held
+	// and comes out at 1.30, after the health (FinishHeal first, then the dodge: one charge used).
 	FPlayerActions A = MakeActions();
 	PressNow(A, EPlayerInput::Heal);
-	A.Tick(Frame(1.0f));
-	TestTrue(TEXT("a dodge cancels the heal and comes out"), Same(PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()), { C::CancelHeal, C::StartDodge }));
-	TestEqual(TEXT("the charge is kept"), A.GetHealCharges(), 2);
+	A.Tick(Frame(0.90f));
+	const FPlayerCommands Early = PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move());
+	TestTrue(TEXT("refused at 0.90, shown"), A.Tick(Frame(0.f).Move()).Contains(C::RefuseInput) || Early.Contains(C::RefuseInput));
+	TestTrue(TEXT("still healing"), A.GetState() == EPlayerState::Healing);
+	A.Tick(Frame(0.20f).Move());
+	TestTrue(TEXT("pressed at 1.10: held"), PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()).IsEmpty());
+	A.Tick(Frame(0.19f).Move());
+	TestTrue(TEXT("at 1.30: the health, then the dodge"), Same(A.Tick(Frame(0.01f).Move()), { C::FinishHeal, C::StartDodge }));
+	TestEqual(TEXT("one charge used"), A.GetHealCharges(), 1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsHealTail, "BossTest.Player.Actions.HealTail", ActionsTestFlags)
+bool FActionsHealTail::RunTest(const FString& Parameters)
+{
+	// After the health lands: a dodge or the guard ends the tail at once; attacks wait for 1.70; a hit in the tail is an
+	// ordinary hit (the health stays, no "heal interrupted", no retry delay).
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Heal);
+	A.Tick(Frame(1.40f));
+	TestTrue(TEXT("a dodge in the tail comes out"), PressNow(A, EPlayerInput::Dodge, Frame(0.f).Move()).Contains(C::StartDodge));
+
+	FPlayerActions B = MakeActions();
+	PressNow(B, EPlayerInput::Heal);
+	B.Tick(Frame(1.60f));
+	TestTrue(TEXT("a light at 1.60 waits"), PressNow(B, EPlayerInput::Light).IsEmpty());
+	TestTrue(TEXT("and comes out at 1.70 (buffered)"), B.Tick(Frame(0.10f)).Contains(C::StartLight));
+
+	FPlayerActions H = MakeActions();
+	PressNow(H, EPlayerInput::Heal);
+	H.Tick(Frame(1.50f));
+	TestTrue(TEXT("a hit in the tail is a plain hit reaction"), Same(H.OnHit(false), { C::PlayHitReact }));
+	TestEqual(TEXT("the charge was used"), H.GetHealCharges(), 1);
 	return true;
 }
 

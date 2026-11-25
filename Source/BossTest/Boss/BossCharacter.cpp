@@ -15,6 +15,8 @@
 #include "Combat/Tracking.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/PointLightComponent.h"
+#include "Particles/ParticleSystem.h"
+#include "Particles/ParticleSystemComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -228,9 +230,38 @@ void ABossCharacter::Tick(float DeltaSeconds)
 	// The director watches every tick; a band change re-decides a movement (not an attack or the pause).
 	const EBossState Now = States.GetState();
 	const bool bMoving = Now == EBossState::Approach || Now == EBossState::Circle || Now == EBossState::Reposition || Now == EBossState::Turn;
+	if (const APlayerCharacter* Seen = Cast<APlayerCharacter>(Player()))
+	{
+		const double NowS = GetWorld()->GetTimeSeconds();
+		const EPlayerState PS = Seen->GetActions().GetState();
+		const bool bAttacking = PS == EPlayerState::Attacking;
+		const bool bHealing = PS == EPlayerState::Healing;
+		if (bAttacking)
+		{
+			LastPlayerAttackTime = NowS; // the stalk
+		}
+		if (bAttacking && !bPlayerWasAttacking)
+		{
+			LastPlayerAttackStart = NowS; // the aura's exits
+		}
+		if (bHealing && !bPlayerWasHealing)
+		{
+			LastPlayerHealStart = NowS;
+		}
+		bPlayerWasAttacking = bAttacking;
+		bPlayerWasHealing = bHealing;
+		if (!bPlayerHitBound)
+		{
+			if (UCombatantComponent* PC = Seen->FindComponentByClass<UCombatantComponent>())
+			{
+				PC->OnHitResolved.AddUObject(this, &ABossCharacter::OnPlayerHit); // his hits on you earn the aura
+				bPlayerHitBound = true;
+			}
+		}
+	}
 	if (Player() && Actions.Num() > 0 && Now != EBossState::Intro && Now != EBossState::Paused && Now != EBossState::Dead)
 	{
-		const bool bBandChanged = Director.Observe(Perception(), bMoving || Now == EBossState::Neutral, ClampAttackStep(DeltaSeconds));
+		const bool bBandChanged = Director.Observe(Perception(), bMoving || Now == EBossState::Neutral || Now == EBossState::Posture, ClampAttackStep(DeltaSeconds));
 		if (bBandChanged && bMoving && Director.ShouldRedecide(CurrentMove, States.GetStateTime()))
 		{
 			// A circle re-picked after a band change keeps its way round and only its remaining time.
@@ -280,8 +311,25 @@ void ABossCharacter::Tick(float DeltaSeconds)
 	case EBossState::Stagger:
 		TickStagger(DeltaSeconds);
 		break;
+	case EBossState::Posture:
+		TickPosture(DeltaSeconds);
+		break;
 	default:
 		break;
+	}
+
+	// The curse's sign: your stolen soul swirls around him while you're missing fragments.
+	const UCombatantComponent* PlayerCombat = Player() ? Player()->FindComponentByClass<UCombatantComponent>() : nullptr;
+	const bool bHoldsSoul = PlayerCombat && PlayerCombat->State.Health.Fragments > 0 && !Combatant->IsDead();
+	if (bHoldsSoul && StolenSoulEffect && !StolenSoulFX)
+	{
+		StolenSoulFX = UGameplayStatics::SpawnEmitterAttached(StolenSoulEffect, GetMesh(), NAME_None, FVector::ZeroVector, FRotator::ZeroRotator,
+			EAttachLocation::KeepRelativeOffset, false);
+	}
+	else if (!bHoldsSoul && StolenSoulFX)
+	{
+		StolenSoulFX->Deactivate(); // what's spawned fades on its own
+		StolenSoulFX = nullptr;
 	}
 
 	// The in-range cue: on while a light or heavy pressed now would finish him, faded so it never pops.
@@ -337,6 +385,150 @@ void ABossCharacter::TickStagger(float DeltaSeconds)
 		PlayClipEased(StunEndClip, StunEndRate, 0.2f, 0.25f);
 		StunPhase = 2;
 	}
+}
+
+void ABossCharacter::OnPlayerHit(const FHitOutcome& Outcome, AActor* Attacker)
+{
+	if (Attacker != this || Outcome.Result != EHitResult::Hit)
+	{
+		return;
+	}
+	const double NowS = GetWorld()->GetTimeSeconds();
+	HitsOnPlayerTimes.RemoveAll([this, NowS](double T) { return NowS - T > PostureHitWindow; });
+	HitsOnPlayerTimes.Add(NowS);
+	if (Outcome.bKnockdown)
+	{
+		LastKnockdownOnPlayer = NowS;
+	}
+}
+
+bool ABossCharacter::TryPosture()
+{
+	if (!PostureClip || !Player())
+	{
+		return false;
+	}
+	const double NowS = GetWorld()->GetTimeSeconds();
+	HitsOnPlayerTimes.RemoveAll([this, NowS](double T) { return NowS - T > PostureHitWindow; });
+	FPostureInputs In;
+	In.RecentHitsOnPlayer = HitsOnPlayerTimes.Num();
+	In.bRecentKnockdown = NowS - LastKnockdownOnPlayer <= PostureHitWindow;
+	In.SinceLastPosture = static_cast<float>(NowS - LastPostureTime);
+	In.Band = Director.GetBand();
+	In.Angle = Director.GetAngleBand();
+	In.bPursuit = Director.PursuitActive();
+	In.SincePlayerAttack = static_cast<float>(NowS - LastPlayerAttackTime);
+	In.Roll = Rng.FRand();
+	FPostureRules Rules;
+	Rules.HitsNeeded = PostureRules.HitsNeeded;
+	Rules.Cooldown = PostureRules.Cooldown;
+	Rules.QuietFor = PostureRules.QuietFor;
+	Rules.Chance = PostureRules.Chance;
+	if (!ShouldPosture(In, Rules))
+	{
+		return false;
+	}
+	PostureLength = Rng.FRandRange(PostureMin, PostureMax);
+	PostureSign = Rng.FRand() < 0.5f ? -1 : 1;
+	return States.Complete(EBossState::Posture, FString::Printf(TEXT("aura: %d hits in %.0f s%s"), In.RecentHitsOnPlayer, PostureHitWindow,
+		In.bRecentKnockdown ? TEXT(", a knockdown") : TEXT("")), PostureLength + 1.3f);
+}
+
+void ABossCharacter::ForcePosture()
+{
+	PostureLength = Rng.FRandRange(PostureMin, PostureMax);
+	PostureSign = Rng.FRand() < 0.5f ? -1 : 1;
+	States.Request(EBossState::Posture, EBossPriority::Scripted, TEXT("forced aura"), PostureLength + 1.3f);
+}
+
+void ABossCharacter::TickPosture(float DeltaSeconds)
+{
+	const ACharacter* P = Player();
+	const double NowS = GetWorld()->GetTimeSeconds();
+	const EBossAngleBand Angle = Director.GetAngleBand();
+	const bool bNearEnough = Director.GetBand() == EBossBand::Close || Director.GetBand() == EBossBand::Medium;
+	const TCHAR* End = nullptr;
+	if (!P || PlayerDown())
+	{
+		End = TEXT("no player");
+	}
+	else if (Director.GetBand() == EBossBand::Close)
+	{
+		End = TEXT("you came close");
+	}
+	else if (LastPlayerAttackStart > PostureStartTime && bNearEnough && NowS - LastPlayerAttackStart >= 0.25)
+	{
+		End = TEXT("you attacked"); // QA: a charged heavy from just outside Close mustn't land for free; seen 0.25 s later
+	}
+	else if (LastPlayerHealStart > PostureStartTime && NowS - LastPlayerHealStart >= 0.25)
+	{
+		End = TEXT("you healed");
+	}
+	else if (Angle == EBossAngleBand::RearQuarter || Angle == EBossAngleBand::Behind)
+	{
+		End = TEXT("you got round him");
+	}
+	else if (Director.PursuitActive())
+	{
+		End = TEXT("you ran");
+	}
+	else if (States.GetStateTime() >= PostureLength)
+	{
+		End = TEXT("done");
+	}
+	if (!End)
+	{
+		// A slow circle round you, watching rather than tracking; at the arena's edge he turns back once, a second time ends it.
+		const FVector Centre = HomeTransform.GetLocation();
+		FVector Dir = CircleDirection(GetActorLocation(), P->GetActorLocation(), PostureSign);
+		if (LeavesArena(GetActorLocation(), Dir, PostureSpeed, 0.5f, Centre, ArenaRadius))
+		{
+			if (bPostureFlipped)
+			{
+				End = TEXT("the edge");
+			}
+			else
+			{
+				bPostureFlipped = true;
+				PostureSign = -PostureSign;
+				Dir = -Dir;
+			}
+		}
+		if (!End)
+		{
+			GetCharacterMovement()->MaxWalkSpeed = PostureSpeed;
+			AddMovementInput(Dir, 1.f); // no glide clip: the aura clip stays on the slot
+			const FVector To = (P->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+			if (!To.IsNearlyZero())
+			{
+				SetActorRotation(FRotator(0.f, TrackingYawStep(GetActorRotation().Yaw, To.Rotation().Yaw, PostureTurnRate, DeltaSeconds), 0.f));
+			}
+			return;
+		}
+	}
+	// The rouse: the commitment pause itself (he turns at his full rate in it), then a decision.
+	PauseLength = PostureRouse;
+	States.Complete(EBossState::Neutral, FString::Printf(TEXT("aura ended: %s"), End), PauseLength + 1.f);
+}
+
+void ABossCharacter::EndPostureEffects()
+{
+	for (UParticleSystemComponent* FX : PostureFX)
+	{
+		if (FX)
+		{
+			FX->Deactivate();
+		}
+	}
+	PostureFX.Reset();
+	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
+	if (Anim && ClipMontage && Anim->Montage_IsActive(ClipMontage))
+	{
+		FMontageBlendSettings Out(PostureRouse);
+		Out.Blend.BlendOption = EAlphaBlendOption::HermiteCubic;
+		Anim->Montage_StopWithBlendSettings(Out, ClipMontage); // back to his combat idle
+	}
+	ClipMontage = nullptr;
 }
 
 bool ABossCharacter::CanBeFinishedBy(const AActor* Who) const
@@ -421,7 +613,7 @@ void ABossCharacter::Evaluate()
 		switch (D.Move)
 		{
 		case EBossMove::Attack:
-			StartAction(D.Action, D.Why, EBossPriority::CommittedAttack, Director.RollCombo(D.Action, Rng));
+			StartAction(D.Action, D.Why, EBossPriority::CommittedAttack, -1, -1, true);
 			break;
 		case EBossMove::Turn:
 			States.Request(EBossState::Turn, EBossPriority::Decision, D.Why);
@@ -502,13 +694,14 @@ void ABossCharacter::TickApproach(float DeltaSeconds)
 		return;
 	}
 	// Toward where you'll be (section 11: 0.45 s ahead, at most 3 m), never past the arena's edge; no lead while you
-	// dodge (root motion), so a dodge can't drag him.
-	const bool bRootMotion = P->GetCharacterMovement()->HasRootMotionSources();
+	// dodge, so a dodge can't drag him (the player reports what may be led).
 	const FVector Centre = HomeTransform.GetLocation();
-	FVector Aim = ClampToArena(InterceptPoint(P->GetActorLocation(), bRootMotion ? FVector::ZeroVector : P->GetVelocity(), 0.45f, 300.f), Centre, ArenaRadius);
+	FVector Aim = ClampToArena(InterceptPoint(P->GetActorLocation(), UCombatantComponent::LeadVelocityOf(P), 0.45f, 300.f), Centre, ArenaRadius);
 	const FVector Dir = (Aim - GetActorLocation()).GetSafeNormal2D();
 	FaceTarget(DeltaSeconds);
-	SteerAndGlide(Dir, Director.PursuitActive() ? PursuitSpeed : GlideSpeed, DeltaSeconds);
+	// Chasing a runner at pursuit speed; at Medium, with you holding back, a slow stalk; otherwise his glide.
+	const bool bStalk = Director.GetBand() == EBossBand::Medium && GetWorld()->GetTimeSeconds() - LastPlayerAttackTime > 2.0;
+	SteerAndGlide(Dir, Director.PursuitActive() ? PursuitSpeed : bStalk ? StalkSpeed : GlideSpeed, DeltaSeconds);
 	CheckProgress(DeltaSeconds, EBossMove::Approach);
 }
 
@@ -591,13 +784,71 @@ void ABossCharacter::TickTurn(float DeltaSeconds)
 	}
 }
 
+void ABossCharacter::SampleSwing()
+{
+	const UAttackDefinition* Def = Attacks->GetCurrent();
+	const ACharacter* P = Player();
+	if (!Def || !P || Def->SocketStart.IsNone())
+	{
+		return; // only steps with a weapon sweep
+	}
+	if (Attacks->GetInstanceId() != Swing.Instance)
+	{
+		FlushSwing();
+		Swing = FSwingRecord();
+		Swing.Instance = Attacks->GetInstanceId();
+		Swing.Step = Def->GetName();
+		Swing.Action = Actions.IsValidIndex(CurrentAction) ? Actions[CurrentAction].Name.ToString() : FString(TEXT("?"));
+		Swing.EdgeAtWindup = EdgeDistanceToPlayer();
+		const FVector Away = (P->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+		Swing.RadialSpeed = FVector::DotProduct(P->GetVelocity(), Away);
+	}
+	const FAttackSample Sample = Attacks->GetSample();
+	if (Sample.Phase == EAttackPhase::Active)
+	{
+		if (Swing.EdgeAtActive < 0.f)
+		{
+			Swing.EdgeAtActive = EdgeDistanceToPlayer();
+		}
+		const UCapsuleComponent* Cap = P->GetCapsuleComponent();
+		const FVector Up(0.f, 0.f, FMath::Max(0.f, Cap->GetScaledCapsuleHalfHeight() - Cap->GetScaledCapsuleRadius()));
+		FVector OnHammer, OnYou;
+		FMath::SegmentDistToSegmentSafe(GetMesh()->GetSocketLocation(Def->SocketStart), GetMesh()->GetSocketLocation(Def->SocketEnd),
+			P->GetActorLocation() - Up, P->GetActorLocation() + Up, OnHammer, OnYou);
+		Swing.ClosestGap = FMath::Min(Swing.ClosestGap, FMath::Max(0.f, FVector::Dist(OnHammer, OnYou) - Cap->GetScaledCapsuleRadius() - Def->Radius));
+	}
+	if (const APlayerCharacter* PC = Cast<APlayerCharacter>(P))
+	{
+		Swing.bDodged |= PC->GetActions().GetState() == EPlayerState::Dodging;
+		Swing.bGuarded |= PC->GetActions().IsGuardActive();
+	}
+}
+
+void ABossCharacter::FlushSwing()
+{
+	if (Swing.Instance == 0)
+	{
+		return;
+	}
+	// A whiff with no dodge or guard and the hammer short of you is his miss; a gap that grew while you walked away is spacing.
+	UE_LOG(LogBossTest, Log, TEXT("Sevarog SWING %s / %s: %.0f cm at windup (you %+.0f cm/s), %.0f at active, hammer closest %.0f cm, %s%s%s"),
+		*Swing.Action, *Swing.Step, Swing.EdgeAtWindup, Swing.RadialSpeed, Swing.EdgeAtActive, Swing.ClosestGap < 1e8f ? Swing.ClosestGap : -1.f,
+		Swing.Outcome.IsEmpty() ? TEXT("WHIFF") : *Swing.Outcome, Swing.bDodged ? TEXT(", you dodged") : TEXT(""), Swing.bGuarded ? TEXT(", you guarded") : TEXT(""));
+	Swing = FSwingRecord();
+}
+
 void ABossCharacter::TickAttack()
 {
+	SampleSwing();
 	if (!Attacks->IsAttacking())
 	{
 		// The commitment pause (0.25 s), or the breather after every second action (the punish windows, Step 6).
 		PauseLength = Actions.Num() > 0 ? Director.PauseAfterAttack() : NeutralBeat;
 		CurrentMove = EBossMove::Wait;
+		if (Actions.Num() > 0 && PauseLength >= 0.5f && TryPosture())
+		{
+			return; // the breather became the aura circle
+		}
 		States.Complete(EBossState::Neutral, PauseLength < 0.5f ? TEXT("pause") : TEXT("breather"), PauseLength + 1.f);
 		return;
 	}
@@ -631,10 +882,14 @@ void ABossCharacter::FaceTarget(float DeltaSeconds)
 
 void ABossCharacter::PlayGlideClip(const FVector& Dir)
 {
-	// He hovers, so his jog clips are glide poses: pick the one matching his movement relative to his facing.
-	const float Forward = FVector::DotProduct(Dir, GetActorForwardVector());
-	const float Side = FVector::DotProduct(Dir, GetActorRightVector());
-	UAnimSequenceBase* Wanted = FMath::Abs(Forward) >= FMath::Abs(Side) ? (Forward >= 0.f ? GlideForward : GlideBack) : (Side >= 0.f ? GlideRight : GlideLeft);
+	// He hovers, so his jog clips are glide poses: pick the one matching his movement relative to his facing, with 10 degrees
+	// of hysteresis at the diagonals so he doesn't pop between strafe and forward near 45 (the AI engineer, 2026-11-25).
+	const float Angle = FMath::RadiansToDegrees(FMath::Atan2(FVector::DotProduct(Dir, GetActorRightVector()), FVector::DotProduct(Dir, GetActorForwardVector())));
+	auto InBand = [Angle](float Centre, float Half) { return FMath::Abs(FMath::FindDeltaAngleDegrees(Centre, Angle)) <= Half; };
+	const bool bKeep = (GlideClip == GlideForward && InBand(0.f, 55.f)) || (GlideClip == GlideRight && InBand(90.f, 55.f))
+		|| (GlideClip == GlideBack && InBand(180.f, 55.f)) || (GlideClip == GlideLeft && InBand(-90.f, 55.f));
+	UAnimSequenceBase* Wanted = bKeep ? GlideClip.Get() : InBand(0.f, 45.f) ? GlideForward.Get() : InBand(90.f, 45.f) ? GlideRight.Get()
+		: InBand(-90.f, 45.f) ? GlideLeft.Get() : GlideBack.Get();
 	const UAnimInstance* Anim = GetMesh()->GetAnimInstance();
 	const bool bPlaying = Anim && ClipMontage && Anim->Montage_IsActive(ClipMontage);
 	if (Wanted && (GlideClip != Wanted || !bPlaying))
@@ -665,6 +920,9 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 	// Leaving a state.
 	switch (From)
 	{
+	case EBossState::Posture:
+		EndPostureEffects(); // every exit (an ending, a stagger, death, a reset, a timeout) cleans up
+		break;
 	case EBossState::Intro:
 		Combatant->State.bImmune = false;
 		FightStartTime = GetWorld()->GetTimeSeconds();
@@ -672,6 +930,7 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 	case EBossState::Approach:
 		break; // the glide carries on into another movement; Neutral, Turn and attacks stop it
 	case EBossState::Attack:
+		FlushSwing();
 		if (Attacks->IsAttacking())
 		{
 			Attacks->StopAttack(0.15f); // interrupted: a stagger, death or a timeout (clears his armour and the queue)
@@ -779,6 +1038,25 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 			Combatant->RagdollAfter(ClipMontage ? ClipMontage->GetPlayLength() : DeathClip->GetPlayLength());
 		}
 		break;
+	case EBossState::Posture:
+	{
+		StopGlide();
+		PostureStartTime = GetWorld()->GetTimeSeconds();
+		LastPostureTime = PostureStartTime;
+		bPostureFlipped = false;
+		PlayClipEased(PostureClip, 1.f, 0.5f, 0.3f, 1000);
+		if (PostureSmoke)
+		{
+			PostureFX.Add(UGameplayStatics::SpawnEmitterAttached(PostureSmoke, GetMesh(), NAME_None, FVector::ZeroVector, FRotator::ZeroRotator,
+				EAttachLocation::KeepRelativeOffset, false));
+		}
+		if (PostureHammerEffect)
+		{
+			PostureFX.Add(UGameplayStatics::SpawnEmitterAttached(PostureHammerEffect, GetMesh(), TEXT("Weapon_01"), FVector::ZeroVector,
+				FRotator::ZeroRotator, EAttachLocation::SnapToTarget, false));
+		}
+		break;
+	}
 	case EBossState::Paused:
 	case EBossState::Neutral:
 	case EBossState::Turn:
@@ -808,6 +1086,12 @@ void ABossCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacker)
 			{
 				PauseLength = Director.PauseEndAfterHit(0.f, PauseLength, States.GetStateTime());
 				Director.NoteBeatBroken();
+			}
+			else if (S == EBossState::Posture)
+			{
+				Director.NoteBeatBroken();
+				PauseLength = PostureRouse;
+				States.Complete(EBossState::Neutral, TEXT("aura broken: hit"), PauseLength + 1.f);
 			}
 			else if (S == EBossState::Approach || S == EBossState::Circle || S == EBossState::Reposition || S == EBossState::Turn)
 			{
@@ -867,6 +1151,10 @@ void ABossCharacter::InitDirector()
 		C.Id = c;
 		C.Opener = IndexOf(Combo.Opener);
 		C.Weight = Combo.Weight;
+		C.Cooldown = Combo.Cooldown;
+		C.bNeedsFreshBeat = Combo.bNeedsFreshBeat;
+		C.bNeedsSeen = Combo.bNeedsSeen;
+		C.Majors = Combo.Majors;
 		bool bResolved = C.Opener != INDEX_NONE;
 		for (const FBossComboLink& Link : Combo.FollowUps)
 		{
@@ -936,6 +1224,11 @@ bool ABossCharacter::PunishTriggered() const
 
 void ABossCharacter::OnOwnSweep(const FHitOutcome& Outcome, AActor* Victim, uint32 InstanceId)
 {
+	if (InstanceId == Swing.Instance && Swing.Outcome.IsEmpty())
+	{
+		Swing.Outcome = Outcome.Result == EHitResult::Hit ? TEXT("hit") : Outcome.Result == EHitResult::Blocked ? TEXT("blocked")
+			: Outcome.Result == EHitResult::PerfectGuard ? TEXT("perfect guard") : Outcome.Result == EHitResult::Dodged ? TEXT("through your i-frames") : TEXT("other");
+	}
 	// The player's guard broke on the action's first step (the block that emptied the bar resolves inside this sweep,
 	// before the attack's end): he stops there instead of going on (Double Execution's hit 2 would land inside the break).
 	const APlayerCharacter* P = Cast<APlayerCharacter>(Victim);
@@ -952,7 +1245,7 @@ void ABossCharacter::OnOwnSweep(const FHitOutcome& Outcome, AActor* Victim, uint
 	}
 }
 
-bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriority Priority, int32 Combo, int32 ForcedVariant)
+bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriority Priority, int32 Combo, int32 ForcedVariant, bool bRollCombo)
 {
 	if (!Actions.IsValidIndex(Index) || Actions[Index].Variants.Num() == 0 || !FBossStateMachine::IsLegal(States.GetState(), EBossState::Attack))
 	{
@@ -961,7 +1254,7 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 	// Flatten the action and, for a combo, each follow-up: every action rolls its variant now (section 5: Double
 	// Execution's branch at commit), and its last step carries that variant's hold variation.
 	TArray<FPlannedStep> NewPlan;
-	auto AddAction = [this, &NewPlan](int32 ActionIndex, float ChainIntoRecovery, int32 Forced, UAttackDefinition* Own = nullptr)
+	auto AddAction = [this, &NewPlan](int32 ActionIndex, float ChainIntoRecovery, int32 Forced, UAttackDefinition* Own = nullptr) -> int32
 	{
 		const FBossAction& A = Actions[ActionIndex];
 		float Total = 0.f;
@@ -994,7 +1287,7 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 			Step.Action = ActionIndex;
 			Step.bFirstOfAction = true;
 			Step.ChainIntoRecovery = ChainIntoRecovery;
-			return;
+			return Pick;
 		}
 		for (int32 s = 0; s < V.Steps.Num(); ++s)
 		{
@@ -1005,8 +1298,14 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 			Step.ChainIntoRecovery = s == 0 ? ChainIntoRecovery : -1.f;
 			Step.ExtraHold = s == V.Steps.Num() - 1 ? Hold : 0.f;
 		}
+		return Pick;
 	};
-	AddAction(Index, -1.f, ForcedVariant);
+	const int32 Picked = AddAction(Index, -1.f, ForcedVariant);
+	if (bRollCombo)
+	{
+		// After the variant: a branch that ends the action alone (Double Execution's stop) takes no combo.
+		Combo = Actions[Index].Variants[Picked].bEndsAlone ? -1 : Director.RollCombo(Index, Rng);
+	}
 	if (Combos.IsValidIndex(Combo))
 	{
 		for (const FBossComboLink& Link : Combos[Combo].FollowUps)
@@ -1320,6 +1619,10 @@ void ABossCharacter::ResetBoss()
 	StunPhase = 0;
 	GlowAlpha = 0.f;
 	FinisherGlow->SetVisibility(false);
+	EndPostureEffects();
+	HitsOnPlayerTimes.Reset();
+	LastKnockdownOnPlayer = -100.0;
+	LastPostureTime = -1000.0;
 	PlayerHitTimes.Reset();
 	ClearCombat();
 	Rng.Initialize(Seed != 0 ? Seed : FMath::Rand()); // a retry starts its own rolls (the same ones with a fixed seed)

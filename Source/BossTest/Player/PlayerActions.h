@@ -51,8 +51,14 @@ struct FPlayerTuning
 	UPROPERTY(EditAnywhere, Category = "Dodge")
 	float DodgeIFrames = 0.22f;
 
-	UPROPERTY(EditAnywhere, Category = "Dodge", meta = (ToolTip = "Another dodge or an attack from here; moving waits for the end"))
+	UPROPERTY(EditAnywhere, Category = "Dodge", meta = (ToolTip = "A dodge attack from here; a held guard, sprint or heal also ends the dodge from here"))
 	float DodgeLock = 0.50f;
+
+	UPROPERTY(EditAnywhere, Category = "Dodge", meta = (ToolTip = "Another dodge, and steering, from here: the push hands its speed to the run (the feel pass, 2026-11-25)"))
+	float ReDodgeAt = 0.40f;
+
+	UPROPERTY(EditAnywhere, Category = "Dodge", meta = (ToolTip = "A dodge pressed this long into a dodge is held for Re Dodge At; earlier presses are dropped"))
+	float DodgeHoldFrom = 0.15f;
 
 	UPROPERTY(EditAnywhere, Category = "Dodge", meta = (ToolTip = "A light or heavy coming out in this window after a dodge started is a dodge attack: the quick combo or the leaping slam"))
 	float DodgeAttackFrom = 0.50f;
@@ -66,8 +72,17 @@ struct FPlayerTuning
 	UPROPERTY(EditAnywhere, Category = "Reactions", meta = (ToolTip = "Invulnerable throughout"))
 	float Knockdown = 1.4f;
 
-	UPROPERTY(EditAnywhere, Category = "Heal")
-	float HealCast = 2.0f;
+	UPROPERTY(EditAnywhere, Category = "Reactions", meta = (ToolTip = "A dodge pressed this long into a knockdown is held and comes out as it ends; earlier ones are dropped"))
+	float KnockdownDodgeHoldFrom = 0.80f;
+
+	UPROPERTY(EditAnywhere, Category = "Heal", meta = (ToolTip = "The whole heal: the health lands at Heal Land At, then a tail that a dodge or the guard ends; attacks wait for its end"))
+	float HealCast = 1.70f;
+
+	UPROPERTY(EditAnywhere, Category = "Heal", meta = (ToolTip = "The health lands here; no dodging out before it (the committed heal, 2026-11-25)"))
+	float HealLandAt = 1.30f;
+
+	UPROPERTY(EditAnywhere, Category = "Heal", meta = (ToolTip = "A dodge pressed from here is held until the health lands; earlier ones are refused"))
+	float HealDodgeHoldFrom = 1.00f;
 
 	UPROPERTY(EditAnywhere, Category = "Heal", meta = (ToolTip = "After an interrupted heal"))
 	float HealRetryDelay = 1.0f;
@@ -160,10 +175,12 @@ enum class EPlayerCommand : uint8
 	StartDodge,         // toward the held direction
 	StartBackstep,      // no direction held
 	EndDodge,           // remove the rest of the dodge's push (an action took over)
+	ReleaseDodge,       // the stick took over at Re Dodge At: drop the push, keeping his speed, and let him steer
 	StopAttack,
 	StartHeal,
 	CancelHeal,         // interrupted: the charge is kept
-	FinishHeal,         // the heal lands: add Tuning.HealAmount
+	FinishHeal,         // the heal lands: add Tuning.HealAmount (its clip plays on through the tail)
+	EndHeal,            // the heal's tail is over: blend its clip out
 	StartSprint,
 	StopSprint,
 	PlayHitReact,
@@ -238,7 +255,8 @@ public:
 	bool IsGuardActive() const;               // raised (Guard from GuardRaiseTime) or in block-stun
 	bool HasPerfectWindow() const;            // a fresh press raised the guard and its window hasn't passed
 	bool IsSprinting() const { return bSprinting; }
-	bool CanSteer() const { return State == EPlayerState::Free; }
+	bool CanSteer() const { return State == EPlayerState::Free || (State == EPlayerState::Dodging && bDodgeReleased); }
+	bool IsHealLanded() const { return State == EPlayerState::Healing && bHealLanded; }
 	bool IsRiposting() const { return State == EPlayerState::Attacking && bRiposte; }
 	// A light or heavy pressed now would become the finishing blow if his window is open (the in-range cue): free, guarding,
 	// dodging or attacking (held to the chain point), and not exhausted.
@@ -283,4 +301,7 @@ private:
 	EPlayerInput StunHeld = EPlayerInput::None; // a dodge or attack pressed during block- or deflect-stun, for its end
 	bool bBusy = false;           // an attack or dodge chain is running: no regeneration
 	bool bRiposte = false;        // the running attack is the finishing blow (invulnerable until free)
+	bool bDodgeReleased = false;  // this dodge handed over to the stick
+	bool bHealLanded = false;     // this heal's health is in: its tail is running
+	bool bHealDodgeHeld = false;  // a dodge pressed late in the heal, for when the health lands
 };

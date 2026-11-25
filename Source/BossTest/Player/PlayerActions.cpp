@@ -43,6 +43,37 @@ void FPlayerActions::Press(EPlayerInput Input)
 		}
 		return;
 	}
+	if (Input == EPlayerInput::Dodge && State == EPlayerState::Dodging)
+	{
+		// Held for the re-dodge point from DodgeHoldFrom (latest press wins); earlier it's dropped, silently: the
+		// stamina flash means "can't afford", which a full bar would teach wrong (game feel, 2026-11-25).
+		if (StateTime >= Tuning.DodgeHoldFrom - TimeSlack)
+		{
+			Held = EPlayerInput::Dodge;
+			HeldAge = 0.f;
+			bChainQueued = false;
+			Buffer.Clear();
+		}
+		return;
+	}
+	if (Input == EPlayerInput::Dodge && State == EPlayerState::Knockdown)
+	{
+		bDodgeHeld = StateTime >= Tuning.KnockdownDodgeHoldFrom - TimeSlack; // held for the get-up, or dropped
+		return;
+	}
+	if (Input == EPlayerInput::Dodge && State == EPlayerState::Healing && !bHealLanded)
+	{
+		// The committed heal: no dodging out before the health lands. Late presses wait for it; early ones are refused.
+		if (StateTime >= Tuning.HealDodgeHoldFrom - TimeSlack)
+		{
+			bHealDodgeHeld = true;
+		}
+		else
+		{
+			bRefused = true;
+		}
+		return;
+	}
 	if (State == EPlayerState::Dodging)
 	{
 		if (bAttackInput)
@@ -102,7 +133,7 @@ void FPlayerActions::Reset()
 
 float FPlayerActions::GetHealProgress() const
 {
-	return State == EPlayerState::Healing && Tuning.HealCast > 0.f ? FMath::Clamp(StateTime / Tuning.HealCast, 0.f, 1.f) : 0.f;
+	return State == EPlayerState::Healing && Tuning.HealLandAt > 0.f ? FMath::Clamp(StateTime / Tuning.HealLandAt, 0.f, 1.f) : 0.f; // full when the health lands
 }
 
 bool FPlayerActions::IsInvulnerable() const
@@ -134,6 +165,9 @@ void FPlayerActions::Enter(EPlayerState NewState)
 	State = NewState;
 	StateTime = 0.f;
 	bRiposte = false; // set again by TryStartRiposte, after it enters the attack
+	bDodgeReleased = false;
+	bHealLanded = false;
+	bHealDodgeHeld = false;
 	if (NewState == EPlayerState::Attacking)
 	{
 		// A new attack: presses until its first sample are early ones.
@@ -227,7 +261,7 @@ bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands
 		{
 			Out.Add(EPlayerCommand::EndDodge);
 		}
-		else if (State == EPlayerState::Healing)
+		else if (State == EPlayerState::Healing && !bHealLanded)
 		{
 			Out.Add(EPlayerCommand::CancelHeal);
 			HealRetryLeft = Tuning.HealRetryDelay;
@@ -508,6 +542,31 @@ FPlayerCommands FPlayerActions::Tick(const FPlayerFrame& Frame)
 				Held = EPlayerInput::None; // a fresh guard press takes back a held attack here too
 				bChainQueued = false;
 			}
+			if (Reached(StateTime, Tuning.ReDodgeAt))
+			{
+				if (Held == EPlayerInput::Dodge)
+				{
+					// The held second dodge, from the same front-loaded profile (one distance to learn).
+					Held = EPlayerInput::None;
+					if (Stamina.CanStartAction())
+					{
+						Buffer.Press(EPlayerInput::Dodge);
+						if (TryStartBuffered(Frame, Out))
+						{
+							break;
+						}
+					}
+					else
+					{
+						Out.Add(EPlayerCommand::RefuseInput); // a held press meeting exhaustion: shown
+					}
+				}
+				if (!bDodgeReleased && Frame.bMoveHeld)
+				{
+					bDodgeReleased = true; // the stick takes over; attacks still wait for the lock
+					Out.Add(EPlayerCommand::ReleaseDodge);
+				}
+			}
 			if (Reached(StateTime, Tuning.DodgeLock))
 			{
 				if (Held == EPlayerInput::Light || Held == EPlayerInput::Heavy)
@@ -533,6 +592,13 @@ FPlayerCommands FPlayerActions::Tick(const FPlayerFrame& Frame)
 					bChainQueued = false;
 					break;
 				}
+				// From the lock, a held guard or sprint or a pressed heal ends the dodge; the free pass starts it this tick.
+				if (Frame.bGuardHeld || (Frame.bSprintHeld && Frame.bMoveHeld) || Buffer.Peek() == EPlayerInput::Heal)
+				{
+					Out.Add(EPlayerCommand::EndDodge);
+					Enter(EPlayerState::Free);
+					break;
+				}
 			}
 			if (Reached(StateTime, Tuning.DodgeDuration))
 			{
@@ -541,14 +607,34 @@ FPlayerCommands FPlayerActions::Tick(const FPlayerFrame& Frame)
 			break;
 
 		case EPlayerState::Healing:
+			if (!bHealLanded && Reached(StateTime, Tuning.HealLandAt))
+			{
+				Out.Add(EPlayerCommand::FinishHeal);
+				--HealCharges;
+				bHealLanded = true;
+				if (bHealDodgeHeld)
+				{
+					bHealDodgeHeld = false;
+					Buffer.Press(EPlayerInput::Dodge); // the dodge pressed late in the cast, now the health is in
+				}
+			}
+			if (!bHealLanded)
+			{
+				break; // committed: nothing ends the cast but a hit (OnHit) or death
+			}
+			// The tail: a dodge or the guard ends it at once; attacks wait for its end.
 			if (Buffer.Peek() == EPlayerInput::Dodge && TryStartBuffered(Frame, Out))
 			{
 				break;
 			}
+			if (Frame.bGuardHeld && Stamina.CanStartAction())
+			{
+				Enter(EPlayerState::Free); // the free pass raises the guard this tick
+				break;
+			}
 			if (Reached(StateTime, Tuning.HealCast))
 			{
-				Out.Add(EPlayerCommand::FinishHeal);
-				--HealCharges;
+				Out.Add(EPlayerCommand::EndHeal);
 				Enter(EPlayerState::Free);
 			}
 			break;
@@ -578,6 +664,11 @@ FPlayerCommands FPlayerActions::Tick(const FPlayerFrame& Frame)
 		case EPlayerState::Knockdown:
 			if (Reached(StateTime, Tuning.Knockdown))
 			{
+				if (bDodgeHeld)
+				{
+					bDodgeHeld = false;
+					Buffer.Press(EPlayerInput::Dodge); // the get-up dodge, held since it was pressed late in the knockdown
+				}
 				Enter(EPlayerState::Free);
 			}
 			break;
@@ -617,9 +708,12 @@ FPlayerCommands FPlayerActions::OnHit(bool bKnockdown)
 		Out.Add(EPlayerCommand::EndDodge);
 		break;
 	case EPlayerState::Healing:
-		Out.Add(EPlayerCommand::CancelHeal);
-		HealRetryLeft = Tuning.HealRetryDelay;
-		break;
+		if (!bHealLanded)
+		{
+			Out.Add(EPlayerCommand::CancelHeal); // the charge is kept
+			HealRetryLeft = Tuning.HealRetryDelay;
+		}
+		break; // in the tail the health is already in: an ordinary hit
 	default:
 		break;
 	}

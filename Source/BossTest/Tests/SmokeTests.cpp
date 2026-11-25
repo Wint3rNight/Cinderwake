@@ -23,6 +23,7 @@
 #include "GameFramework/WorldSettings.h"
 #include "Misc/PackageName.h"
 #include "InputKeyEventArgs.h"
+#include "Misc/App.h"
 #include "Combat/AttackDefinition.h"
 #include "GameFramework/PlayerController.h"
 #include "Player/BossTestPlayerController.h"
@@ -1949,7 +1950,7 @@ bool FAfterimageRun::Update()
 		return false;
 	}
 	Test->TestTrue(TEXT("the press was an evade"), W.bDodged);
-	Test->TestEqual(TEXT("all four copies showed together at the peak"), W.Most, 4);
+	Test->TestEqual(TEXT("all five copies showed together at the peak"), W.Most, 5);
 	Test->TestEqual(TEXT("and none are left after it"), Player->GetVisibleAfterimages(), 0);
 	return true;
 }
@@ -1961,6 +1962,537 @@ bool FSmokeAfterimages::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FAfterimageRun(this, MakeShared<FAfterimageWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FEvadeWatch
+{
+	float Dt = 1.f / 60.f;
+	double Start = 0.0;
+	int32 Phase = 0;
+	float DodgeClock = 0.f;      // seconds since the first press, on the fixed step
+	float LastStateTime = -1.f;
+	float SecondAt = -1.f;       // the first dodge's clock when the second began
+	int32 CopiesBy022 = -1;
+	float MinSpeed = 1e9f;
+	bool bLeadWhileDodging = false;
+	bool bSecondPressed = false;
+};
+
+// The evade fix (game feel and QA, 2026-11-25), at a fixed frame rate: hold W, dodge, press dodge again at 0.25 s. The second
+// burst starts at 0.40 s (plus or minus a frame), all five afterimages appear inside the 0.22 s of i-frames, his speed never
+// drops under 2 m/s through 1.2 s (a dead stop is what the old lag looked like), and nothing leads him while he dodges.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FEvadeChain, FAutomationTestBase*, Test, TSharedRef<FEvadeWatch>, Watch);
+bool FEvadeChain::Update()
+{
+	FEvadeWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player, boss or controller"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	auto Finish = [&W, PC]()
+	{
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::W, IE_Released, 0.f));
+		FApp::SetUseFixedTimeStep(false);
+	};
+	if (Now - W.Start > 30.0)
+	{
+		Finish();
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const FPlayerActions& A = Player->GetActions();
+	if (W.Phase == 0)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 900.f, 90.f); // well away from him, side on
+		FApp::SetUseFixedTimeStep(true);
+		FApp::SetFixedDeltaTime(W.Dt);
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::W, IE_Pressed, 1.f));
+		W.Phase = 1;
+		return false;
+	}
+	if (W.Phase == 1)
+	{
+		if (Player->GetVelocity().Size2D() < 300.f)
+		{
+			return false; // running first
+		}
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::SpaceBar, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::SpaceBar, IE_Released, 0.f));
+		W.Phase = 2;
+		return false;
+	}
+	if (A.GetState() == EPlayerState::Dodging || W.DodgeClock > 0.f)
+	{
+		W.DodgeClock += W.Dt;
+	}
+	if (W.DodgeClock <= 0.f)
+	{
+		return false;
+	}
+	const float T = A.GetStateTime();
+	if (A.GetState() == EPlayerState::Dodging)
+	{
+		if (W.SecondAt < 0.f && W.LastStateTime >= 0.f && T + 0.001f < W.LastStateTime)
+		{
+			W.SecondAt = W.LastStateTime + W.Dt; // the state restarted: the second dodge began this frame
+		}
+		W.LastStateTime = T;
+		W.bLeadWhileDodging |= !Player->GetCombatant()->LeadVelocity.IsNearlyZero();
+	}
+	if (!W.bSecondPressed && W.DodgeClock >= 0.25f)
+	{
+		W.bSecondPressed = true;
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::SpaceBar, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::SpaceBar, IE_Released, 0.f));
+	}
+	if (W.CopiesBy022 < 0 && W.DodgeClock >= 0.22f)
+	{
+		W.CopiesBy022 = Player->GetVisibleAfterimages();
+	}
+	if (W.DodgeClock > 0.05f)
+	{
+		W.MinSpeed = FMath::Min(W.MinSpeed, static_cast<float>(Player->GetVelocity().Size2D()));
+	}
+	if (W.DodgeClock < 1.2f)
+	{
+		return false;
+	}
+	Finish();
+	const FString Rate = FString::Printf(TEXT("%.0f fps"), 1.f / W.Dt);
+	Test->TestTrue(FString::Printf(TEXT("%s: the second dodge began at %.3f s (0.40 plus or minus a frame)"), *Rate, W.SecondAt), FMath::Abs(W.SecondAt - 0.40f) <= W.Dt + 0.002f);
+	Test->TestTrue(FString::Printf(TEXT("%s: all five copies by 0.22 s (%d)"), *Rate, W.CopiesBy022), W.CopiesBy022 >= 5);
+	Test->TestTrue(FString::Printf(TEXT("%s: never under 2 m/s (%.0f cm/s)"), *Rate, W.MinSpeed), W.MinSpeed >= 200.f);
+	Test->TestFalse(FString::Printf(TEXT("%s: never led while dodging"), *Rate), W.bLeadWhileDodging);
+	return true;
+}
+
+static void AddEvadeChain(FAutomationTestBase* Test, float Dt)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	TSharedRef<FEvadeWatch> Watch = MakeShared<FEvadeWatch>();
+	Watch->Dt = Dt;
+	ADD_LATENT_AUTOMATION_COMMAND(FEvadeChain(Test, Watch));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeEvadeChain30, "BossTest.Smoke.EvadeChain30", SmokeTestFlags)
+bool FSmokeEvadeChain30::RunTest(const FString& Parameters)
+{
+	AddEvadeChain(this, 1.f / 30.f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeEvadeChain60, "BossTest.Smoke.EvadeChain60", SmokeTestFlags)
+bool FSmokeEvadeChain60::RunTest(const FString& Parameters)
+{
+	AddEvadeChain(this, 1.f / 60.f);
+	return true;
+}
+
+struct FStrafeWatch
+{
+	double Start = 0.0;
+	double Held = 0.0;
+	int32 Phase = 0;
+	float WorstFacing = 0.f;
+	float WorstSideways = 1.f;
+	bool bRightClip = false;
+};
+
+// Strafing (the gap study, 2026-11-25): locked on and holding D, Feng Mao keeps facing Sevarog, moves sideways at the strafe
+// speed and shows the right-hand jog clip.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FStrafeRun, FAutomationTestBase*, Test, TSharedRef<FStrafeWatch>, Watch);
+bool FStrafeRun::Update()
+{
+	FStrafeWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player, boss or controller"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 20.0)
+	{
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::D, IE_Released, 0.f));
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	if (W.Phase == 0)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 500.f, 0.f);
+		Player->SetActorRotation((Boss->GetActorLocation() - Player->GetActorLocation()).GetSafeNormal2D().Rotation());
+		PC->SetControlRotation(Player->GetActorRotation());
+		W.Phase = 1;
+		return false;
+	}
+	if (W.Phase == 1)
+	{
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::Tab, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::Tab, IE_Released, 0.f));
+		W.Phase = 2;
+		return false;
+	}
+	if (W.Phase == 2)
+	{
+		if (!Player->IsLockedOn())
+		{
+			return false;
+		}
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::D, IE_Pressed, 1.f));
+		W.Held = Now;
+		W.Phase = 3;
+		return false;
+	}
+	if (Now - W.Held > 0.6)
+	{
+		const FVector Forward = Player->GetActorForwardVector().GetSafeNormal2D();
+		const FVector ToBoss = (Boss->GetActorLocation() - Player->GetActorLocation()).GetSafeNormal2D();
+		W.WorstFacing = FMath::Max(W.WorstFacing, FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(FVector::DotProduct(Forward, ToBoss), -1.f, 1.f))));
+		const FVector V = Player->GetVelocity().GetSafeNormal2D();
+		W.WorstSideways = FMath::Min(W.WorstSideways, 1.f - FMath::Abs(FVector::DotProduct(V, Forward)));
+		W.bRightClip |= Player->GetStrafeClip() && Player->GetStrafeClip()->GetName() == TEXT("Jog_Right");
+	}
+	if (Now - W.Held < 1.6)
+	{
+		return false;
+	}
+	PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::D, IE_Released, 0.f));
+	Test->TestTrue(FString::Printf(TEXT("he kept facing Sevarog (worst %.0f deg off)"), W.WorstFacing), W.WorstFacing <= 25.f);
+	Test->TestTrue(FString::Printf(TEXT("and moved sideways (worst %.2f)"), W.WorstSideways), W.WorstSideways >= 0.8f);
+	Test->TestTrue(TEXT("on the right-hand jog clip"), W.bRightClip);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeStrafe, "BossTest.Smoke.Strafe", SmokeTestFlags)
+bool FSmokeStrafe::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FStrafeRun(this, MakeShared<FStrafeWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FWarpWatch
+{
+	double Start = 0.0;
+	double Mark = 0.0;
+	int32 Phase = 0;
+	int32 JogSamples = 0;
+	int32 GuardSamples = 0;
+	float JogWorstStep = 0.f;   // degrees between the way the shown clip steps (after the warp) and the way he moves
+	float GuardWorstStep = 0.f;
+	float WorstRoot = 0.f;      // degrees between the warp asked for and the root bone's turn in the evaluated pose
+	float JogMaxWarp = 0.f;
+	float GuardMaxWarp = 0.f;
+	float WarpAfterRelease = 999.f;
+	float RootAfterRelease = 999.f;
+	float RootRest = 0.f;       // the root bone's yaw in the pose with no warp (Paragon's blueprint keeps it turned 90)
+};
+
+namespace
+{
+	// The direction a locked-on clip steps in, relative to his facing (0 ahead, +90 right): the jog's and the guard walk's
+	// (Shield_Jog_...); unset for any other clip.
+	TOptional<float> StepCentre(const UAnimSequenceBase* Clip)
+	{
+		if (!Clip)
+		{
+			return {};
+		}
+		const FString Name = Clip->GetName();
+		if (Name.EndsWith(TEXT("Jog_Fwd"))) return 0.f;
+		if (Name.EndsWith(TEXT("Jog_Right"))) return 90.f;
+		if (Name.EndsWith(TEXT("Jog_Bwd"))) return 180.f;
+		if (Name.EndsWith(TEXT("Jog_Left"))) return -90.f;
+		return {};
+	}
+
+	// How far the warped clip's steps are from his real movement, and how far the pose's root is from the warp asked for.
+	float RootYaw(const APlayerCharacter* Player)
+	{
+		return Player->GetMesh()->GetSocketTransform(TEXT("root"), RTS_Component).Rotator().Yaw;
+	}
+
+	void SampleWarp(APlayerCharacter* Player, const UAnimSequenceBase* Clip, float MinSpeed, float RootRest, int32& Samples, float& WorstStep,
+		float& MaxWarp, float& WorstRoot)
+	{
+		const TOptional<float> Centre = StepCentre(Clip);
+		const FVector Local = Player->GetActorRotation().UnrotateVector(Player->GetVelocity());
+		if (!Centre || Local.Size2D() < MinSpeed)
+		{
+			return;
+		}
+		const float Moving = FMath::RadiansToDegrees(FMath::Atan2(Local.Y, Local.X));
+		WorstStep = FMath::Max(WorstStep, FMath::Abs(FMath::FindDeltaAngleDegrees(*Centre + Player->GetWarpAngle(), Moving)));
+		MaxWarp = FMath::Max(MaxWarp, FMath::Abs(Player->GetWarpAngle()));
+		WorstRoot = FMath::Max(WorstRoot, FMath::Abs(FMath::FindDeltaAngleDegrees(RootYaw(Player) - RootRest, Player->GetWarpAngle())));
+		++Samples;
+	}
+
+	void PressKeys(APlayerController* PC, std::initializer_list<FKey> Keys, bool bDown)
+	{
+		for (const FKey& Key : Keys)
+		{
+			PC->InputKey(FInputKeyEventArgs::CreateSimulated(Key, bDown ? IE_Pressed : IE_Released, bDown ? 1.f : 0.f));
+		}
+	}
+}
+
+// Orientation warping (after the 6d play, 2026-11-25): locked on and holding W+D, the forward jog's steps are turned to follow
+// his diagonal (the pose's root really turns, so the animation blueprint runs the warp), it lets go when he stops, and the
+// guard walk does the same.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FWarpRun, FAutomationTestBase*, Test, TSharedRef<FWarpWatch>, Watch);
+bool FWarpRun::Update()
+{
+	FWarpWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player, boss or controller"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 25.0)
+	{
+		PressKeys(PC, { EKeys::W, EKeys::D, EKeys::Q }, false);
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const EPlayerState State = Player->GetActions().GetState();
+	switch (W.Phase)
+	{
+	case 0:
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 500.f, 0.f);
+		Player->SetActorRotation((Boss->GetActorLocation() - Player->GetActorLocation()).GetSafeNormal2D().Rotation());
+		PC->SetControlRotation(Player->GetActorRotation());
+		PressKeys(PC, { EKeys::Tab }, true);
+		PressKeys(PC, { EKeys::Tab }, false);
+		W.Phase = 1;
+		return false;
+	case 1:
+		if (!Player->IsLockedOn())
+		{
+			return false;
+		}
+		W.RootRest = RootYaw(Player);
+		PressKeys(PC, { EKeys::W, EKeys::D }, true);
+		W.Mark = Now;
+		W.Phase = 2;
+		return false;
+	case 2:
+		if (Now - W.Mark > 0.8 && State == EPlayerState::Free)
+		{
+			SampleWarp(Player, Player->GetStrafeClip(), 150.f, W.RootRest, W.JogSamples, W.JogWorstStep, W.JogMaxWarp, W.WorstRoot);
+		}
+		if (Now - W.Mark < 1.6)
+		{
+			return false;
+		}
+		PressKeys(PC, { EKeys::W, EKeys::D }, false);
+		W.Mark = Now;
+		W.Phase = 3;
+		return false;
+	case 3:
+		if (Now - W.Mark < 0.6)
+		{
+			return false;
+		}
+		W.WarpAfterRelease = FMath::Abs(Player->GetWarpAngle());
+		W.RootAfterRelease = FMath::Abs(FMath::FindDeltaAngleDegrees(RootYaw(Player), W.RootRest));
+		PressKeys(PC, { EKeys::Q, EKeys::W, EKeys::D }, true);
+		W.Mark = Now;
+		W.Phase = 4;
+		return false;
+	default:
+		if (Now - W.Mark > 1.0 && State == EPlayerState::Guard)
+		{
+			SampleWarp(Player, Player->GetGuardClip(), 100.f, W.RootRest, W.GuardSamples, W.GuardWorstStep, W.GuardMaxWarp, W.WorstRoot);
+		}
+		if (Now - W.Mark < 1.8)
+		{
+			return false;
+		}
+		PressKeys(PC, { EKeys::Q, EKeys::W, EKeys::D }, false);
+		break;
+	}
+
+	Test->TestTrue(FString::Printf(TEXT("sampled the jog (%d samples)"), W.JogSamples), W.JogSamples >= 10);
+	Test->TestTrue(FString::Printf(TEXT("the diagonal warped the jog (up to %.0f deg)"), W.JogMaxWarp), W.JogMaxWarp >= 30.f);
+	Test->TestTrue(FString::Printf(TEXT("its steps followed his movement (worst %.1f deg off)"), W.JogWorstStep), W.JogWorstStep <= 8.f);
+	Test->TestTrue(FString::Printf(TEXT("the pose's root turned with it (worst %.1f deg off)"), W.WorstRoot), W.WorstRoot <= 3.f);
+	Test->TestTrue(FString::Printf(TEXT("stopping let the warp go (%.1f deg, root %.1f)"), W.WarpAfterRelease, W.RootAfterRelease),
+		W.WarpAfterRelease <= 1.f && W.RootAfterRelease <= 1.f);
+	Test->TestTrue(FString::Printf(TEXT("sampled the guard walk (%d samples)"), W.GuardSamples), W.GuardSamples >= 10);
+	// The guard walk's angle depends on where Sevarog goes (circling him close, the velocity trails the stick by up to 30 degrees),
+	// so this checks the warp is on and follows the real movement, with a little more room for its start.
+	Test->TestTrue(FString::Printf(TEXT("the guard walk warped (up to %.0f deg)"), W.GuardMaxWarp), W.GuardMaxWarp >= 10.f);
+	Test->TestTrue(FString::Printf(TEXT("and its steps followed him (worst %.1f deg off)"), W.GuardWorstStep), W.GuardWorstStep <= 12.f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeStrafeWarp, "BossTest.Smoke.StrafeWarp", SmokeTestFlags)
+bool FSmokeStrafeWarp::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FWarpRun(this, MakeShared<FWarpWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FPostureWatch
+{
+	double Start = 0.0;
+	int32 Phase = 0;
+	double Pressed = 0.0;
+	double EndedAt = 0.0;
+	bool bCleanAfterClose = false;
+	bool bCleanAfterAttack = false;
+};
+
+// The aura circle's exits (2026-11-25): walking into Close ends it at once; an attack started at Medium ends it 0.25 s later
+// (QA: a charged heavy from just outside Close mustn't land for free). Every exit leaves no effect or clip behind.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FPostureRun, FAutomationTestBase*, Test, TSharedRef<FPostureWatch>, Watch);
+bool FPostureRun::Update()
+{
+	FPostureWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player, boss or controller"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 30.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const EBossState S = Boss->GetStates().GetState();
+	switch (W.Phase)
+	{
+	case 0:
+		if (!SmokeBossReady(Boss) || S != EBossState::Paused)
+		{
+			return false;
+		}
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+		PlaceSmokePlayer(Player, Boss, 450.f, 0.f);
+		Boss->ForcePosture();
+		W.Phase = 1;
+		return false;
+	case 1:
+		if (S != EBossState::Posture || Boss->GetStates().GetStateTime() < 0.3f)
+		{
+			return false;
+		}
+		Test->TestTrue(TEXT("the aura shows its effects"), Boss->IsPostureFXActive());
+		PlaceSmokePlayer(Player, Boss, 150.f, 0.f); // into Close
+		W.Phase = 2;
+		return false;
+	case 2:
+		if (S == EBossState::Posture)
+		{
+			return false;
+		}
+		W.bCleanAfterClose = !Boss->IsPostureFXActive();
+		W.Phase = 3;
+		return false;
+	case 3:
+		if (S != EBossState::Paused)
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 400.f, 0.f);
+		Boss->ForcePosture();
+		W.Phase = 4;
+		return false;
+	case 4:
+		if (S != EBossState::Posture || Boss->GetStates().GetStateTime() < 0.3f)
+		{
+			return false;
+		}
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::LeftMouseButton, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::LeftMouseButton, IE_Released, 0.f));
+		W.Pressed = Now;
+		W.Phase = 5;
+		return false;
+	case 5:
+		if (S == EBossState::Posture)
+		{
+			return false;
+		}
+		W.EndedAt = Now;
+		W.bCleanAfterAttack = !Boss->IsPostureFXActive();
+		break;
+	default:
+		break;
+	}
+	Test->TestTrue(TEXT("walking into Close ended it, clean"), W.bCleanAfterClose);
+	Test->TestTrue(FString::Printf(TEXT("an attack at Medium ended it %.2f s after the press (0.25 s seen, plus frames)"), W.EndedAt - W.Pressed),
+		W.EndedAt - W.Pressed >= 0.2 && W.EndedAt - W.Pressed <= 0.6);
+	Test->TestTrue(TEXT("and left nothing behind"), W.bCleanAfterAttack);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokePosture, "BossTest.Smoke.PostureEnds", SmokeTestFlags)
+bool FSmokePosture::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FPostureRun(this, MakeShared<FPostureWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }

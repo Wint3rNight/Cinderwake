@@ -742,9 +742,19 @@ void UAttackComponent::Deliver()
 	}
 	else if (Def->Delivery == EAttackDelivery::Projectile)
 	{
-		// Aimed once, at where the target is now (spec section 5: Soul Mark aims at its windup's end, then commits).
+		// Aimed once, at its windup's end, then committed (spec section 5). With a lead it aims where a runner will be when it
+		// arrives (the gap study: aiming at where you stood missed every sideways runner), never ahead of a dodge.
 		const AActor* TargetActor = Target.Get();
-		const FVector Aim = TargetActor ? TargetActor->GetActorLocation() : From + GetOwner()->GetActorForwardVector() * 1000.f;
+		FVector Aim = TargetActor ? TargetActor->GetActorLocation() : From + GetOwner()->GetActorForwardVector() * 1000.f;
+		if (TargetActor && Def->DeliveryLeadMax > 0.f && Def->DeliverySpeed > 0.f)
+		{
+			const FVector Lead = UCombatantComponent::LeadVelocityOf(TargetActor);
+			const FVector Here = TargetActor->GetActorLocation();
+			for (int32 Pass = 0; Pass < 2; ++Pass) // the flight time depends on the aim: refine once
+			{
+				Aim = InterceptPoint(Here, Lead, FVector::Dist(From, Aim) / Def->DeliverySpeed, Def->DeliveryLeadMax);
+			}
+		}
 		Delivery->LaunchProjectile(*Def, From, (Aim - From).GetSafeNormal());
 	}
 }
@@ -794,10 +804,9 @@ void UAttackComponent::ApplyLunge(float Duration)
 		FVector Aim = TargetActor->GetActorLocation();
 		if (CurrentDefinition->LungeAim == ELungeAim::Intercept)
 		{
-			// A dodge or a lunge is root motion: never led (it would fling him 2 m with it). Running and sprinting are.
-			const ACharacter* TargetCharacter = Cast<ACharacter>(TargetActor);
-			const bool bRootMotion = TargetCharacter && TargetCharacter->GetCharacterMovement()->HasRootMotionSources();
-			Aim = InterceptPoint(Aim, bRootMotion ? FVector::ZeroVector : TargetActor->GetVelocity(), Duration, CurrentDefinition->InterceptLeadMax);
+			// Running and sprinting are led; a dodge (even its steered tail), a lunge or a reaction never (it would fling him 2 m
+			// with it): the target reports what may be led.
+			Aim = InterceptPoint(Aim, UCombatantComponent::LeadVelocityOf(TargetActor), Duration, CurrentDefinition->InterceptLeadMax);
 			const FVector ToAim = (Aim - Character->GetActorLocation()).GetSafeNormal2D();
 			if (!ToAim.IsNearlyZero())
 			{

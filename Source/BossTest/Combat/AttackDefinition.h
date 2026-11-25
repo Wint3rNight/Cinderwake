@@ -232,6 +232,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Movement", meta = (ToolTip = "Intercept: the most the aim leads the target, cm (a dodge's burst can't fling him past you)"))
 	float InterceptLeadMax = 200.f;
 
+	UPROPERTY(EditAnywhere, Category = "Delivery", meta = (ToolTip = "cm: a projectile aims ahead of a moving target by up to this much (its velocity times the flight time), never ahead of a dodge. 0 aims where it stands"))
+	float DeliveryLeadMax = 0.f;
+
 	// ---- Tracking: turning toward the target during the windup ----
 	UPROPERTY(EditAnywhere, Category = "Tracking", meta = (ToolTip = "Degrees per second the attacker turns toward the target. 0 = none"))
 	float TrackingRate = 0.f;

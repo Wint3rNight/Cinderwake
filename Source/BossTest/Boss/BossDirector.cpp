@@ -20,6 +20,7 @@ void FBossDirector::Init(TArray<FBossOption> InOptions, TArray<FBossComboOption>
 void FBossDirector::Reset()
 {
 	Cooldowns.Reset();
+	Seen.Reset();
 	History.Reset();
 	LastCombo = -1;
 	Majors = 0;
@@ -165,6 +166,25 @@ bool FBossDirector::ComboValid(const FBossComboOption& C) const
 	{
 		return false; // never the same combo twice in a row
 	}
+	if ((C.bNeedsFreshBeat && Majors > 0) || GetCooldownLeft(ComboKey(C.Id)) > 0.f)
+	{
+		return false;
+	}
+	if (C.bNeedsSeen)
+	{
+		// A long string only uses moves you've met: it tests knowing him, not surprise (the AI engineer, 2026-11-25).
+		if (!Seen.Contains(C.Opener))
+		{
+			return false;
+		}
+		for (const int32 F : C.FollowUps)
+		{
+			if (!Seen.Contains(F))
+			{
+				return false;
+			}
+		}
+	}
 	for (const int32 F : C.FollowUps)
 	{
 		if (GetCooldownLeft(F) > 0.f || !Find(F))
@@ -265,11 +285,18 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 	}
 	if (Pinned < 0 && AngleBand != EBossAngleBand::Behind)
 	{
-		const float Approach = ExcludeOnce == EBossMove::Approach ? 0.f : Tuning.ApproachWeights.Get(Band);
+		// Section 10 caps any stretch without an attack at 3 s: past 2.5 s of neutral a movement never beats an attack that
+		// scores (QA, 2026-11-25: the cap leaked, as he could keep picking approach in 0.4 s pieces).
+		const bool bAttackScored = Scored.ContainsByPredicate([](const FScored& S) { return S.Move == EBossMove::Attack; });
+		const bool bMustAttack = bAttackScored && NeutralTime >= Tuning.MustAttackAfter;
+		const float Approach = bMustAttack || ExcludeOnce == EBossMove::Approach ? 0.f : Tuning.ApproachWeights.Get(Band);
 		// No circling right after a hit ended his beat, while he's chasing, or after a circle got nowhere.
-		// Nor past 1.8 s of neutral: section 10 caps any stretch without an attack at 3 s.
-		const bool bNoCircle = bJustHit || PursuitActive() || ExcludeOnce == EBossMove::Circle || NeutralTime >= 1.8f;
+		// Nor past 1.8 s of neutral.
+		const bool bNoCircle = bMustAttack || bJustHit || PursuitActive() || ExcludeOnce == EBossMove::Circle || NeutralTime >= 1.8f;
 		const float Circle = bNoCircle ? 0.f : Tuning.CircleWeights.Get(Band);
+		// Backing off on purpose (close only); never right after a hit, which must get an answer.
+		const bool bNoReposition = bMustAttack || bJustHit || ExcludeOnce == EBossMove::Reposition;
+		const float Reposition = bNoReposition ? 0.f : Tuning.RepositionWeights.Get(Band);
 		if (Approach > 0.f)
 		{
 			Scored.Add({ EBossMove::Approach, -1, Approach });
@@ -278,6 +305,10 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 		{
 			Scored.Add({ EBossMove::Circle, -1, Circle });
 		}
+		if (Reposition > 0.f)
+		{
+			Scored.Add({ EBossMove::Reposition, -1, Reposition });
+		}
 	}
 
 	float Total = 0.f;
@@ -285,7 +316,7 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 	{
 		Total += S.Weight;
 		D.Why += S.Move == EBossMove::Attack ? FString::Printf(TEXT("%d:%.2f "), S.Action, S.Weight)
-			: FString::Printf(TEXT("%s:%.2f "), S.Move == EBossMove::Approach ? TEXT("approach") : TEXT("circle"), S.Weight);
+			: FString::Printf(TEXT("%s:%.2f "), S.Move == EBossMove::Approach ? TEXT("approach") : S.Move == EBossMove::Circle ? TEXT("circle") : TEXT("reposition"), S.Weight);
 	}
 
 	if (Total <= 0.f)
@@ -341,6 +372,10 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 		D.Duration = Rng.FRandRange(Tuning.CircleMin, Tuning.CircleMax);
 		D.CircleSign = Rng.FRand() < 0.5f ? -1 : 1;
 	}
+	else if (D.Move == EBossMove::Reposition)
+	{
+		D.Duration = Rng.FRandRange(Tuning.RepositionMin, Tuning.RepositionMax);
+	}
 	if (D.Move != EBossMove::Attack)
 	{
 		D.Duration = FMath::Min(D.Duration, FMath::Max(0.4f, 3.f - NeutralTime)); // the 3 s cap
@@ -365,12 +400,18 @@ void FBossDirector::NoteCommitted(int32 Opener, int32 Combo)
 		Push(ComboKey(Combo));
 	}
 	LastCombo = Combo >= 0 ? Combo : LastCombo;
-	++Majors;
+	const FBossComboOption* C = Combo >= 0 ? Combos.FindByPredicate([Combo](const FBossComboOption& X) { return X.Id == Combo; }) : nullptr;
+	Majors += C ? FMath::Max(1, C->Majors) : 1;
+	if (C && C->Cooldown > 0.f)
+	{
+		Cooldowns.Add(ComboKey(Combo), C->Cooldown);
+	}
 	NeutralTime = 0.f;
 }
 
 void FBossDirector::NoteStepStarted(int32 Action)
 {
+	Seen.Add(Action);
 	if (const FBossOption* O = Find(Action))
 	{
 		if (O->Cooldown > 0.f)
@@ -404,4 +445,13 @@ bool FBossDirector::ShouldRedecide(EBossMove Move, float TimeInMove) const
 {
 	// Reaching a closer band ends an approach at once; anything else waits, so a wiggle on an edge can't flip him.
 	return (Move == EBossMove::Approach && bLastChangeCloser) || TimeInMove >= Tuning.RedecideAfter;
+}
+
+bool ShouldPosture(const FPostureInputs& In, const FPostureRules& Rules)
+{
+	const bool bEarned = In.RecentHitsOnPlayer >= Rules.HitsNeeded || In.bRecentKnockdown; // he's been winning
+	const bool bSpace = (In.Band == EBossBand::Medium || In.Band == EBossBand::Far)
+		&& (In.Angle == EBossAngleBand::Front || In.Angle == EBossAngleBand::Side);
+	const bool bQuiet = In.SincePlayerAttack >= Rules.QuietFor && !In.bPursuit && !In.bBeatBroken;
+	return bEarned && bSpace && bQuiet && In.SinceLastPosture >= Rules.Cooldown && In.Roll < Rules.Chance;
 }
