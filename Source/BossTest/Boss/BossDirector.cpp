@@ -2,6 +2,13 @@
 
 #include "Misc/ScopeExit.h"
 
+FBossPerception FBossDirector::Touching(FBossPerception P)
+{
+	// Pressed against him the capsule gap reads a little below zero: that's close, never out of range.
+	P.EdgeCm = FMath::Max(0.f, P.EdgeCm);
+	return P;
+}
+
 void FBossDirector::Init(TArray<FBossOption> InOptions, TArray<FBossComboOption> InCombos, const FBossDirectorTuning& InTuning)
 {
 	Options = MoveTemp(InOptions);
@@ -42,8 +49,9 @@ EBossAngleBand FBossDirector::RawAngleBand(float Angle) const
 		: Angle <= Tuning.RearAngle ? EBossAngleBand::RearQuarter : EBossAngleBand::Behind;
 }
 
-bool FBossDirector::Observe(const FBossPerception& P, bool bNeutral, float Dt)
+bool FBossDirector::Observe(const FBossPerception& InP, bool bNeutral, float Dt)
 {
+	const FBossPerception P = Touching(InP);
 	// Bands change only past the edge plus the hysteresis, measured toward the current band, so standing on an edge
 	// can't flicker his decisions.
 	const EBossBand OldBand = Band;
@@ -120,8 +128,9 @@ float FBossDirector::AngleScale(const FBossOption& O) const
 	return O.Angle == EBossAngleRule::FrontSidesAndRear && AngleBand == EBossAngleBand::RearQuarter ? O.RearWeight : 1.f;
 }
 
-bool FBossDirector::IsValidNow(int32 Action, const FBossPerception& P, bool bAsFollowUp) const
+bool FBossDirector::IsValidNow(int32 Action, const FBossPerception& InP, bool bAsFollowUp) const
 {
+	const FBossPerception P = Touching(InP);
 	const FBossOption* O = Find(Action);
 	if (!O || P.EdgeCm < O->MinRange || P.EdgeCm > O->MaxRange)
 	{
@@ -179,17 +188,25 @@ int32 FBossDirector::RollCombo(int32 Opener, FRandomStream& Rng) const
 		return -1;
 	}
 	TArray<TPair<int32, float>, TInlineAllocator<8>> Choices;
-	Choices.Add({ -1, Tuning.StopWeight });
-	float Total = Tuning.StopWeight;
+	Choices.Add({ -1, 0.f });
+	float Base = 0.f;
+	float Total = 0.f;
 	for (const FBossComboOption& C : Combos)
 	{
 		if (C.Opener == Opener && ComboValid(C))
 		{
 			const float W = ComboWeight(C.Id);
 			Choices.Add({ C.Id, W });
+			Base += FMath::Max(0.f, C.Weight);
 			Total += W;
 		}
 	}
+	if (Choices.Num() == 1)
+	{
+		return -1; // nothing valid to chain
+	}
+	Choices[0].Value = Tuning.StopShare * Base;
+	Total += Choices[0].Value;
 	float Roll = Rng.FRand() * Total;
 	for (const TPair<int32, float>& Choice : Choices)
 	{
@@ -202,8 +219,9 @@ int32 FBossDirector::RollCombo(int32 Opener, FRandomStream& Rng) const
 	return Choices.Last().Key;
 }
 
-FBossDecision FBossDirector::Decide(const FBossPerception& P, FRandomStream& Rng)
+FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& Rng)
 {
+	const FBossPerception P = Touching(InP);
 	FBossDecision D;
 	ON_SCOPE_EXIT
 	{

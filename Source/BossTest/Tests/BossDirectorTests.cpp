@@ -28,7 +28,7 @@ namespace
 	{
 		TArray<FBossOption> O = {
 			Opt(Swing, 0.f, 430.f, EBossAngleRule::FrontAndSides, { 1.0f, 0.2f, 0.f, 0.f }),
-			Opt(Delayed, 0.f, 490.f, EBossAngleRule::FrontAndSides, { 0.7f, 0.1f, 0.f, 0.f }),
+			Opt(Delayed, 0.f, 490.f, EBossAngleRule::FrontAndSides, { 0.5f, 0.1f, 0.f, 0.f }),
 			Opt(Reverse, 0.f, 320.f, EBossAngleRule::FrontSidesAndRear, { 0.8f, 0.f, 0.f, 0.f }),
 			Opt(Crushing, 0.f, 400.f, EBossAngleRule::FrontAndSides, { 0.6f, 0.5f, 0.f, 0.f }),
 			Opt(Double, 0.f, 430.f, EBossAngleRule::FrontAndSides, { 1.0f, 0.2f, 0.f, 0.f }),
@@ -51,11 +51,11 @@ namespace
 		return C;
 	}
 
-	// Section 5's combos A-F.
+	// Section 5's combos A-F (E: swing, sweep, slam since the council's run, 2026-11-24).
 	TArray<FBossComboOption> CombosAF()
 	{
 		return { Combo(0, Swing, { Punish }), Combo(1, Swing, { Delayed }), Combo(2, Reverse, { Crushing }),
-			Combo(3, Crushing, { Delayed }), Combo(4, Swing, { Swing, Judgment }), Combo(5, SoulMark, { Advance }) };
+			Combo(3, Crushing, { Delayed }), Combo(4, Swing, { Reverse, Judgment }), Combo(5, SoulMark, { Advance }) };
 	}
 
 	FBossDirector Make(TArray<FBossComboOption> Combos = TArray<FBossComboOption>())
@@ -127,12 +127,12 @@ bool FDirectorAngleHysteresis::RunTest(const FString& Parameters)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorWeightTables, "BossTest.Boss.Director.WeightTables", DirectorTestFlags)
 bool FDirectorWeightTables::RunTest(const FString& Parameters)
 {
-	// Close, in front: section 10's close column (Swing 1.0, Double 1.0, Reverse 0.8, Delayed 0.7, Crushing 0.6,
+	// Close, in front: section 10's close column (Swing 1.0, Double 1.0, Reverse 0.8, Delayed 0.5, Crushing 0.6,
 	// Judgment 0.3, Circle 0.8; Punishment needs its trigger, Soul Mark its 2.5 m minimum).
 	FBossDirector D = Make();
 	D.Observe(See(150.f), true, 0.1f);
 	const TMap<int32, int32> R = Picks(D, See(150.f), 6000);
-	const float Total = 1.0f + 1.0f + 0.8f + 0.7f + 0.6f + 0.3f + 0.8f;
+	const float Total = 1.0f + 1.0f + 0.8f + 0.5f + 0.6f + 0.3f + 0.8f;
 	auto Share = [&R](int32 K) { return R.FindRef(K) / 6000.f; };
 	TestTrue(FString::Printf(TEXT("the swing about %.2f (%.2f)"), 1.f / Total, Share(Swing)), FMath::Abs(Share(Swing) - 1.f / Total) < 0.03f);
 	TestTrue(FString::Printf(TEXT("Judgment Slam about %.2f (%.2f)"), 0.3f / Total, Share(Judgment)), FMath::Abs(Share(Judgment) - 0.3f / Total) < 0.02f);
@@ -204,17 +204,43 @@ bool FDirectorRepetition::RunTest(const FString& Parameters)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorComboStop, "BossTest.Boss.Director.ComboStopWeight", DirectorTestFlags)
 bool FDirectorComboStop::RunTest(const FString& Parameters)
 {
-	// At commit: stopping after the opener (0.3) against each valid combo for it (1 each). The swing opens A, B and E.
+	// At commit: stopping weighs half the opener's valid combos' weights, so it stops alone a third of the time whether
+	// it opens three combos (the swing: A, B and E) or one (Reverse Sweep: C).
 	FBossDirector D = Make(CombosAF());
 	FRandomStream Rng(5);
 	TMap<int32, int32> R;
-	for (int32 i = 0; i < 6600; ++i)
+	int32 ReverseStops = 0;
+	for (int32 i = 0; i < 6000; ++i)
 	{
 		R.FindOrAdd(D.RollCombo(Swing, Rng))++;
+		ReverseStops += D.RollCombo(Reverse, Rng) == -1 ? 1 : 0;
 	}
-	const float Stop = R.FindRef(-1) / 6600.f;
-	TestTrue(FString::Printf(TEXT("stops about 0.3/3.3 of the time (%.3f)"), Stop), FMath::Abs(Stop - 0.3f / 3.3f) < 0.02f);
+	const float Stop = R.FindRef(-1) / 6000.f;
+	TestTrue(FString::Printf(TEXT("the swing stops about a third of the time (%.3f)"), Stop), FMath::Abs(Stop - 1.f / 3.f) < 0.02f);
+	TestTrue(FString::Printf(TEXT("Reverse Sweep too (%.3f)"), ReverseStops / 6000.f), FMath::Abs(ReverseStops / 6000.f - 1.f / 3.f) < 0.02f);
 	TestTrue(TEXT("A, B and E all come out, never C, D or F"), R.Contains(0) && R.Contains(1) && R.Contains(4) && !R.Contains(2) && !R.Contains(3) && !R.Contains(5));
+	TestEqual(TEXT("an opener with no combo always stops"), D.RollCombo(Punish, Rng), -1);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorComboStopBase, "BossTest.Boss.Director.ComboStopUsesBaseWeights", DirectorTestFlags)
+bool FDirectorComboStopBase::RunTest(const FString& Parameters)
+{
+	// The stop weighs the combos' base weights, not their repetition-scaled ones: after three swings every swing combo is
+	// at 0.4, so stopping (1.5) beats the three of them (1.2) and he stops alone more often. Scaling the stop down with
+	// them would cancel that (and Step 7's habit modifiers).
+	FBossDirector D = Make(CombosAF());
+	D.NoteCommitted(Swing, -1);
+	D.NoteCommitted(Swing, -1);
+	D.NoteCommitted(Swing, -1);
+	FRandomStream Rng(17);
+	int32 Stops = 0;
+	for (int32 i = 0; i < 6000; ++i)
+	{
+		Stops += D.RollCombo(Swing, Rng) == -1 ? 1 : 0;
+	}
+	const float Stop = Stops / 6000.f;
+	TestTrue(FString::Printf(TEXT("stops about 1.5/2.7 of the time (%.3f)"), Stop), FMath::Abs(Stop - 1.5f / 2.7f) < 0.02f);
 	return true;
 }
 
@@ -579,6 +605,19 @@ bool FDirectorNeutralCap::RunTest(const FString& Parameters)
 	}
 	TestFalse(TEXT("no new circle after 2 s of neutral"), bCircle);
 	TestTrue(TEXT("movements end by the 3 s cap"), bWithinCap);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorTouching, "BossTest.Boss.Director.TouchingStillAttacks", DirectorTestFlags)
+bool FDirectorTouching::RunTest(const FString& Parameters)
+{
+	// Pressed against him, the gap between capsules can read a little below zero. That's close, not out of range: the
+	// hug-back smoke test caught him repositioning forever because every attack's 0 cm minimum refused it.
+	FBossDirector D = Make();
+	D.Observe(See(-5.f, 20.f), true, 0.1f);
+	TestTrue(TEXT("touching: close"), D.GetBand() == EBossBand::Close);
+	TestTrue(TEXT("the swing fits"), D.IsValidNow(Swing, See(-5.f, 20.f), false));
+	TestTrue(TEXT("and he attacks"), Picks(D, See(-5.f, 20.f), 200).Contains(Swing));
 	return true;
 }
 

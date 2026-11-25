@@ -76,6 +76,9 @@ struct FBossComboLink
 
 	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "Seconds into the previous action's recovery that this one starts (section 5: 0.2 by default)"))
 	float ChainIntoRecovery = 0.2f;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "This combo's own version of the action, played instead of its variants (Combo E's quicker Reverse Sweep). Empty: the action's own roll"))
+	TObjectPtr<UAttackDefinition> Attack;
 };
 
 // A combo (spec section 5): an opener and its follow-ups, one purpose each.
@@ -132,6 +135,9 @@ struct FBossAction
 
 	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "A cast: poise damage during the first step's windup that breaks it (Soul Mark 70). 0 = not a cast"))
 	float CastBreakThreshold = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "If the player's guard breaks on the first step, he swaps to this (same clip and timing, its own recovery) and stops: Double Execution's second hit would land inside the break"))
+	TObjectPtr<UAttackDefinition> GuardBreakRecovery;
 };
 
 UCLASS()
@@ -175,8 +181,8 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "Seconds of breather after every second action (a hit cuts it to the pause)"))
 	float Breather = 1.0f;
 
-	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "At commit: the weight of stopping after the opener, against each combo it opens at 1"))
-	float ComboStopWeight = 0.3f;
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "At commit: stopping after the opener weighs this times the sum of its valid combos' weights (0.5: it stops alone a third of the time)"))
+	float ComboStopShare = 0.5f;
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Attacks", meta = (ToolTip = "The rolls' seed (variants, timing variation, picks). 0 = a new one every play"))
 	int32 Seed = 0;
@@ -190,13 +196,62 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Boss|Attacks", meta = (ToolTip = "A broken cast's recoil (spec section 9)"))
 	float CastBrokenTime = 0.8f;
 
+	// ---- The finishing blow (the council's run, 2026-11-24) ----
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "Seconds into his stagger the window opens (he's slumping by then)"))
+	float FinisherFrom = 0.35f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "... and closes (he starts to stand at the normal 1.8 s stagger's 1.25)"))
+	float FinisherUntil = 1.25f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "Degrees from his front the player must be in"))
+	float FinisherArc = 45.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "cm, the player's capsule to his"))
+	float FinisherReach = 150.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "With a finisher the stagger lasts this long in all, wherever it was triggered"))
+	float FinisherStaggerLength = 2.40f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "cm from his centre to the player's: the crash's blade crosses his slumped chest there (probe_finisher.py)"))
+	float FinisherStandOff = 164.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "He turns toward the player by up to this many degrees..."))
+	float StaggerTurnLimit = 60.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "... during this many seconds from the stagger's start"))
+	float StaggerTurnTime = 0.35f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "The in-range cue: a soft light on his slumped chest while a press would finish him"))
+	FLinearColor FinisherGlowColor = FLinearColor(1.f, 0.72f, 0.38f);
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Finisher", meta = (ToolTip = "Candelas"))
+	float FinisherGlowIntensity = 40.f;
+
 
 	// ---- Clips (played on MontageSlot) ----
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips")
 	TObjectPtr<UAnimSequenceBase> IntroClip;
 
-	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips", meta = (ToolTip = "Fitted to the stagger's length"))
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips", meta = (ToolTip = "Fitted to the stagger's length; only when the stun clips are missing"))
 	TObjectPtr<UAnimSequenceBase> StaggerClip;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips", meta = (ToolTip = "The stagger's slump: played to Stun Start To at Stun Start Rate"))
+	TObjectPtr<UAnimSequenceBase> StunStartClip;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips", meta = (ToolTip = "Looped while slumped"))
+	TObjectPtr<UAnimSequenceBase> StunLoopClip;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips", meta = (ToolTip = "The stand-up, timed to end with the stagger"))
+	TObjectPtr<UAnimSequenceBase> StunEndClip;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips", meta = (ToolTip = "Clip seconds: the slump's end (head 243 to 143 cm)"))
+	float StunStartTo = 1.0f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips")
+	float StunStartRate = 1.67f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips")
+	float StunEndRate = 1.33f;
 
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips")
 	TObjectPtr<UAnimSequenceBase> DeathClip;
@@ -258,7 +313,7 @@ public:
 	void ToggleAI();
 	void ForceSwing();          // the selected action (Executioner's Swing until another is picked)
 	void SelectNextAction();    // cycles which action ForceSwing forces
-	bool ForceAction(int32 Index);
+	bool ForceAction(int32 Index, int32 Variant = -1);
 	void PinAction(int32 Index);  // tests: that action whenever it fits, no combos (-1 = none)
 	const FBossDirector& GetDirector() const { return Director; }
 	bool ForceCombo(int32 ComboIndex);                  // tests and debugging: its opener, then its follow-ups
@@ -270,6 +325,16 @@ public:
 	const UDeliveryComponent* GetDelivery() const { return Delivery; }
 	void ForceStagger();
 	void ResetBoss();
+
+	// ---- The finishing blow ----
+	// His stagger's window is open (one per stagger, never in a flinch) and Who stands within the arc and reach.
+	bool CanBeFinishedBy(const AActor* Who) const;
+	// The player committed: the window closes, the stagger runs to FinisherStaggerLength. False if it can't.
+	bool BeginFinisher(const AActor* Who);
+	// Where the player stands for it: FinisherStandOff in front of him, facing him (the caller sweep-tests it).
+	FTransform FinisherSpot(const AActor* Who) const;
+	bool IsFinisherTaken() const { return bFinisherTaken; }
+	float GetFinisherGlow() const;
 
 protected:
 	UPROPERTY(VisibleAnywhere)
@@ -283,11 +348,16 @@ protected:
 
 private:
 	void ApplyScale();
+	void IgnoreCamera();
 	float SwingRange() const;
 	void StartIntro();
 	void Evaluate();
 	void StartSwing(const FString& Reason);
-	bool StartAction(int32 Index, const FString& Reason, EBossPriority Priority = EBossPriority::CommittedAttack, int32 Combo = -1);
+	bool StartAction(int32 Index, const FString& Reason, EBossPriority Priority = EBossPriority::CommittedAttack, int32 Combo = -1, int32 ForcedVariant = -1);
+	void OnOwnSweep(const FHitOutcome& Outcome, AActor* Victim, uint32 InstanceId);
+	void TickStagger(float DeltaSeconds);
+	bool HasStunClips() const { return StunStartClip && StunLoopClip && StunEndClip; }
+	UAnimMontage* PlayClipEased(UAnimSequenceBase* Clip, float Rate, float BlendIn, float BlendOut, int32 Loops = 1);
 	void InitDirector();
 	FBossPerception Perception() const;
 	bool PunishTriggered() const;
@@ -360,4 +430,11 @@ private:
 	FTransform HomeTransform;
 	float IntroLength = 0.f;
 	bool bRecoveringSent = false;
+
+	UPROPERTY()
+	TObjectPtr<class UPointLightComponent> FinisherGlow;
+	bool bFinisherTaken = false;  // this stagger's one finishing blow has started
+	int32 StunPhase = 0;          // 0 slumping, 1 slumped (the loop), 2 standing
+	float StaggerYaw = 0.f;       // his facing when the stagger began (the turn's limit is measured from it)
+	float GlowAlpha = 0.f;
 };

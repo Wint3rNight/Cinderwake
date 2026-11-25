@@ -43,7 +43,19 @@ void FPoiseModel::BeginStagger()
 	SinceDamage = 0.f;
 	bDeferred = false;
 	StaggerLeft = StaggerDuration;
+	StaggerLength = StaggerDuration;
 	ImmunityLeft = 0.f;
+}
+
+void FPoiseModel::SetStaggerLength(float Length)
+{
+	if (!IsStaggered())
+	{
+		return;
+	}
+	const float Elapsed = StaggerElapsed();
+	StaggerLength = FMath::Max(Length, Elapsed);
+	StaggerLeft = FMath::Max(StaggerLength - Elapsed, KINDA_SMALL_NUMBER);
 }
 
 void FPoiseModel::Tick(float Dt)
@@ -124,6 +136,7 @@ void FPoiseModel::ResetRuntime()
 	Bar = 0.f;
 	SinceDamage = 0.f;
 	StaggerLeft = 0.f;
+	StaggerLength = 0.f;
 	ImmunityLeft = 0.f;
 	bDeferred = false;
 }

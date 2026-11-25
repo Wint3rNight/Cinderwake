@@ -1328,4 +1328,63 @@ bool FActionsKnockdownPlan::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsRiposteFromFree, "BossTest.Player.Actions.RiposteFromFree", ActionsTestFlags)
+bool FActionsRiposteFromFree::RunTest(const FString& Parameters)
+{
+	// The finishing blow (the council's run, 2026-11-24): a light or heavy while his window is open, no stamina spent,
+	// invulnerable until free, then free as usual.
+	for (const EPlayerInput Input : { EPlayerInput::Light, EPlayerInput::Heavy })
+	{
+		FPlayerActions A = MakeActions();
+		FPlayerFrame Ready;
+		Ready.bRiposteReady = true;
+		TestTrue(TEXT("could riposte when free"), A.CouldRiposte());
+		TestTrue(TEXT("the press is the finishing blow"), Same(PressNow(A, Input, Ready), { C::StartRiposte }));
+		TestEqual(TEXT("no stamina spent"), A.Stamina.Current, A.Tuning.StaminaMax, ActionsTol);
+		TestTrue(TEXT("invulnerable while it runs"), A.IsRiposting() && A.IsInvulnerable());
+		TestFalse(TEXT("no second one from it"), A.CouldRiposte());
+		A.Tick(Frame(0.5f).Running());
+		TestTrue(TEXT("still invulnerable before free"), A.IsInvulnerable());
+		A.Tick(Frame(0.f));
+		TestTrue(TEXT("free, and vulnerable again"), A.GetState() == EPlayerState::Free && !A.IsInvulnerable() && !A.IsRiposting());
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsRiposteNeedsWindow, "BossTest.Player.Actions.RiposteNeedsWindowAndStamina", ActionsTestFlags)
+bool FActionsRiposteNeedsWindow::RunTest(const FString& Parameters)
+{
+	// Without the window a press is a normal attack; exhausted, no finishing blow either (it costs nothing, but QA's
+	// overdrawn finisher must not be possible: exhaustion blocks it like any attack).
+	FPlayerActions A = MakeActions();
+	TestTrue(TEXT("no window: a normal light"), Same(PressNow(A, EPlayerInput::Light), { C::StartLight }));
+	FPlayerActions B = MakeActions();
+	B.Stamina.Current = 10.f;
+	PressNow(B, EPlayerInput::Light);
+	B.Tick(Frame(0.01f));
+	B.Tick(Frame(0.f));
+	TestTrue(TEXT("exhausted"), B.Stamina.bExhausted && B.GetState() == EPlayerState::Free);
+	TestFalse(TEXT("so no cue"), B.CouldRiposte());
+	FPlayerFrame Ready;
+	Ready.bRiposteReady = true;
+	TestTrue(TEXT("and no finishing blow"), PressNow(B, EPlayerInput::Light, Ready).IsEmpty());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FActionsRiposteAtChain, "BossTest.Player.Actions.RiposteAtChainPoint", ActionsTestFlags)
+bool FActionsRiposteAtChain::RunTest(const FString& Parameters)
+{
+	// The hit that staggered him is still running: a light pressed during it is held to the chain point as usual, and
+	// comes out as the finishing blow if the window is open by then.
+	FPlayerActions A = MakeActions();
+	PressNow(A, EPlayerInput::Light);
+	A.Tick(Frame(0.1f).Running());
+	A.Press(EPlayerInput::Light);
+	TestTrue(TEXT("held until the chain point"), A.Tick(Frame(0.f).Running()).IsEmpty());
+	FPlayerFrame AtChain = Frame(0.1f).Running().Chain();
+	AtChain.bRiposteReady = true;
+	TestTrue(TEXT("the finishing blow at the chain point"), Same(A.Tick(AtChain), { C::StartRiposte }) && A.IsRiposting());
+	return true;
+}
+
 #endif

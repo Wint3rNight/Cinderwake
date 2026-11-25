@@ -70,7 +70,8 @@ bool FAttackDataChainPoints::RunTest(const FString& Parameters)
 	const UAttackDefinition* Reference = LoadAttack(TEXT("DA_Light1"));
 	const USkeleton* Skeleton = Reference && Reference->Clip ? Reference->Clip->GetSkeleton() : nullptr;
 	for (const TCHAR* Name : { TEXT("DA_Light1"), TEXT("DA_Light2"), TEXT("DA_Light3"), TEXT("DA_Light4"), TEXT("DA_Heavy"), TEXT("DA_Heavy2"),
-		TEXT("DA_ChargedHeavy"), TEXT("DA_DodgeLight1"), TEXT("DA_DodgeLight2"), TEXT("DA_DodgeHeavy"), TEXT("DA_SprintAttack"), TEXT("DA_Light1Rise") })
+		TEXT("DA_ChargedHeavy"), TEXT("DA_DodgeLight1"), TEXT("DA_DodgeLight2"), TEXT("DA_DodgeHeavy"), TEXT("DA_SprintAttack"), TEXT("DA_Light1Rise"),
+		TEXT("DA_Riposte") })
 	{
 		const UAttackDefinition* A = LoadAttack(Name);
 		if (!TestNotNull(FString::Printf(TEXT("%s exists"), Name), A) || !TestNotNull(FString::Printf(TEXT("%s has its clip"), Name), A->Clip.Get()))
@@ -82,6 +83,22 @@ bool FAttackDataChainPoints::RunTest(const FString& Parameters)
 	}
 	const UAttackDefinition* Heavy2 = LoadAttack(TEXT("DA_Heavy2"));
 	TestTrue(TEXT("DA_Heavy2 has no branch (it never charges)"), Heavy2 && Heavy2->BranchAt < 0.f && !Heavy2->BranchVariant);
+	// The finishing blow (the council's run, 2026-11-24): the charged heavy's crash from its crouch, strike 0.40 s, free
+	// 1.40; 250 damage, no poise, no stamina, a 0.20 s hit-stop; a guaranteed hit on him with no lunge, no chain point.
+	const UAttackDefinition* Riposte = LoadAttack(TEXT("DA_Riposte"));
+	const UAttackDefinition* ChargedClip = LoadAttack(TEXT("DA_ChargedHeavy"));
+	if (TestNotNull(TEXT("DA_Riposte exists"), Riposte) && ChargedClip)
+	{
+		const UAttackDefinition* Charged = ChargedClip;
+		const FAttackTiming R = Riposte->GetTiming();
+		TestEqual(TEXT("the finishing blow strikes 0.40 s after the press"), R.Windup, 0.40f, 0.005f);
+		TestEqual(TEXT("and frees you at 1.40"), R.Total(), 1.40f, 0.005f);
+		TestTrue(TEXT("the charged heavy's clip, from its crouch, through its crash"), Riposte->Clip == Charged->Clip && Riposte->ClipStartAt == 0.f
+			&& Riposte->ClipActiveStart >= Charged->ClipActiveStart && Riposte->ClipActiveEnd <= Charged->ClipActiveEnd + 0.001f);
+		TestTrue(TEXT("250 damage, no poise, no stamina, 0.20 s hit-stop"), Riposte->Damage == 250.f && Riposte->PoiseDamage == 0.f
+			&& Riposte->StaminaCost == 0.f && FMath::IsNearlyEqual(Riposte->HitStop, 0.20f));
+		TestTrue(TEXT("a guaranteed hit, no lunge, no chain point"), Riposte->bStrikesTarget && Riposte->LungeCap == 0.f && R.ChainFrom < 0.f);
+	}
 
 	// The charged heavy restarts its own timeline at the heavy's branch, so check it from the press.
 	const UAttackDefinition* Charged = LoadAttack(TEXT("DA_ChargedHeavy"));
@@ -130,6 +147,7 @@ bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
 		{ TEXT("DA_CrushingOverhead"), 55.f, true }, { TEXT("DA_DoubleExecution1"), 35.f, false }, { TEXT("DA_DoubleExecutionStop"), 35.f, false },
 		{ TEXT("DA_DoubleExecution2Fast"), 40.f, false }, { TEXT("DA_DoubleExecution2Delayed"), 40.f, false }, { TEXT("DA_PunishmentSweep"), 40.f, false },
 		{ TEXT("DA_JudgmentSlam"), 60.f, true }, { TEXT("DA_SoulMark"), 0.f, false }, { TEXT("DA_AdvanceDash"), 0.f, false }, { TEXT("DA_AdvanceSwing"), 40.f, false },
+		{ TEXT("DA_DoubleExecutionBreak"), 35.f, false }, { TEXT("DA_ReverseSweepE"), 35.f, false },
 	};
 	for (const FExpect& E : All)
 	{
@@ -194,6 +212,21 @@ bool FAttackDataBossAttacks::RunTest(const FString& Parameters)
 		TestTrue(FString::Printf(TEXT("delayed band, earliest: %.2f s apart"), Gap(Late, 0.f)), Gap(Late, 0.f) >= 0.70f);
 		TestTrue(TEXT("delayed band: 0.95-1.15 s windup"), FMath::IsNearlyEqual(Late->GetTiming().Windup, 0.95f, 0.001f));
 	}
+	// Double Execution plays the mirror image of his own clips (the council's run, 2026-11-24): a silhouette no other
+	// attack of his shares. Every clip of all five steps is a mirrored one, and the guard-break recovery keeps hit 1's
+	// clip and timing so he can swap to it mid-swing.
+	const UAttackDefinition* Stop = Load(TEXT("DA_DoubleExecutionStop"));
+	const UAttackDefinition* Break = Load(TEXT("DA_DoubleExecutionBreak"));
+	if (Hit1 && Fast && Late && Stop && Break)
+	{
+		auto Mirrored = [](const UAnimSequenceBase* C) { return C == nullptr || C->GetPathName().StartsWith(TEXT("/Game/Retargeted/Sevarog/")); };
+		for (const UAttackDefinition* A : { Hit1, Stop, Break, Fast, Late })
+		{
+			TestTrue(FString::Printf(TEXT("%s: mirrored clips only"), *A->GetName()), A->Clip && Mirrored(A->Clip) && Mirrored(A->LeadInClip) && Mirrored(A->TailClip));
+		}
+		TestTrue(TEXT("the guard-break recovery: hit 1's clip, windup and active"), Break->Clip == Hit1->Clip
+			&& FMath::IsNearlyEqual(Break->GetTiming().Windup, Hit1->GetTiming().Windup) && FMath::IsNearlyEqual(Break->GetTiming().Active, Hit1->GetTiming().Active));
+	}
 	return true;
 }
 
@@ -246,7 +279,7 @@ bool FAttackDataBossCombos::RunTest(const FString& Parameters)
 		{ TEXT("B"), TEXT("ExecutionersSwing"), { TEXT("DelayedExecution") } },
 		{ TEXT("C"), TEXT("ReverseSweep"), { TEXT("CrushingOverhead") } },
 		{ TEXT("D"), TEXT("CrushingOverhead"), { TEXT("DelayedExecution") } },
-		{ TEXT("E"), TEXT("ExecutionersSwing"), { TEXT("ExecutionersSwing"), TEXT("JudgmentSlam") } },
+		{ TEXT("E"), TEXT("ExecutionersSwing"), { TEXT("ReverseSweep"), TEXT("JudgmentSlam") } },
 		{ TEXT("F"), TEXT("SoulMark"), { TEXT("ExecutionersAdvance") } },
 	};
 	TestEqual(TEXT("six combos"), Boss->Combos.Num(), 6);
@@ -259,6 +292,7 @@ bool FAttackDataBossCombos::RunTest(const FString& Parameters)
 			continue;
 		}
 		const FBossAction* Prev = FindAction(Boss, C->Opener);
+		const UAttackDefinition* PrevOwn = nullptr;
 		for (int32 i = 0; i < C->FollowUps.Num(); ++i)
 		{
 			const FBossComboLink& Link = C->FollowUps[i];
@@ -268,17 +302,33 @@ bool FAttackDataBossCombos::RunTest(const FString& Parameters)
 			{
 				break;
 			}
-			const FAttackTiming Opener = LastStepTiming(*Prev);
+			const FAttackTiming Opener = PrevOwn ? PrevOwn->GetTiming() : LastStepTiming(*Prev);
 			TestTrue(FString::Printf(TEXT("%s: chain point %.2f inside the %.2f s recovery"), E.Name, Link.ChainIntoRecovery, Opener.Recovery),
 				Link.ChainIntoRecovery >= 0.f && Link.ChainIntoRecovery < Opener.Recovery);
-			// The follow-up's shortest timing: its hold at the low end of its variation.
-			const float Gap = Opener.Active + Link.ChainIntoRecovery + ActiveStartOf(*Next, Next->Variants[0].HoldExtraMin);
+			// The follow-up's shortest timing: its hold at the low end of its variation (a combo's own version has none).
+			const UAttackDefinition* Own = Link.Attack;
+			const float Gap = Opener.Active + Link.ChainIntoRecovery + (Own ? Own->GetTiming().Windup : ActiveStartOf(*Next, Next->Variants[0].HoldExtraMin));
 			TestTrue(FString::Printf(TEXT("%s: follow-up %d goes active %.2f s after the previous one (at least 1.40)"), E.Name, i + 1, Gap), Gap >= 1.40f - 0.001f);
-			const UAttackDefinition* First = Next->Variants[0].Steps[0];
+			const UAttackDefinition* First = Own ? Own : Next->Variants[0].Steps[0].Get();
 			const float Turn = First->TrackingRate * FMath::Max(0.f, First->GetTiming().Windup - First->TrackingStopsBeforeActive);
 			TestTrue(FString::Printf(TEXT("%s: follow-up %d tracks %.0f deg before its cutoff (at least 90)"), E.Name, i + 1, Turn), Turn >= 90.f);
 			Prev = Next;
+			PrevOwn = Own;
 		}
+	}
+	// Combo E's own sweep starts at the exact clip join: the swing's recovery at Swing 1's 1.50, Swing 2 from its start, no blend.
+	const FBossCombo* ComboE = Boss->Combos.FindByPredicate([](const FBossCombo& X) { return X.Name == FName(TEXT("E")); });
+	const FBossAction* Swing = FindAction(Boss, TEXT("ExecutionersSwing"));
+	if (ComboE && Swing && ComboE->FollowUps.Num() > 0 && TestNotNull(TEXT("E: its own sweep"), ComboE->FollowUps[0].Attack.Get()))
+	{
+		const UAttackDefinition* S1 = Swing->Variants[0].Steps.Last();
+		const UAttackDefinition* Sweep = ComboE->FollowUps[0].Attack;
+		const FAttackTiming T = S1->GetTiming();
+		const float ClipAtChain = S1->ClipActiveEnd + ComboE->FollowUps[0].ChainIntoRecovery * (S1->ClipEnd - S1->ClipActiveEnd) / T.Recovery;
+		TestTrue(FString::Printf(TEXT("E: the swing's clip is at %.3f when the sweep starts (the join, 1.50)"), ClipAtChain), FMath::Abs(ClipAtChain - 1.50f) < 0.01f);
+		const UAttackDefinition* Plain = FindAction(Boss, TEXT("ReverseSweep"))->Variants[0].Steps[0];
+		TestTrue(TEXT("E: Reverse Sweep's own clip and damage, from its start, no blend"), Sweep->Clip == Plain->Clip && Sweep->Damage == Plain->Damage
+			&& Sweep->ClipStartAt == 0.f && Sweep->BlendIn == 0.f && S1->Clip && S1->Clip->GetName() == TEXT("Swing1_Slow"));
 	}
 	// Combo F: the Advance's swing at least 0.70 s after the grasp reaches the Advance's 11.5 m (the dodge lock plus a reaction).
 	const FBossAction* Mark = FindAction(Boss, TEXT("SoulMark"));

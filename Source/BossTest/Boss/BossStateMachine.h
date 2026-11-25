@@ -51,6 +51,8 @@ public:
 
 	EBossState GetState() const { return State; }
 	float GetStateTime() const { return StateTime; }
+	// The running state's backstop, counted from its start (a stagger lengthened by the finishing blow).
+	void SetTimeout(float InTimeout) { Timeout = InTimeout; }
 	float GetTimeout() const { return Timeout; }
 	EBossPriority GetHeldPriority() const;
 	const TArray<FBossRequestRecord>& GetHistory() const { return History; }

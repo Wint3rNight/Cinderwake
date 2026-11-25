@@ -14,6 +14,7 @@
 #include "Boss/BossMovement.h"
 #include "Combat/Tracking.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/PointLightComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -84,6 +85,27 @@ ABossCharacter::ABossCharacter(const FObjectInitializer& ObjectInitializer)
 	Attacks = CreateDefaultSubobject<UAttackComponent>(TEXT("Attacks"));
 	Attacks->MontageSlot = MontageSlot;
 	Delivery = CreateDefaultSubobject<UDeliveryComponent>(TEXT("Delivery"));
+	// The finishing blow's in-range cue: a soft light just in front of his slumped chest, placed every tick (a light at
+	// the bone would sit inside his body and light nothing you can see).
+	FinisherGlow = CreateDefaultSubobject<UPointLightComponent>(TEXT("FinisherGlow"));
+	FinisherGlow->SetupAttachment(GetRootComponent());
+	FinisherGlow->SetUsingAbsoluteLocation(true);
+	FinisherGlow->SetIntensityUnits(ELightUnits::Candelas);
+	FinisherGlow->SetIntensity(0.f);
+	FinisherGlow->SetAttenuationRadius(140.f);
+	FinisherGlow->SetSourceRadius(25.f);
+	FinisherGlow->SetCastShadows(false);
+	FinisherGlow->SetVisibility(false);
+	IgnoreCamera();
+}
+
+void ABossCharacter::IgnoreCamera()
+{
+	// After the Step 6 play: the camera arm's probe treated his 3.7 m body as a wall and shoved the camera into him when
+	// a dodge put him between it and the player. The camera passes through him instead, as in souls games. (The death
+	// ragdoll saves and restores his collision responses, so this survives it.)
+	GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+	GetMesh()->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
 }
 
 void ABossCharacter::OnConstruction(const FTransform& Transform)
@@ -111,6 +133,7 @@ void ABossCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 	HomeTransform = GetActorTransform();
+	IgnoreCamera(); // again at play, in case the Blueprint carries an older collision setting
 	ApplyScale();
 	Attacks->MontageSlot = MontageSlot;
 
@@ -134,6 +157,7 @@ void ABossCharacter::BeginPlay()
 	InitDirector();
 	Attacks->CanContinue = [this]() { return CanContinuePlan(); };
 	Attacks->OnStepStarted.AddUObject(this, &ABossCharacter::OnStepStarted);
+	Attacks->OnSweepResolved.AddUObject(this, &ABossCharacter::OnOwnSweep);
 	if (Actions.Num() == 0)
 	{
 		UE_LOG(LogBossTest, Warning, TEXT("%s has no actions: Executioner's Swing only (Docs/tools/setup_boss.py fills them)"), *GetName());
@@ -254,17 +278,111 @@ void ABossCharacter::Tick(float DeltaSeconds)
 		}
 		break;
 	case EBossState::Stagger:
-		// The poise model owns the stagger's length; the state's timeout is only a backstop.
-		if (!Combatant->State.Poise.IsStaggered())
-		{
-			States.Complete(EBossState::Evaluate, TEXT("stagger over"));
-		}
+		TickStagger(DeltaSeconds);
 		break;
 	default:
 		break;
 	}
 
+	// The in-range cue: on while a light or heavy pressed now would finish him, faded so it never pops.
+	const APlayerCharacter* P = Cast<APlayerCharacter>(Player());
+	const bool bCue = P && CanBeFinishedBy(P) && P->GetActions().CouldRiposte();
+	GlowAlpha = FMath::FInterpConstantTo(GlowAlpha, bCue ? 1.f : 0.f, DeltaSeconds, 8.f);
+	FinisherGlow->SetVisibility(GlowAlpha > 0.f);
+	if (GlowAlpha > 0.f)
+	{
+		FinisherGlow->SetLightColor(FinisherGlowColor);
+		FinisherGlow->SetIntensity(FinisherGlowIntensity * GlowAlpha);
+		FinisherGlow->SetWorldLocation(GetMesh()->GetBoneLocation(TEXT("spine_03")) + GetActorForwardVector() * 45.f);
+	}
+
 	DrawDebugShapes();
+}
+
+void ABossCharacter::TickStagger(float DeltaSeconds)
+{
+	// The poise model owns the stagger's length (and a finisher lengthens it); the state's timeout is only a backstop.
+	const FPoiseModel& Poise = Combatant->State.Poise;
+	if (!Poise.IsStaggered())
+	{
+		// Through the commitment pause, as after an attack: he never acts on the frame he stands (the council's run).
+		PauseLength = Actions.Num() > 0 ? CommitPause : NeutralBeat;
+		States.Complete(EBossState::Neutral, TEXT("stagger over"), PauseLength + 1.f);
+		return;
+	}
+	const float T = Poise.StaggerElapsed();
+	// While he slumps he turns toward the player, up to the limit from where the stagger caught him (QA: a sideways
+	// dodge leaves you 55-60 deg off, so a finisher stays possible).
+	const ACharacter* P = Player();
+	if (P && !bFinisherTaken && T < StaggerTurnTime)
+	{
+		const float Want = (P->GetActorLocation() - GetActorLocation()).GetSafeNormal2D().Rotation().Yaw;
+		const float Goal = StaggerYaw + FMath::Clamp(FMath::FindDeltaAngleDegrees(StaggerYaw, Want), -StaggerTurnLimit, StaggerTurnLimit);
+		const float Max = StaggerTurnLimit / FMath::Max(StaggerTurnTime, 0.01f) * DeltaSeconds;
+		const float Yaw = GetActorRotation().Yaw;
+		SetActorRotation(FRotator(0.f, Yaw + FMath::Clamp(FMath::FindDeltaAngleDegrees(Yaw, Goal), -Max, Max), 0.f));
+	}
+	if (!HasStunClips())
+	{
+		return;
+	}
+	// The slump (Stun_Start to its end pose), the loop, then the stand-up timed to end with the stagger.
+	if (StunPhase == 0 && T >= StunStartTo / FMath::Max(StunStartRate, 0.01f))
+	{
+		PlayClip(StunLoopClip, 1.f, 0.15f, 0.2f, 1000);
+		StunPhase = 1;
+	}
+	if (StunPhase < 2 && Poise.StaggerRemaining() <= StunEndClip->GetPlayLength() / FMath::Max(StunEndRate, 0.01f))
+	{
+		PlayClipEased(StunEndClip, StunEndRate, 0.2f, 0.25f);
+		StunPhase = 2;
+	}
+}
+
+bool ABossCharacter::CanBeFinishedBy(const AActor* Who) const
+{
+	const ACharacter* C = Cast<ACharacter>(Who);
+	if (!C || bFinisherTaken || States.GetState() != EBossState::Stagger || Combatant->IsDead())
+	{
+		return false; // one per stagger; a cast-broken flinch is not a stagger
+	}
+	const float T = Combatant->State.Poise.StaggerElapsed();
+	if (T < FinisherFrom || T > FinisherUntil)
+	{
+		return false;
+	}
+	const FVector To = C->GetActorLocation() - GetActorLocation();
+	const float Dot = FVector::DotProduct(GetActorForwardVector().GetSafeNormal2D(), To.GetSafeNormal2D());
+	const float Angle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.f, 1.f)));
+	const float Edge = To.Size2D() - GetCapsuleComponent()->GetScaledCapsuleRadius() - C->GetCapsuleComponent()->GetScaledCapsuleRadius();
+	return Angle <= FinisherArc && Edge <= FinisherReach;
+}
+
+bool ABossCharacter::BeginFinisher(const AActor* Who)
+{
+	if (!CanBeFinishedBy(Who))
+	{
+		return false;
+	}
+	bFinisherTaken = true;
+	// He stands at the same moment wherever in the window it came (QA: a late one bought extra stagger time).
+	Combatant->State.Poise.SetStaggerLength(FinisherStaggerLength);
+	States.SetTimeout(FinisherStaggerLength + 1.f);
+	UE_LOG(LogBossTest, Log, TEXT("Sevarog: FINISHER at %.2f s into the stagger"), Combatant->State.Poise.StaggerElapsed());
+	return true;
+}
+
+FTransform ABossCharacter::FinisherSpot(const AActor* Who) const
+{
+	const FVector Forward = GetActorForwardVector().GetSafeNormal2D();
+	FVector Spot = GetActorLocation() + Forward * FinisherStandOff;
+	Spot.Z = Who ? Who->GetActorLocation().Z : Spot.Z;
+	return FTransform((-Forward).Rotation(), Spot);
+}
+
+float ABossCharacter::GetFinisherGlow() const
+{
+	return GlowAlpha;
 }
 
 void ABossCharacter::Evaluate()
@@ -627,13 +745,23 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 		{
 			Poise.BeginStagger(); // a deferred or forced stagger; a direct one began in the poise model already
 		}
+		bFinisherTaken = false;
+		StunPhase = 0;
+		StaggerYaw = GetActorRotation().Yaw;
 		const float Length = FMath::Max(Poise.StaggerDuration, 0.1f);
 		// The five-run stagger measurement (the punish windows, Step 6): how long since the last one.
 		const double NowS = GetWorld()->GetTimeSeconds();
 		UE_LOG(LogBossTest, Log, TEXT("Sevarog: STAGGER %.1f s into the fight (%s)"), NowS - FightStartTime,
 			LastStaggerTime >= 0.0 ? *FString::Printf(TEXT("%.1f s since the last"), NowS - LastStaggerTime) : TEXT("the first"));
 		LastStaggerTime = NowS;
-		PlayClip(StaggerClip, StaggerClip ? StaggerClip->GetPlayLength() / Length : 1.f, 0.1f, 0.25f);
+		if (HasStunClips())
+		{
+			PlayClip(StunStartClip, StunStartRate, 0.1f, 0.2f); // the slump; the loop and the stand-up follow (TickStagger)
+		}
+		else
+		{
+			PlayClip(StaggerClip, StaggerClip ? StaggerClip->GetPlayLength() / Length : 1.f, 0.1f, 0.25f);
+		}
 		break;
 	}
 	case EBossState::Dead:
@@ -759,7 +887,7 @@ void ABossCharacter::InitDirector()
 	FBossDirectorTuning Tuning;
 	Tuning.CommitPause = CommitPause;
 	Tuning.Breather = Breather;
-	Tuning.StopWeight = ComboStopWeight;
+	Tuning.StopShare = ComboStopShare;
 	Director.Init(MoveTemp(Options), MoveTemp(ComboOptions), Tuning);
 }
 
@@ -806,7 +934,25 @@ bool ABossCharacter::PunishTriggered() const
 	return Recent >= PunishHits;
 }
 
-bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriority Priority, int32 Combo)
+void ABossCharacter::OnOwnSweep(const FHitOutcome& Outcome, AActor* Victim, uint32 InstanceId)
+{
+	// The player's guard broke on the action's first step (the block that emptied the bar resolves inside this sweep,
+	// before the attack's end): he stops there instead of going on (Double Execution's hit 2 would land inside the break).
+	const APlayerCharacter* P = Cast<APlayerCharacter>(Victim);
+	if (Outcome.Result != EHitResult::Blocked || !P || P->GetActions().GetState() != EPlayerState::GuardBroken || StepIndex != 0 || Plan.Num() < 2
+		|| !Actions.IsValidIndex(CurrentAction) || !Actions[CurrentAction].GuardBreakRecovery)
+	{
+		return;
+	}
+	if (Attacks->SwapRecovery(Actions[CurrentAction].GuardBreakRecovery))
+	{
+		Plan.SetNum(1);
+		const float Left = Attacks->GetTimeToFree();
+		States.NextStep(TEXT("guard broken: he stops"), Left + 1.f);
+	}
+}
+
+bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriority Priority, int32 Combo, int32 ForcedVariant)
 {
 	if (!Actions.IsValidIndex(Index) || Actions[Index].Variants.Num() == 0 || !FBossStateMachine::IsLegal(States.GetState(), EBossState::Attack))
 	{
@@ -815,7 +961,7 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 	// Flatten the action and, for a combo, each follow-up: every action rolls its variant now (section 5: Double
 	// Execution's branch at commit), and its last step carries that variant's hold variation.
 	TArray<FPlannedStep> NewPlan;
-	auto AddAction = [this, &NewPlan](int32 ActionIndex, float ChainIntoRecovery)
+	auto AddAction = [this, &NewPlan](int32 ActionIndex, float ChainIntoRecovery, int32 Forced, UAttackDefinition* Own = nullptr)
 	{
 		const FBossAction& A = Actions[ActionIndex];
 		float Total = 0.f;
@@ -834,8 +980,22 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 				break;
 			}
 		}
+		if (A.Variants.IsValidIndex(Forced))
+		{
+			Pick = Forced; // tests and debugging (the roll still advanced, so the seeded stream doesn't shift)
+		}
 		const FBossActionVariant& V = A.Variants[Pick];
 		const float Hold = V.HoldExtraMax > V.HoldExtraMin ? Rng.FRandRange(V.HoldExtraMin, V.HoldExtraMax) : V.HoldExtraMin;
+		if (Own)
+		{
+			// A combo's own version of the action replaces its variants (the rolls above still ran, so the stream doesn't shift).
+			FPlannedStep& Step = NewPlan.AddDefaulted_GetRef();
+			Step.Attack = Own;
+			Step.Action = ActionIndex;
+			Step.bFirstOfAction = true;
+			Step.ChainIntoRecovery = ChainIntoRecovery;
+			return;
+		}
 		for (int32 s = 0; s < V.Steps.Num(); ++s)
 		{
 			FPlannedStep& Step = NewPlan.AddDefaulted_GetRef();
@@ -846,7 +1006,7 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 			Step.ExtraHold = s == V.Steps.Num() - 1 ? Hold : 0.f;
 		}
 	};
-	AddAction(Index, -1.f);
+	AddAction(Index, -1.f, ForcedVariant);
 	if (Combos.IsValidIndex(Combo))
 	{
 		for (const FBossComboLink& Link : Combos[Combo].FollowUps)
@@ -856,7 +1016,7 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 			{
 				break;
 			}
-			AddAction(F, Link.ChainIntoRecovery);
+			AddAction(F, Link.ChainIntoRecovery, -1, Link.Attack);
 		}
 	}
 	if (NewPlan.Num() == 0 || !NewPlan[0].Attack)
@@ -918,6 +1078,22 @@ void ABossCharacter::ClearCombat()
 	Attacks->ClearEffects();
 	Combatant->State.Cast.Close();
 	bCastOpen = false;
+}
+
+UAnimMontage* ABossCharacter::PlayClipEased(UAnimSequenceBase* Clip, float Rate, float BlendIn, float BlendOut, int32 Loops)
+{
+	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
+	if (!Anim || !Clip)
+	{
+		return nullptr;
+	}
+	GlideClip = nullptr;
+	FMontageBlendSettings In(BlendIn);
+	In.Blend.BlendOption = EAlphaBlendOption::HermiteCubic;
+	FMontageBlendSettings Out(BlendOut);
+	Out.Blend.BlendOption = EAlphaBlendOption::HermiteCubic;
+	ClipMontage = Anim->PlaySlotAnimationAsDynamicMontage_WithBlendSettings(Clip, MontageSlot, In, Out, Rate, Loops);
+	return ClipMontage;
 }
 
 UAnimMontage* ABossCharacter::PlayClip(UAnimSequenceBase* Clip, float Rate, float BlendIn, float BlendOut, int32 Loops)
@@ -1068,13 +1244,13 @@ void ABossCharacter::SelectNextAction()
 	SelectedAction = Actions.Num() > 0 ? (SelectedAction + 1) % Actions.Num() : 0;
 }
 
-bool ABossCharacter::ForceAction(int32 Index)
+bool ABossCharacter::ForceAction(int32 Index, int32 Variant)
 {
 	if (States.GetState() == EBossState::Neutral)
 	{
 		States.Complete(EBossState::Evaluate, TEXT("forced action"));
 	}
-	return StartAction(Index, TEXT("forced"), EBossPriority::Scripted, -1);
+	return StartAction(Index, TEXT("forced"), EBossPriority::Scripted, -1, Variant);
 }
 
 bool ABossCharacter::ForceCombo(int32 ComboIndex)
@@ -1140,6 +1316,10 @@ void ABossCharacter::ResetBoss()
 	Director.Reset(); // bands, cooldowns, history: a retry starts clean
 	LastStaggerTime = -1.0;
 	bKeepCircle = false;
+	bFinisherTaken = false;
+	StunPhase = 0;
+	GlowAlpha = 0.f;
+	FinisherGlow->SetVisibility(false);
 	PlayerHitTimes.Reset();
 	ClearCombat();
 	Rng.Initialize(Seed != 0 ? Seed : FMath::Rand()); // a retry starts its own rolls (the same ones with a fixed seed)

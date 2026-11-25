@@ -78,6 +78,7 @@ bool FBossStateMachine::IsLegal(EBossState From, EBossState To)
 	case EBossState::Paused:
 		return To == EBossState::Evaluate || To == EBossState::Attack;
 	case EBossState::Stagger:
+		return To == EBossState::Evaluate || To == EBossState::Neutral; // the commitment pause first (the council's run)
 	case EBossState::CastBroken:
 		return To == EBossState::Evaluate;
 	default:

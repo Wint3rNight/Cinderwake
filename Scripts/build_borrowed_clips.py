@@ -1,5 +1,6 @@
 # Builds the borrowed clips (Step 4e): retargets attacks from Paragon Kwang and Aurora onto Feng Mao, then mirrors them
-# (both swing right-handed; Feng Mao's sword is in his left hand). The results go in /Game/Retargeted, which is
+# (both swing right-handed; Feng Mao's sword is in his left hand). Also mirrors three of Sevarog's own clips for Double
+# Execution (after Step 6). The results go in /Game/Retargeted, which is
 # git-ignored because it's derived from Fab content: anyone with the Paragon Feng Mao, Kwang and Aurora packs can
 # rebuild it with this script.
 #
@@ -92,4 +93,54 @@ for name in made_all:
         raise RuntimeError("mirroring %s failed (see the log)" % name)
     EAL.save_asset(dst)
     out.append("%s_Mirrored: mirrored" % name)
+
+# Sevarog's own clips, mirrored (the council's variety run after Step 6): Double Execution starts from his other side,
+# a silhouette tell. Copied from the Paragon pack into /Game/Retargeted/Sevarog (derived content, git-ignored) and
+# mirrored there; the Paragon originals are never touched.
+SEV_ANIMS = "/Game/ParagonSevarog/Characters/Heroes/Sevarog/Animations/"
+SEV_OUT = "/Game/Retargeted/Sevarog"
+sev = unreal.load_asset("/Game/ParagonSevarog/Characters/Heroes/Sevarog/Meshes/Sevarog")
+SEV_TABLE = RIGS + "/MT_Sevarog"
+sev_table = unreal.load_asset(SEV_TABLE) if EAL.does_asset_exist(SEV_TABLE) else unreal.BossTestEditorTools.create_mirror_table(sev.skeleton, RIGS, "MT_Sevarog")
+EAL.save_asset(SEV_TABLE)
+# The hammer hangs off weapon_r at a fixed offset along the bone's own -Y; mirroring swaps weapon_r with weapon_l and
+# mirrors their rotations, which flips that offset the wrong way (measured: at the strike the head sat near his body,
+# 2.3 m from the reflection). So weapon_r is rewritten every key: its world position reflected across X, its world
+# rotation the mirror image (the quaternion's y and z negated: a proper rotation that keeps the hammer's head-to-handle
+# axis, which has no X), back into its parent's space in the mirrored pose.
+E, ML = unreal.AnimPoseExtensions, unreal.MathLibrary
+POSE = unreal.AnimPoseEvaluationOptions()
+def fix_hammer(original, mirrored):
+    keys = unreal.AnimationLibrary.get_num_frames(mirrored) + 1
+    length = mirrored.get_play_length()
+    pos, rot, scl = [], [], []
+    for i in range(keys):
+        t = min(length, length * i / max(1, keys - 1))
+        wo = E.get_bone_pose(E.get_anim_pose_at_time(original, t, POSE), "weapon_r", unreal.AnimPoseSpaces.WORLD)
+        pm = E.get_anim_pose_at_time(mirrored, t, POSE)
+        wm = E.get_bone_pose(pm, "weapon_r", unreal.AnimPoseSpaces.WORLD)
+        lm = E.get_bone_pose(pm, "weapon_r", unreal.AnimPoseSpaces.LOCAL)
+        parent = ML.compose_transforms(ML.invert_transform(lm), wm)  # world = local * parent
+        want = unreal.Transform()
+        want.translation = unreal.Vector(-wo.translation.x, wo.translation.y, wo.translation.z)
+        q = wo.rotation
+        want.rotation = unreal.Quat(q.x, -q.y, -q.z, q.w)
+        want.scale3d = wo.scale3d
+        local = ML.compose_transforms(want, ML.invert_transform(parent))
+        pos.append(local.translation)
+        rot.append(local.rotation)
+        scl.append(local.scale3d)
+    if not mirrored.controller.set_bone_track_keys("weapon_r", pos, rot, scl, False):
+        raise RuntimeError("couldn't rewrite weapon_r on %s" % mirrored.get_name())
+for name in ("Swing1_Slow", "Swing2_Slow", "Swing2_Return2Idle_120fps"):
+    dst = SEV_OUT + "/" + name + "_Mirrored"
+    if EAL.does_asset_exist(dst):
+        out.append("%s_Mirrored: already built, kept" % name)
+        continue
+    copy = EAL.duplicate_asset(SEV_ANIMS + name, dst)
+    if not unreal.BossTestEditorTools.mirror_animation(copy, sev_table):
+        raise RuntimeError("mirroring Sevarog's %s failed (see the log)" % name)
+    fix_hammer(unreal.load_asset(SEV_ANIMS + name), copy)
+    EAL.save_asset(dst)
+    out.append("%s_Mirrored: mirrored, hammer reflected" % name)
 open(LOG, "w").write("\n".join(out))

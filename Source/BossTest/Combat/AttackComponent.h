@@ -50,6 +50,10 @@ public:
 	// asked once, then; refused, the queue clears and the running attack plays its full recovery (spec section 10, rule 4).
 	void QueueNextAt(UAttackDefinition* Next, float ExtraHold, float ChainIntoRecovery);
 	void ClearQueue();
+	// Swaps the running attack for one on the same clip with the same windup and active window but another recovery
+	// (Double Execution's first hit when the player's guard breaks: he stops). Only before the active window ends; clears
+	// the queue. The instance and its hits are kept.
+	bool SwapRecovery(UAttackDefinition* SameClip);
 	bool HasQueued() const { return QueuedNext != nullptr; }
 	TFunction<bool()> CanContinue;
 	FOnAttackStepStarted OnStepStarted;
@@ -60,7 +64,13 @@ public:
 
 	uint32 GetInstanceId() const { return CurrentDefinition ? InstanceId : 0; }
 	static uint32 AllocateInstanceId(); // ids for anything that hits (attacks, rings, projectiles): never 0, never reused
-	void StopAttack(float BlendOut = 0.2f);
+	void StopAttack(float BlendOut = 0.2f, bool bEased = false);
+
+	// After the Step 6 play: once an attack frees its owner, its clip can keep playing its own follow-through for the
+	// definition's SettleTime (no hits, no armour: purely the look), then blend out. Any new attack or clip on the slot
+	// replaces it; the owner ends it early (moving).
+	bool IsSettling() const { return SettleMontage != nullptr; }
+	void StopSettle(float BlendOut = 0.25f);
 	// Swaps the running attack for its variant (the charged heavy), keeping the instance so nothing already hit can
 	// be hit twice. Same clip: keeps the elapsed time and the montage, no pop. Another clip: crossfades to it
 	// (SwitchBlend, eased) and the variant's own timeline starts at 0.
@@ -101,6 +111,9 @@ private:
 	bool StartQueued(); // true if the queued step started (the running attack is replaced)
 	UAnimMontage* PlayPaused(UAnimSequenceBase* Clip, float BlendIn, bool bEased);
 	void SweepWeapon();
+	// Every victim of this frame's strike through the resolver, with its hit-stop, effect and events (a sweep's, or the
+	// target of an attack that strikes it directly).
+	void ResolveVictims(const TArray<class UCombatantComponent*>& Victims);
 	void ApplyLunge(float Duration);
 	void TrackTarget(float Step);
 	void SetOwnerArmor(EArmor Armor);
@@ -126,8 +139,16 @@ private:
 	uint16 LungeId = 0; // root motion source id, 0 when none is running
 	EAttackSpan CurrentSpan = EAttackSpan::Main;
 	bool bDeliveryDone = false;
+	bool bStruckTarget = false;     // bStrikesTarget: its one hit has resolved
 	bool bTrailsOn = false;
 	TArray<bool> CueFired;
+
+	UPROPERTY()
+	TObjectPtr<UAnimMontage> SettleMontage;
+	float SettleLeft = 0.f;
+	float SettleBlendOut = 0.2f;
+	bool bSettleEased = false;
+	void TickSettle(float DeltaTime);
 
 	UPROPERTY()
 	TObjectPtr<UAttackDefinition> QueuedNext;

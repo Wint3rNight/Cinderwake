@@ -182,6 +182,8 @@ enum class EPlayerCommand : uint8
 	ChainHeavy,         // the normal heavy, started from another attack's chain point (it blends in longer)
 	ChainHeavyTwo,      // the second heavy (the rising uppercut): the heavy that follows a heavy, the charged heavy or the slam
 	StartLightRise,     // Light 1 out of the slam's landing crouch: it stands up first
+	StartRiposte,       // a light or heavy while his stagger's finishing window is open: the finishing blow (no stamina,
+	                    // invulnerable until free)
 	RefuseInput         // a press was refused (a dodge mid-swing, a held attack meeting exhaustion): flash the stamina bar
 };
 
@@ -200,6 +202,7 @@ struct FPlayerFrame
 	bool bAtChargeBranch = false;   // the heavy is held at its cocked pose, waiting for the charge decision (UAttackComponent::IsAtBranch)
 	bool bPastActive = false;       // the running attack's own hit window is over (its sample, on the attack's capped clock)
 	float TimeToFree = 100.f;       // attack-clock seconds until the running attack frees him
+	bool bRiposteReady = false;     // his stagger's finishing window is open and you stand where a press finishes him
 };
 
 class BOSSTEST_API FPlayerActions
@@ -236,12 +239,18 @@ public:
 	bool HasPerfectWindow() const;            // a fresh press raised the guard and its window hasn't passed
 	bool IsSprinting() const { return bSprinting; }
 	bool CanSteer() const { return State == EPlayerState::Free; }
+	bool IsRiposting() const { return State == EPlayerState::Attacking && bRiposte; }
+	// A light or heavy pressed now would become the finishing blow if his window is open (the in-range cue): free, guarding,
+	// dodging or attacking (held to the chain point), and not exhausted.
+	bool CouldRiposte() const;
 
 private:
 	bool TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands& Out);
 	// From the running attack's chain point: the held light continues its line, the held heavy is the normal heavy.
 	bool TryStartChained(EPlayerInput Input, const FPlayerFrame& Frame, FPlayerCommands& Out);
 	bool TryStartAttack(float Cost, FPlayerCommands& Out);
+	// A light or heavy becomes the finishing blow while Frame.bRiposteReady: no stamina spent, but not while exhausted.
+	bool TryStartRiposte(const FPlayerFrame& Frame, FPlayerCommands& Out);
 	void Enter(EPlayerState NewState);
 	void StopSprint(FPlayerCommands& Out);
 	void UpdateSprint(const FPlayerFrame& Frame, FPlayerCommands& Out);
@@ -253,7 +262,7 @@ private:
 	float SinceDodge = 100.f;     // since the last dodge or backstep started
 	int32 LightIndex = 0;
 	// What's running decides which light follows it at the chain point.
-	enum class EAttackLine : uint8 { None, Light, DodgeLight, Sprint, Heavy, Heavy2, Slam };
+	enum class EAttackLine : uint8 { None, Light, DodgeLight, Sprint, Heavy, Heavy2, Slam, Riposte };
 	EAttackLine Line = EAttackLine::None;
 	EPlayerInput Held = EPlayerInput::None; // the one held press (Step 4d), latest wins
 	float HeldAge = 0.f;
@@ -273,4 +282,5 @@ private:
 	float PerfectLockoutLeft = 0.f; // after a whiffed window, no new one until this runs out
 	EPlayerInput StunHeld = EPlayerInput::None; // a dodge or attack pressed during block- or deflect-stun, for its end
 	bool bBusy = false;           // an attack or dodge chain is running: no regeneration
+	bool bRiposte = false;        // the running attack is the finishing blow (invulnerable until free)
 };

@@ -200,6 +200,18 @@ bool FWatchBossSwing::Update()
 			Test->AddError(TEXT("no swing seen from its start in 20 s"));
 			return true;
 		}
+		// Until the watched swing starts, hold the player 3.5 m in front of him, so its lunge has ground to cover (a
+		// lunge stops 1 m short: from point blank, after an earlier swing, there's nothing to lunge, by design).
+		if (!Attacks->IsAttacking())
+		{
+			if (ACharacter* P = World->GetFirstPlayerController() ? Cast<ACharacter>(World->GetFirstPlayerController()->GetPawn()) : nullptr)
+			{
+				const float Radii = Boss->GetCapsuleComponent()->GetScaledCapsuleRadius() + P->GetCapsuleComponent()->GetScaledCapsuleRadius();
+				FVector At = Boss->GetActorLocation() + Boss->GetActorForwardVector().GetSafeNormal2D() * (350.f + Radii);
+				At.Z = P->GetActorLocation().Z;
+				P->SetActorLocation(At, false, nullptr, ETeleportType::TeleportPhysics);
+			}
+		}
 		return false;
 	}
 	if (Attacks->IsAttacking())
@@ -312,6 +324,23 @@ bool FCheckDeferredStagger::Update()
 	return true;
 }
 
+// The guard tests time their press to Executioner's Swing, so they pin him to that one action and no combos (Step 5
+// gave him nine, Step 6 combos), from the moment play starts: his first pick comes as soon as his intro ends.
+DEFINE_LATENT_AUTOMATION_COMMAND(FPinBossToSwing);
+bool FPinBossToSwing::Update()
+{
+	UWorld* World = PlayWorld();
+	if (World)
+	{
+		if (TActorIterator<ABossCharacter> It(World); It)
+		{
+			It->PinAction(0); // through the director: that action whenever it fits, never a combo
+			return true;
+		}
+	}
+	return false;
+}
+
 DEFINE_LATENT_AUTOMATION_COMMAND_ONE_PARAMETER(FCheckNoTimeouts, FAutomationTestBase*, Test);
 bool FCheckNoTimeouts::Update()
 {
@@ -331,6 +360,9 @@ bool FSmokePlayerKitInArena::RunTest(const FString& Parameters)
 {
 	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	// It watches his swing's armour and a deferred stagger: pinned to Executioner's Swing (his director picks any of
+	// nine actions since Step 6, and Soul Mark's windup has no armour on purpose).
+	ADD_LATENT_AUTOMATION_COMMAND(FPinBossToSwing());
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(4.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FCheckPlayerKitInArena(this));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitForBossHitOnPlayer(this, 0.0));
@@ -390,23 +422,6 @@ struct FBlockWatch
 	bool bRaised = false;
 	float LastStamina = -1.f;
 };
-
-// The guard tests time their press to Executioner's Swing, so they pin him to that one action and no combos (Step 5
-// gave him nine, Step 6 combos), from the moment play starts: his first pick comes as soon as his intro ends.
-DEFINE_LATENT_AUTOMATION_COMMAND(FPinBossToSwing);
-bool FPinBossToSwing::Update()
-{
-	UWorld* World = PlayWorld();
-	if (World)
-	{
-		if (TActorIterator<ABossCharacter> It(World); It)
-		{
-			It->PinAction(0); // through the director: that action whenever it fits, never a combo
-			return true;
-		}
-	}
-	return false;
-}
 
 DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FGuardNextSwing, FAutomationTestBase*, Test, TSharedRef<FBlockWatch>, Watch);
 bool FGuardNextSwing::Update()
@@ -592,6 +607,9 @@ struct FDeathWatch
 	float FloorZ = 0.f;
 	FVector PlayerMeshRelative = FVector::ZeroVector;
 	FVector BossMeshRelative = FVector::ZeroVector;
+	FName PlayerProfile;
+	FName BossProfile;
+	ECollisionResponse BossCamera = ECR_Block;
 };
 
 namespace
@@ -647,6 +665,9 @@ bool FKillBoth::Update()
 		W.FloorZ = Player->GetActorLocation().Z - Player->GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
 		W.PlayerMeshRelative = Player->GetMesh()->GetRelativeLocation();
 		W.BossMeshRelative = Boss->GetMesh()->GetRelativeLocation();
+		W.PlayerProfile = Player->GetMesh()->GetCollisionProfileName();
+		W.BossProfile = Boss->GetMesh()->GetCollisionProfileName();
+		W.BossCamera = Boss->GetMesh()->GetCollisionResponseToChannel(ECC_Camera);
 	}
 	FCombatHitContext Lethal;
 	Lethal.Damage = 100000.f;
@@ -713,7 +734,12 @@ bool FCheckBodiesRestored::Update()
 		Test->TestTrue(FString::Printf(TEXT("%s: the mesh is back on the capsule"), *C->GetName()), Mesh->GetAttachParent() == C->GetCapsuleComponent());
 		const FVector Want = C == Player ? W.PlayerMeshRelative : W.BossMeshRelative;
 		Test->TestTrue(FString::Printf(TEXT("%s: in its old place"), *C->GetName()), Mesh->GetRelativeLocation().Equals(Want, 1.f));
-		Test->TestEqual(FString::Printf(TEXT("%s: its collision profile is back"), *C->GetName()), Mesh->GetCollisionProfileName(), FName(TEXT("CharacterMesh")));
+		// Whatever it had before death (his is Custom: CharacterMesh with the camera ignored, after the Step 6 play).
+		Test->TestEqual(FString::Printf(TEXT("%s: its collision profile is back"), *C->GetName()), Mesh->GetCollisionProfileName(), C == Player ? W.PlayerProfile : W.BossProfile);
+		if (C != Player)
+		{
+			Test->TestEqual(TEXT("his mesh still lets the camera through"), static_cast<int32>(Mesh->GetCollisionResponseToChannel(ECC_Camera)), static_cast<int32>(W.BossCamera));
+		}
 	}
 	const UPhysicsAsset* BossPhysics = Boss->GetMesh()->GetPhysicsAsset();
 	Test->TestTrue(FString::Printf(TEXT("Sevarog is back on the Paragon physics asset (%s)"), BossPhysics ? *BossPhysics->GetName() : TEXT("none")),
@@ -1304,11 +1330,13 @@ struct FComboWatch
 	bool bFollowUp = false;
 	bool bArmourFromStart = false;
 	float LastOpenerElapsed = 0.f;
+	float OpenerChainAt = 0.f;
+	bool bOwnSweep = false;
 };
 
 // Combo C (Reverse Sweep into Crushing Overhead) forced at 2 m: the follow-up starts at its chain point with windup armour
 // from its first frame. Forced again with the player moved to 6 m once the sweep starts: no follow-up, and the sweep
-// plays its whole recovery.
+// plays its whole recovery. Then Combo E at 2 m: its own quicker sweep starts 0.81 s into the swing's recovery.
 DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FComboChain, FAutomationTestBase*, Test, TSharedRef<FComboWatch>, Watch);
 bool FComboChain::Update()
 {
@@ -1327,7 +1355,7 @@ bool FComboChain::Update()
 		W.Start = Now;
 		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
 	}
-	if (Now - W.Start > 40.0)
+	if (Now - W.Start > 60.0)
 	{
 		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
 		return true;
@@ -1341,11 +1369,36 @@ bool FComboChain::Update()
 			return false;
 		}
 		PlaceSmokePlayer(Player, Boss, 200.f, 0.f);
-		const int32 C = Boss->Combos.IndexOfByPredicate([](const FBossCombo& X) { return X.Name == FName(TEXT("C")); });
+		const FName Name = W.Phase < 2 ? FName(TEXT("C")) : FName(TEXT("E"));
+		const int32 C = Boss->Combos.IndexOfByPredicate([Name](const FBossCombo& X) { return X.Name == Name; });
 		W.bForced = Boss->ForceCombo(C);
 		W.bFollowUp = false;
 		W.LastOpenerElapsed = 0.f;
 		return false;
+	}
+	if (W.Phase == 2)
+	{
+		if (Current == TEXT("DA_ExecutionersSwing"))
+		{
+			const FAttackTiming T = Attacks->GetCurrent()->GetTiming();
+			W.LastOpenerElapsed = Attacks->GetElapsed();
+			W.OpenerChainAt = T.Windup + T.Active + 0.81f;
+			return false;
+		}
+		if (Current == TEXT("DA_ReverseSweepE") && !W.bOwnSweep)
+		{
+			W.bOwnSweep = true;
+			W.OpenerElapsed = W.LastOpenerElapsed;
+			return false;
+		}
+		if (Boss->GetStates().GetState() == EBossState::Attack)
+		{
+			return false;
+		}
+		Test->TestTrue(TEXT("Combo E: its own sweep came"), W.bOwnSweep);
+		Test->TestTrue(FString::Printf(TEXT("at the clip join (the swing at %.2f s, expected %.2f)"), W.OpenerElapsed, W.OpenerChainAt),
+			FMath::Abs(W.OpenerElapsed - W.OpenerChainAt) <= 0.05f);
+		return true;
 	}
 	if (Current == TEXT("DA_ReverseSweep"))
 	{
@@ -1379,7 +1432,9 @@ bool FComboChain::Update()
 	}
 	Test->TestFalse(TEXT("at 6 m: no follow-up"), W.bFollowUp);
 	Test->TestTrue(FString::Printf(TEXT("and the sweep played its whole recovery (%.2f s of 1.98)"), W.LastOpenerElapsed), W.LastOpenerElapsed >= 1.9f);
-	return true;
+	W.Phase = 2;
+	W.bForced = false;
+	return false;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeComboChain, "BossTest.Smoke.ComboChain", SmokeTestFlags)
@@ -1456,6 +1511,456 @@ bool FSmokeHugBack::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
 	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
 	ADD_LATENT_AUTOMATION_COMMAND(FHugBack(this, MakeShared<FHugWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- After the Step 6 play: the camera shoved into his body when a dodge put him between it and you ----
+
+// His capsule and mesh blocked the camera channel, so the camera arm's probe treated his 3.7 m body as a wall. A
+// camera-channel sweep straight through him now hits nothing of his (the camera passes through, as in souls games).
+DEFINE_LATENT_AUTOMATION_COMMAND_ONE_PARAMETER(FCheckCameraPassesBoss, FAutomationTestBase*, Test);
+bool FCheckCameraPassesBoss::Update()
+{
+	UWorld* World = PlayWorld();
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Boss)
+	{
+		Test->AddError(TEXT("no boss"));
+		return true;
+	}
+	const FVector Mid = Boss->GetActorLocation();
+	const FVector From = Mid - Boss->GetActorForwardVector() * 400.f;
+	const FVector To = Mid + Boss->GetActorForwardVector() * 400.f;
+	TArray<FHitResult> Hits;
+	World->SweepMultiByChannel(Hits, From, To, FQuat::Identity, ECC_Camera, FCollisionShape::MakeSphere(12.f));
+	bool bHitHim = false;
+	for (const FHitResult& H : Hits)
+	{
+		bHitHim |= H.GetActor() == Boss;
+	}
+	Test->TestFalse(TEXT("a camera sweep through him hits nothing of his"), bHitHim);
+	Test->TestEqual(TEXT("his capsule ignores the camera"), static_cast<int32>(Boss->GetCapsuleComponent()->GetCollisionResponseToChannel(ECC_Camera)), static_cast<int32>(ECR_Ignore));
+	Test->TestEqual(TEXT("his mesh ignores the camera"), static_cast<int32>(Boss->GetMesh()->GetCollisionResponseToChannel(ECC_Camera)), static_cast<int32>(ECR_Ignore));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeCameraPassesBoss, "BossTest.Smoke.CameraPassesBoss", SmokeTestFlags)
+bool FSmokeCameraPassesBoss::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(1.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FCheckCameraPassesBoss(this));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- After the Step 6 play: "after doing an attack he goes static... a bit out of flow" ----
+
+struct FSettleWatch
+{
+	double Start = 0.0;
+	double PhaseStart = 0.0;
+	int32 Phase = 0;
+};
+
+// Most of his attacks end far from idle (Light 1's sword tip 1.7 m off, the dodge slam's 6.5 m), and a 0.2 s blend
+// snapped him back. Now, once free, a light keeps playing its own follow-through (the settle); a new attack replaces
+// it at once, and moving ends it.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FAttackSettles, FAutomationTestBase*, Test, TSharedRef<FSettleWatch>, Watch);
+bool FAttackSettles::Update()
+{
+	FSettleWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	APlayerCharacter* Player = SmokePlayer(World);
+	if (!PC || !Player)
+	{
+		Test->AddError(TEXT("no player"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = W.PhaseStart = Now;
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+	}
+	if (Now - W.Start > 15.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const UAttackComponent* Attacks = Player->GetAttacks();
+	auto Key = [PC](const FKey& K, bool bDown)
+	{
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(K, bDown ? IE_Pressed : IE_Released, bDown ? 1.f : 0.f));
+	};
+	auto Next = [&W, Now](int32 Phase) { W.Phase = Phase; W.PhaseStart = Now; };
+	switch (W.Phase)
+	{
+	case 0: Key(EKeys::LeftMouseButton, true); Key(EKeys::LeftMouseButton, false); Next(1); return false;
+	case 1: if (Attacks->IsAttacking()) { Next(2); } return false;
+	case 2:
+		if (!Attacks->IsAttacking())
+		{
+			Test->TestTrue(TEXT("free, and the attack settles into its follow-through"), Attacks->IsSettling());
+			Next(3);
+		}
+		return false;
+	case 3:
+		if (Now - W.PhaseStart < 0.1)
+		{
+			return false;
+		}
+		Test->TestTrue(TEXT("still settling 0.1 s later"), Attacks->IsSettling());
+		Key(EKeys::LeftMouseButton, true);
+		Key(EKeys::LeftMouseButton, false);
+		Next(4);
+		return false;
+	case 4:
+		if (Attacks->IsAttacking())
+		{
+			Test->TestFalse(TEXT("a new attack replaces the settle at once"), Attacks->IsSettling());
+			Next(5);
+		}
+		return false;
+	case 5:
+		if (!Attacks->IsAttacking() && Attacks->IsSettling())
+		{
+			Key(EKeys::W, true);
+			Next(6);
+		}
+		return false;
+	default:
+		if (Now - W.PhaseStart < 0.1)
+		{
+			return false;
+		}
+		Test->TestFalse(TEXT("moving ends the settle"), Attacks->IsSettling());
+		Key(EKeys::W, false);
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeAttackSettles, "BossTest.Smoke.AttackSettles", SmokeTestFlags)
+bool FSmokeAttackSettles::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FAttackSettles(this, MakeShared<FSettleWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+// ---- The council's run after Step 6: a guard broken on Double Execution's first hit stops him ----
+
+struct FBreakWatch
+{
+	double Start = 0.0;
+	double Forced = 0.0;
+	int32 Phase = 0;
+	bool bBroken = false;
+	bool bStopPlayed = false;
+	bool bHitTwo = false;
+};
+
+// Guard held with almost no stamina against the fast Double Execution: hit 1 breaks the guard, no hit 2 follows (it
+// would land inside the 1.0 s break), and he plays the 0.90 s stop recovery instead.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FGuardBreakStopsDouble, FAutomationTestBase*, Test, TSharedRef<FBreakWatch>, Watch);
+bool FGuardBreakStopsDouble::Update()
+{
+	FBreakWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!PC || !Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 30.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const FString Current = Boss->GetAttacks()->GetCurrent() ? Boss->GetAttacks()->GetCurrent()->GetName() : FString();
+	W.bBroken |= Player->GetActions().GetState() == EPlayerState::GuardBroken;
+	W.bStopPlayed |= Current == TEXT("DA_DoubleExecutionBreak");
+	W.bHitTwo |= Current.StartsWith(TEXT("DA_DoubleExecution2"));
+	switch (W.Phase)
+	{
+	case 0:
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 200.f, 0.f);
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::Q, IE_Pressed, 1.f));
+		W.Phase = 1;
+		W.Forced = Now;
+		return false;
+	case 1:
+		if (Now - W.Forced < 0.4)
+		{
+			return false; // the guard is up from 0.18 s
+		}
+		// Enough to keep the guard up through hit 1's 0.95 s windup (holding drains 10/s; at 0 exhaustion drops it),
+		// too little for the block (1.5 x 35 = 52.5): it overdraws and breaks.
+		Player->SetStaminaForTesting(35.f);
+		{
+			const int32 Double = Boss->Actions.IndexOfByPredicate([](const FBossAction& A) { return A.Name == FName(TEXT("DoubleExecution")); });
+			if (!Boss->ForceAction(Double, 0)) // the fast variant: hit 2 would land inside the break
+			{
+				return false;
+			}
+		}
+		W.Phase = 2;
+		W.Forced = Now;
+		return false;
+	default:
+		if (Boss->GetStates().GetState() == EBossState::Attack || Now - W.Forced < 1.0)
+		{
+			return false;
+		}
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::Q, IE_Released, 0.f));
+		Test->TestTrue(TEXT("hit 1 broke the guard"), W.bBroken);
+		Test->TestFalse(TEXT("no hit 2"), W.bHitTwo);
+		Test->TestTrue(TEXT("he played the stop recovery"), W.bStopPlayed);
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeGuardBreakStopsDouble, "BossTest.Smoke.GuardBreakStopsDouble", SmokeTestFlags)
+bool FSmokeGuardBreakStopsDouble::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FGuardBreakStopsDouble(this, MakeShared<FBreakWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FFinisherWatch
+{
+	double Start = 0.0;
+	int32 Phase = 0;
+	double StaggerAt = 0.0;
+	float Health = 0.f;
+	float PressedAt = -1.f;      // stagger seconds at the press
+	float StartYawOff = 0.f;     // degrees off his front when the stagger began
+	bool bGlowSeen = false;
+	bool bGlowBeforeWindow = false;
+	bool bRiposteSeen = false;
+	bool bInvulnerable = true;
+	float Damage = 0.f;
+	float BladeToChest = -1.f;
+	bool bSecondOffered = false;
+	double StoodAt = 0.0;
+	int32 Timeouts = 0;
+};
+
+// The finishing blow (the council's run, 2026-11-24): the player 1 m out at 55 deg off his front (a sideways dodge's
+// leftover) when he staggers. He turns toward you as he slumps, the cue glows only inside the window, a light press
+// snaps you in front of him and the crash lands 250 as its blade crosses his slumped chest, you're invulnerable
+// throughout, there's no second one, and he stands 2.40 s into the stagger (plus the strike's hit-stop) into the pause.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FFinisherRun, FAutomationTestBase*, Test, TSharedRef<FFinisherWatch>, Watch);
+bool FFinisherRun::Update()
+{
+	FFinisherWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player, boss or controller"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 30.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const UCombatantComponent* Combatant = Boss->GetCombatant();
+	const float StaggerT = Combatant->State.Poise.StaggerElapsed();
+	switch (W.Phase)
+	{
+	case 0:
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 100.f, 55.f);
+		W.StartYawOff = 55.f;
+		W.Health = Combatant->State.Health.Current;
+		W.Timeouts = Boss->GetStates().GetTimeoutCount();
+		Boss->ForceStagger();
+		W.StaggerAt = World->GetTimeSeconds();
+		W.Phase = 1;
+		return false;
+	case 1:
+		if (Boss->GetStates().GetState() != EBossState::Stagger)
+		{
+			return false;
+		}
+		if (Boss->GetFinisherGlow() > 0.f)
+		{
+			W.bGlowSeen = true;
+			W.bGlowBeforeWindow |= StaggerT < Boss->FinisherFrom - 0.01f;
+		}
+		if (Boss->CanBeFinishedBy(Player) && Boss->GetFinisherGlow() > 0.9f)
+		{
+			PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::LeftMouseButton, IE_Pressed, 1.f));
+			PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::LeftMouseButton, IE_Released, 0.f));
+			W.PressedAt = StaggerT;
+			W.Phase = 2;
+		}
+		else if (StaggerT > Boss->FinisherUntil)
+		{
+			Test->AddError(FString::Printf(TEXT("the window never opened for a player 55 deg off (he turned to %.0f deg off)"),
+				FMath::RadiansToDegrees(FMath::Acos(FVector::DotProduct(Boss->GetActorForwardVector().GetSafeNormal2D(),
+					(Player->GetActorLocation() - Boss->GetActorLocation()).GetSafeNormal2D())))));
+			return true;
+		}
+		return false;
+	case 2:
+	{
+		const UAttackDefinition* Current = Player->GetAttacks()->GetCurrent();
+		if (Current && Current->GetName() == TEXT("DA_Riposte"))
+		{
+			W.bRiposteSeen = true;
+			W.bInvulnerable &= Player->GetActions().IsInvulnerable();
+			W.bSecondOffered |= Boss->CanBeFinishedBy(Player);
+		}
+		if (Combatant->State.Health.Current < W.Health && W.BladeToChest < 0.f)
+		{
+			// The strike's hit-stop holds both poses on this frame: measure where the blade is against his chest.
+			W.Damage = W.Health - Combatant->State.Health.Current;
+			const USkeletalMeshComponent* Mesh = Player->GetMesh();
+			const FVector Chest = Boss->GetMesh()->GetBoneLocation(TEXT("spine_03"));
+			const FVector A = Mesh->GetSocketLocation(TEXT("FX_Trail_L_03"));
+			const FVector B = Mesh->GetSocketLocation(TEXT("FX_Trail_L_02"));
+			W.BladeToChest = FMath::PointDistToSegment(Chest, A, B);
+			// In his frame (x forward, y right, z up from his feet), for tuning the stand-off and the strike.
+			const FTransform His(Boss->GetActorRotation(), Boss->GetActorLocation() - FVector(0.f, 0.f, Boss->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()));
+			auto L = [&His](const FVector& P) { const FVector V = His.InverseTransformPosition(P); return FString::Printf(TEXT("(%.0f, %.0f, %.0f)"), V.X, V.Y, V.Z); };
+			UE_LOG(LogTemp, Display, TEXT("FINISHER GEOMETRY %s"), *FString::Printf(TEXT("strike at riposte %.3f s: chest %s, blade %s to %s, player at %s, closest %s"),
+				Player->GetAttacks()->GetElapsed(), *L(Chest), *L(A), *L(B), *L(Player->GetActorLocation()),
+				*L(FMath::ClosestPointOnSegment(Chest, A, B))));
+		}
+		if (Boss->GetStates().GetState() != EBossState::Stagger)
+		{
+			W.StoodAt = World->GetTimeSeconds() - W.StaggerAt;
+			W.Phase = 3;
+		}
+		return false;
+	}
+	default:
+		break;
+	}
+	Test->TestTrue(TEXT("the cue glowed in the window"), W.bGlowSeen);
+	Test->TestFalse(TEXT("and never before it opened"), W.bGlowBeforeWindow);
+	Test->TestTrue(FString::Printf(TEXT("pressed inside the window (%.2f s)"), W.PressedAt), W.PressedAt >= Boss->FinisherFrom - 0.01f && W.PressedAt <= Boss->FinisherUntil);
+	Test->TestTrue(TEXT("the press became the finishing blow"), W.bRiposteSeen);
+	Test->TestTrue(TEXT("invulnerable while it ran"), W.bInvulnerable);
+	Test->TestEqual(TEXT("250 damage"), W.Damage, 250.f, 0.5f);
+	Test->TestTrue(FString::Printf(TEXT("the blade is through his chest at the strike (%.0f cm from it)"), W.BladeToChest), W.BladeToChest >= 0.f && W.BladeToChest <= 45.f);
+	Test->TestFalse(TEXT("one per stagger"), W.bSecondOffered);
+	Test->TestTrue(FString::Printf(TEXT("he stood %.2f s after the stagger began (2.40 + the 0.20 s hit-stop)"), W.StoodAt), W.StoodAt >= 2.45 && W.StoodAt <= 2.80);
+	Test->TestTrue(TEXT("into the pause"), Boss->GetStates().GetState() == EBossState::Neutral);
+	Test->TestEqual(TEXT("no timeouts"), Boss->GetStates().GetTimeoutCount(), W.Timeouts);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeFinisher, "BossTest.Smoke.Finisher", SmokeTestFlags)
+bool FSmokeFinisher::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FFinisherRun(this, MakeShared<FFinisherWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FAfterimageWatch
+{
+	double Start = 0.0;
+	double Pressed = 0.0;
+	int32 Most = 0;
+	bool bDodged = false;
+};
+
+// The evade's afterimages (the feel pass, 2026-11-24): a dodge leaves its fading copies of his pose, all of them at
+// once at their peak, and none are left by the time the evade has ended.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FAfterimageRun, FAutomationTestBase*, Test, TSharedRef<FAfterimageWatch>, Watch);
+bool FAfterimageRun::Update()
+{
+	FAfterimageWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player, boss or controller"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 20.0)
+	{
+		Test->AddError(TEXT("ran out of time"));
+		return true;
+	}
+	if (W.Pressed <= 0.0)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 800.f, 0.f);
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::SpaceBar, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::SpaceBar, IE_Released, 0.f));
+		W.Pressed = Now;
+		return false;
+	}
+	W.bDodged |= Player->GetActions().GetState() == EPlayerState::Dodging;
+	W.Most = FMath::Max(W.Most, Player->GetVisibleAfterimages());
+	if (Now - W.Pressed < 1.2)
+	{
+		return false;
+	}
+	Test->TestTrue(TEXT("the press was an evade"), W.bDodged);
+	Test->TestEqual(TEXT("all four copies showed together at the peak"), W.Most, 4);
+	Test->TestEqual(TEXT("and none are left after it"), Player->GetVisibleAfterimages(), 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeAfterimages, "BossTest.Smoke.Afterimages", SmokeTestFlags)
+bool FSmokeAfterimages::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FAfterimageRun(this, MakeShared<FAfterimageWatch>()));
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }

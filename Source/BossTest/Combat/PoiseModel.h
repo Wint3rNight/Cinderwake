@@ -18,6 +18,11 @@ struct FPoiseModel
 	void BeginStagger();             // bar to 0; poise is ignored until immunity ends
 	void Tick(float Dt);             // decay; stagger end starts immunity
 	bool IsStaggered() const;
+	float StaggerElapsed() const { return IsStaggered() ? StaggerLength - StaggerLeft : 0.f; }
+	float StaggerRemaining() const { return StaggerLeft; }
+	// The running stagger lasts this long in all, from its start (the finishing blow: he stands at 2.40 s). No effect
+	// outside a stagger; never shorter than what has already passed.
+	void SetStaggerLength(float Length);
 	bool IsImmune() const;
 	bool HasDeferredStagger() const;
 	float Current() const;
@@ -28,6 +33,7 @@ private:
 	float Bar = 0.f;
 	float SinceDamage = 0.f;
 	float StaggerLeft = 0.f;
+	float StaggerLength = 0.f;       // this stagger's total
 	float ImmunityLeft = 0.f;
 	bool bDeferred = false;
 };

@@ -149,6 +149,11 @@ bool FBossStatesStaggerEnd::RunTest(const FString& Parameters)
 	M.Request(S::Stagger, P::Stagger, TEXT("poise"));
 	TestFalse(TEXT("completing still checks legality"), M.Complete(S::Attack, TEXT("swing")));
 	TestTrue(TEXT("a stagger ends into evaluate"), M.Complete(S::Evaluate, TEXT("stagger over")));
+	FBossStateMachine Paused = Evaluating();
+	Paused.Request(S::Stagger, P::Stagger, TEXT("poise"));
+	Paused.SetTimeout(3.4f);
+	TestEqual(TEXT("a finisher lengthens the stagger's backstop"), Paused.GetTimeout(), 3.4f);
+	TestTrue(TEXT("or into the commitment pause (the council's run, 2026-11-24)"), Paused.Complete(S::Neutral, TEXT("stagger over")));
 	FBossStateMachine N;
 	N.Reset(4.5f);
 	TestEqual(TEXT("the intro's timeout follows its clip"), N.GetTimeout(), 4.5f);

@@ -151,6 +151,25 @@ void UAttackComponent::ClearQueue()
 	QueuedChainAt = -1.f;
 }
 
+bool UAttackComponent::SwapRecovery(UAttackDefinition* SameClip)
+{
+	if (!CurrentDefinition || !SameClip || SameClip->Clip != CurrentDefinition->Clip)
+	{
+		return false;
+	}
+	const FAttackTiming New = SameClip->GetTiming();
+	if (!FMath::IsNearlyEqual(New.Windup, Timing.Windup, 0.001f) || !FMath::IsNearlyEqual(New.Active, Timing.Active, 0.001f)
+		|| Elapsed > Timing.Windup + Timing.Active)
+	{
+		return false; // a different windup or active window would jump the pose; too late once the swing is over
+	}
+	ClearQueue();
+	CurrentDefinition = SameClip;
+	Timing = New;
+	UE_LOG(LogTemp, Log, TEXT("BossTest: %s swaps to %s at %.2f s"), *GetOwner()->GetName(), *SameClip->GetName(), Elapsed);
+	return true;
+}
+
 bool UAttackComponent::StartQueued()
 {
 	// Asked once: a refusal (a pending stagger, or the follow-up no longer fits) clears the queue for good.
@@ -223,6 +242,7 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	}
 
 	EndAttack();
+	SettleMontage = nullptr; // the new attack's clip takes the slot and blends the settle out
 	CurrentDefinition = Definition;
 	Timing = Definition->GetTiming();
 	if (ExtraHold != 0.f)
@@ -236,6 +256,7 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	InstanceId = AllocateInstanceId();
 	Target = InTarget;
 	bDeliveryDone = false;
+	bStruckTarget = false;
 	CueFired.Init(false, Definition->Cues.Num());
 	CueComponents.SetNum(Definition->Cues.Num());
 	PrevPoints.Reset();
@@ -259,7 +280,7 @@ bool UAttackComponent::StartAttack(UAttackDefinition* Definition, AActor* InTarg
 	return true;
 }
 
-void UAttackComponent::StopAttack(float BlendOut)
+void UAttackComponent::StopAttack(float BlendOut, bool bEased)
 {
 	if (!CurrentDefinition)
 	{
@@ -271,11 +292,51 @@ void UAttackComponent::StopAttack(float BlendOut)
 		{
 			if (Montage && Anim->Montage_IsActive(Montage))
 			{
-				Anim->Montage_Stop(BlendOut, Montage);
+				FMontageBlendSettings Out(BlendOut);
+				Out.Blend.BlendOption = bEased ? EAlphaBlendOption::HermiteCubic : EAlphaBlendOption::Linear;
+				Anim->Montage_StopWithBlendSettings(Out, Montage);
 			}
 		}
 	}
 	EndAttack();
+}
+
+void UAttackComponent::StopSettle(float BlendOut)
+{
+	if (!SettleMontage)
+	{
+		return;
+	}
+	if (USkeletalMeshComponent* Mesh = GetOwnerMesh())
+	{
+		if (UAnimInstance* Anim = Mesh->GetAnimInstance())
+		{
+			if (Anim->Montage_IsActive(SettleMontage))
+			{
+				FMontageBlendSettings Out(BlendOut);
+				Out.Blend.BlendOption = bSettleEased ? EAlphaBlendOption::HermiteCubic : EAlphaBlendOption::Linear;
+				Anim->Montage_StopWithBlendSettings(Out, SettleMontage);
+			}
+		}
+	}
+	SettleMontage = nullptr;
+}
+
+void UAttackComponent::TickSettle(float DeltaTime)
+{
+	// Another clip took the slot (a new attack, a dodge, a hit): the settle is over.
+	USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	UAnimInstance* Anim = Mesh ? Mesh->GetAnimInstance() : nullptr;
+	if (!Anim || !Anim->Montage_IsActive(SettleMontage))
+	{
+		SettleMontage = nullptr;
+		return;
+	}
+	SettleLeft -= DeltaTime; // the owner's clock: hit-stop pauses it too
+	if (SettleLeft <= 0.f)
+	{
+		StopSettle(SettleBlendOut);
+	}
 }
 
 void UAttackComponent::EndAttack()
@@ -421,6 +482,10 @@ FAttackSample UAttackComponent::GetSample() const
 void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	if (SettleMontage)
+	{
+		TickSettle(DeltaTime);
+	}
 	if (!CurrentDefinition)
 	{
 		return;
@@ -497,7 +562,29 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 
 	// No sockets, no sweep: an empty socket name gives the mesh's own transform, which would sweep his feet.
 	const bool bHasWeapon = !CurrentDefinition->SocketStart.IsNone() && !CurrentDefinition->SocketEnd.IsNone();
-	if (bHasWeapon && ActiveOverlap(Timing, Before, Elapsed))
+	if (CurrentDefinition->bStrikesTarget)
+	{
+		// The finishing blow: no sweep, one guaranteed hit on the target as the active window opens (the clip and the
+		// snap put the blade through him there; the riposte smoke test checks it).
+		PrevPoints.Reset();
+		if (!bStruckTarget && Sample.Phase >= EAttackPhase::Active)
+		{
+			bStruckTarget = true;
+			// Land on the exact strike pose: a frame that overshot the active start steps back to it, so the hit-stop
+			// holds the blade where it crosses him (it moves up to 65 cm a frame there).
+			if (Elapsed > Timing.Windup)
+			{
+				Elapsed = Timing.Windup;
+				Pose(EvaluateAttack(Timing, Elapsed));
+			}
+			UCombatantComponent* Victim = Target.IsValid() ? Target->FindComponentByClass<UCombatantComponent>() : nullptr;
+			if (Victim)
+			{
+				ResolveVictims({ Victim });
+			}
+		}
+	}
+	else if (bHasWeapon && ActiveOverlap(Timing, Before, Elapsed))
 	{
 		SweepWeapon();
 	}
@@ -513,7 +600,23 @@ void UAttackComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActo
 		{
 			return;
 		}
-		StopAttack(0.2f);
+		// Free. With a settle the clip plays on through its follow-through (the look only), then blends out; without,
+		// it blends out now, over the attack's own (sized, eased) blend-out.
+		const UAttackDefinition* Def = CurrentDefinition;
+		USkeletalMeshComponent* SettleMesh = GetOwnerMesh();
+		UAnimInstance* SettleAnim = SettleMesh ? SettleMesh->GetAnimInstance() : nullptr;
+		if (Def->SettleTime > 0.f && SettleAnim && Montage && Anim->Montage_IsActive(Montage) && CurrentSpan == EAttackSpan::Main)
+		{
+			SettleMontage = Montage;
+			SettleLeft = Def->SettleTime;
+			SettleBlendOut = Def->BlendOut;
+			bSettleEased = Def->bEaseBlendOut;
+			SettleAnim->Montage_SetPlayRate(Montage, 1.f);
+			SettleAnim->Montage_Resume(Montage);
+			EndAttack(); // the attack is over for the rules; only the montage plays on
+			return;
+		}
+		StopAttack(Def->BlendOut, Def->bEaseBlendOut);
 	}
 }
 
@@ -806,7 +909,17 @@ void UAttackComponent::SweepWeapon()
 		}
 	}
 	PrevPoints = Points;
+	ResolveVictims(Victims);
+}
 
+void UAttackComponent::ResolveVictims(const TArray<UCombatantComponent*>& Victims)
+{
+	USkeletalMeshComponent* Mesh = GetOwnerMesh();
+	const UAttackDefinition* Def = CurrentDefinition;
+	if (!Mesh || !Def)
+	{
+		return;
+	}
 	for (UCombatantComponent* Victim : Victims)
 	{
 		FCombatHitContext Hit;

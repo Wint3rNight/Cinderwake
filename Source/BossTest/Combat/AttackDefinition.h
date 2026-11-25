@@ -91,6 +91,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Blend in on a smooth curve instead of a straight crossfade"))
 	bool bEaseBlendIn = false;
 
+	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Once free, real seconds the clip keeps playing its own follow-through at normal speed before blending out (any action replaces it; the owner can end it). 0 = none"))
+	float SettleTime = 0.f;
+
+	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Seconds it blends back to the owner's own animation when it ends (longer when the clip ends far from idle)"))
+	float BlendOut = 0.2f;
+
+	UPROPERTY(EditAnywhere, Category = "Animation")
+	bool bEaseBlendOut = false;
+
 	UPROPERTY(EditAnywhere, Category = "Animation", meta = (ToolTip = "Clip second the attack starts from (a borrowed clip trimmed at its start); 0 = the clip's start"))
 	float ClipStartAt = 0.f;
 
@@ -240,6 +249,9 @@ public:
 	// ---- Delivery ----
 	UPROPERTY(EditAnywhere, Category = "Damage", meta = (ToolTip = "A guard can't stop it (the Finale's impact, soul attacks)"))
 	bool bUnblockable = false;
+
+	UPROPERTY(EditAnywhere, Category = "Damage", meta = (ToolTip = "No sweep: one guaranteed hit on the attack's target as its active window opens (the finishing blow). The sockets still carry the trail and the hit effect"))
+	bool bStrikesTarget = false;
 
 	UPROPERTY(EditAnywhere, Category = "Delivery")
 	EAttackDelivery Delivery = EAttackDelivery::None;

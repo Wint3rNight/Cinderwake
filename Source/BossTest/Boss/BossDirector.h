@@ -84,7 +84,8 @@ struct FBossDirectorTuning
 	float AngleHysteresis = 5.f;
 	FBossBandWeights ApproachWeights = { 0.f, 0.8f, 1.0f, 1.0f };
 	FBossBandWeights CircleWeights = { 0.8f, 1.0f, 0.5f, 0.f };
-	float StopWeight = 0.3f;            // at commit: stopping after the opener, against each combo at its own weight
+	float StopShare = 0.5f;             // at commit: stopping weighs this times the sum of the opener's valid combos' base
+	                                    // weights, so every opener stops alone about a third of the time (council, 2026-11-24)
 	float CommitPause = 0.25f;          // the commitment cooldown after any action
 	float Breather = 1.0f;              // after every second major (the punish windows, Step 6)
 	int32 MajorsBeforeBreather = 2;
@@ -108,7 +109,8 @@ public:
 	// Every tick: bands (with hysteresis), cooldowns, neutral time, time far away. True when the distance band changed.
 	bool Observe(const FBossPerception& P, bool bNeutral, float Dt);
 	FBossDecision Decide(const FBossPerception& P, FRandomStream& Rng);
-	// At commit: stop after the opener (-1), or one of its valid combos.
+	// At commit: stop after the opener (-1), or one of its valid combos. Stopping weighs StopShare times the valid combos'
+	// base weights (not their repetition-scaled ones, which would cancel Step 7's habits), against each at its scaled weight.
 	int32 RollCombo(int32 Opener, FRandomStream& Rng) const;
 	// Range and angle (and, for an opener, cooldown and its trigger). A follow-up's cooldown was checked at commit.
 	bool IsValidNow(int32 Action, const FBossPerception& P, bool bAsFollowUp) const;
@@ -132,6 +134,7 @@ public:
 	float ComboWeight(int32 Combo) const;             // its weight times the lower of its and its opener's repetition
 
 private:
+	static FBossPerception Touching(FBossPerception P);
 	const FBossOption* Find(int32 Action) const;
 	bool AngleFits(const FBossOption& O) const;
 	float AngleScale(const FBossOption& O) const;

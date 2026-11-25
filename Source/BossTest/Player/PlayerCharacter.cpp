@@ -3,11 +3,14 @@
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequenceBase.h"
+#include "Boss/BossCharacter.h"
 #include "Camera/CameraComponent.h"
 #include "Combat/AttackComponent.h"
 #include "Combat/AttackDefinition.h"
 #include "Combat/CombatantComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/PoseableMeshComponent.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Curves/CurveFloat.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -91,6 +94,7 @@ void APlayerCharacter::BeginPlay()
 	StartLocation = GetActorLocation();
 	StartRotation = GetActorRotation();
 	BaseSocketOffset = Arm->SocketOffset;
+	MakeAfterimagePool();
 	GetCharacterMovement()->MaxWalkSpeed = RunSpeed;
 	Attacks->MontageSlot = MontageSlot;
 
@@ -132,7 +136,11 @@ void APlayerCharacter::BeginPlay()
 		UE_LOG(LogTemp, Error, TEXT("BossTest: %s is missing its Step 4e data (the second heavy); run Docs/tools/setup_player.py"), *GetName());
 	}
 	// The borrowed clips live in the git-ignored /Game/Retargeted: without them these attacks would swing nothing.
-	TArray<const UAttackDefinition*> All = { HeavyAttack, Heavy2Attack, ChargedHeavyAttack, DodgeHeavyAttack, SprintAttack, LightRiseAttack };
+	if (!RiposteAttack)
+	{
+		UE_LOG(LogTemp, Error, TEXT("BossTest: %s is missing its finishing blow; run Docs/tools/setup_player.py"), *GetName());
+	}
+	TArray<const UAttackDefinition*> All = { HeavyAttack, Heavy2Attack, ChargedHeavyAttack, DodgeHeavyAttack, SprintAttack, LightRiseAttack, RiposteAttack };
 	for (const UAttackDefinition* Light : LightAttacks) { All.Add(Light); }
 	for (const UAttackDefinition* Light : DodgeLightAttacks) { All.Add(Light); }
 	for (const UAttackDefinition* Attack : All)
@@ -204,8 +212,15 @@ void APlayerCharacter::Tick(float DeltaSeconds)
 	// Given to the rules before this frame's presses (the attack has already ticked this frame).
 	Frame.bPastActive = Frame.bAttackRunning && Attacks->GetSample().Phase >= EAttackPhase::Recovery;
 	Frame.TimeToFree = Frame.bAttackRunning ? Attacks->GetTimeToFree() : 0.f;
+	const ABossCharacter* Boss = FindBoss();
+	Frame.bRiposteReady = RiposteAttack && Boss && Boss->CanBeFinishedBy(this);
 	Actions.NoteAttack(Frame.bPastActive, Frame.TimeToFree);
 	ReadInput(Frame);
+	// Moving ends an attack's settle (its follow-through): the legs take over (after the Step 6 play).
+	if (Frame.bMoveHeld && Attacks->IsSettling())
+	{
+		Attacks->StopSettle(0.25f);
+	}
 	const bool bHadWindow = Actions.HasPerfectWindow();
 	Execute(Actions.Tick(Frame));
 	if (!bHadWindow && Actions.HasPerfectWindow())
@@ -220,8 +235,9 @@ void APlayerCharacter::Tick(float DeltaSeconds)
 	}
 	SyncCombatant();
 
+	TickRiposteSnap(DeltaSeconds);
 	TickMovement();
-	TickEvadeVisuals();
+	TickEvadeVisuals(DeltaSeconds);
 	TickGuardVisuals();
 	TickChargeEffect();
 	TickCamera();
@@ -290,6 +306,9 @@ void APlayerCharacter::Execute(const FPlayerCommands& Commands)
 		case EPlayerCommand::ChainHeavyTwo:
 			// Its own blend (in its data): out of the slam's crouch the pose travels far.
 			StartAttack(Heavy2Attack ? Heavy2Attack.Get() : HeavyAttack.Get(), ChainedHeavyBlend, true);
+			break;
+		case EPlayerCommand::StartRiposte:
+			StartRiposte();
 			break;
 		case EPlayerCommand::StartLightRise:
 			StartAttack(LightRiseAttack ? LightRiseAttack.Get() : (LightAttacks.IsValidIndex(0) ? LightAttacks[0].Get() : nullptr), LightRiseBlend, true);
@@ -463,6 +482,66 @@ void APlayerCharacter::StartAttack(UAttackDefinition* Definition, float MinBlend
 	Attacks->StartAttack(Definition, Target, BlendIn, bEasedBlend);
 }
 
+ABossCharacter* APlayerCharacter::FindBoss() const
+{
+	// Searched once, then again at most once a second while there's none (a level without him).
+	const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	if (!CachedBoss.IsValid() && Now >= NextBossSearch)
+	{
+		CachedBoss = Cast<ABossCharacter>(UGameplayStatics::GetActorOfClass(this, ABossCharacter::StaticClass()));
+		NextBossSearch = Now + 1.0;
+	}
+	return CachedBoss.Get();
+}
+
+void APlayerCharacter::StartRiposte()
+{
+	ABossCharacter* Boss = FindBoss();
+	if (!RiposteAttack || !Boss || !Boss->BeginFinisher(this))
+	{
+		// Checked this same tick, so this shouldn't happen; with no attack running the rules free him next tick.
+		UE_LOG(LogTemp, Warning, TEXT("BossTest: the finishing blow had no window to start in"));
+		return;
+	}
+	// The snap: over RiposteSnapTime to his fixed spot in front of the boss. The spot is swept from the boss's side
+	// outward, so a wall or pillar in the way stops it short, toward him, never inside anything.
+	const FTransform Spot = Boss->FinisherSpot(this);
+	const UCapsuleComponent* Capsule = GetCapsuleComponent();
+	const float Radius = Capsule->GetScaledCapsuleRadius();
+	const FVector Out = Boss->GetActorForwardVector().GetSafeNormal2D();
+	FVector Near = Boss->GetActorLocation() + Out * (Boss->GetCapsuleComponent()->GetScaledCapsuleRadius() + Radius + 2.f);
+	Near.Z = Spot.GetLocation().Z;
+	FVector To = Spot.GetLocation();
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(RiposteSpot), false, this);
+	Params.AddIgnoredActor(Boss);
+	FHitResult Hit;
+	if (GetWorld()->SweepSingleByChannel(Hit, Near, To, FQuat::Identity, Capsule->GetCollisionObjectType(),
+		FCollisionShape::MakeCapsule(Radius, Capsule->GetScaledCapsuleHalfHeight()), Params))
+	{
+		To = Hit.bStartPenetrating ? GetActorLocation() : Hit.Location;
+	}
+	SnapFrom = GetActorLocation();
+	SnapTo = To;
+	SnapFromYaw = GetActorRotation().Yaw;
+	SnapToYaw = Spot.Rotator().Yaw;
+	SnapLeft = RiposteSnapTime;
+	GetCharacterMovement()->StopMovementImmediately();
+	Attacks->StartAttack(RiposteAttack, Boss, RiposteAttack->BlendIn, RiposteAttack->bEaseBlendIn);
+	SetEvent(TEXT("FINISHER"), 1.5f);
+}
+
+void APlayerCharacter::TickRiposteSnap(float DeltaSeconds)
+{
+	if (SnapLeft <= 0.f)
+	{
+		return;
+	}
+	SnapLeft = FMath::Max(0.f, SnapLeft - DeltaSeconds);
+	const float A = FMath::SmoothStep(0.f, 1.f, 1.f - SnapLeft / FMath::Max(RiposteSnapTime, 0.01f));
+	SetActorLocation(FMath::Lerp(SnapFrom, SnapTo, A), true);
+	SetActorRotation(FRotator(0.f, SnapFromYaw + FMath::FindDeltaAngleDegrees(SnapFromYaw, SnapToYaw) * A, 0.f));
+}
+
 AActor* APlayerCharacter::LungeTarget() const
 {
 	if (AActor* Locked = LockOn->GetTarget())
@@ -536,6 +615,8 @@ void APlayerCharacter::StartDodge(bool bBackstep)
 	}
 	ClipMontage = nullptr; // the evade replaced whatever clip was on the slot
 
+	AfterimagesLeft = Afterimages.Num();
+	AfterimageClock = AfterimageInterval; // the first copy appears where he leaves, this tick
 	const FVector Feet = GetActorLocation() - FVector(0.f, 0.f, GetCapsuleComponent()->GetScaledCapsuleHalfHeight());
 	if (EvadeStartEffect)
 	{
@@ -566,9 +647,10 @@ void APlayerCharacter::StartDodge(bool bBackstep)
 	DodgeMoveId = GetCharacterMovement()->ApplyRootMotionSource(Push);
 }
 
-void APlayerCharacter::TickEvadeVisuals()
+void APlayerCharacter::TickEvadeVisuals(float DeltaSeconds)
 {
 	UAnimInstance* Anim = GetMesh()->GetAnimInstance();
+	TickAfterimages(DeltaSeconds);
 	if (Actions.GetState() == EPlayerState::Dodging)
 	{
 		if (Anim && EvadeMontage && Anim->Montage_IsActive(EvadeMontage))
@@ -580,6 +662,122 @@ void APlayerCharacter::TickEvadeVisuals()
 	}
 	// The evade ended (finished, or an attack, reaction or death took over).
 	EndEvadeVisuals(0.15f);
+}
+
+void APlayerCharacter::MakeAfterimagePool()
+{
+	if (!AfterimageMaterial || !GetMesh()->GetSkeletalMeshAsset() || Afterimages.Num() > 0)
+	{
+		return;
+	}
+	const int32 Slots = GetMesh()->GetNumMaterials();
+	for (int32 i = 0; i < FMath::Clamp(AfterimageCount, 0, 8); ++i)
+	{
+		UPoseableMeshComponent* Copy = NewObject<UPoseableMeshComponent>(this);
+		Copy->SetSkinnedAssetAndUpdate(GetMesh()->GetSkeletalMeshAsset());
+		Copy->SetUsingAbsoluteLocation(true);
+		Copy->SetUsingAbsoluteRotation(true);
+		Copy->SetUsingAbsoluteScale(true);
+		Copy->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Copy->SetCastShadow(false);
+		Copy->SetVisibility(false);
+		Copy->SetupAttachment(GetRootComponent());
+		Copy->RegisterComponent();
+		UMaterialInstanceDynamic* Mat = UMaterialInstanceDynamic::Create(AfterimageMaterial, this);
+		Mat->SetVectorParameterValue(TEXT("Color"), AfterimageColor);
+		for (int32 Slot = 0; Slot < Slots; ++Slot)
+		{
+			Copy->SetMaterial(Slot, Mat);
+		}
+		Afterimages.Add(Copy);
+		AfterimageMaterials.Add(Mat);
+		AfterimageAge.Add(-1.f);
+	}
+}
+
+void APlayerCharacter::SpawnAfterimage()
+{
+	// The oldest copy (or a hidden one) takes his pose where he is now.
+	int32 Pick = INDEX_NONE;
+	for (int32 i = 0; i < Afterimages.Num(); ++i)
+	{
+		if (Pick == INDEX_NONE || AfterimageAge[i] < 0.f || (AfterimageAge[Pick] >= 0.f && AfterimageAge[i] > AfterimageAge[Pick]))
+		{
+			Pick = i;
+			if (AfterimageAge[i] < 0.f)
+			{
+				break;
+			}
+		}
+	}
+	if (Pick == INDEX_NONE)
+	{
+		return;
+	}
+	UPoseableMeshComponent* Copy = Afterimages[Pick];
+	Copy->SetWorldTransform(GetMesh()->GetComponentTransform());
+	Copy->CopyPoseFromSkeletalComponent(GetMesh());
+	Copy->SetVisibility(true);
+	AfterimageMaterials[Pick]->SetScalarParameterValue(TEXT("Opacity"), AfterimageOpacity);
+	AfterimageAge[Pick] = 0.f;
+}
+
+void APlayerCharacter::TickAfterimages(float DeltaSeconds)
+{
+	if (Afterimages.Num() == 0)
+	{
+		return;
+	}
+	if (AfterimagesLeft > 0 && Actions.GetState() == EPlayerState::Dodging)
+	{
+		AfterimageClock += DeltaSeconds;
+		if (AfterimageClock >= AfterimageInterval)
+		{
+			AfterimageClock = 0.f;
+			--AfterimagesLeft;
+			SpawnAfterimage();
+		}
+	}
+	else
+	{
+		AfterimagesLeft = 0; // the evade ended early (an attack or a hit took over): no more copies
+	}
+	for (int32 i = 0; i < Afterimages.Num(); ++i)
+	{
+		if (AfterimageAge[i] < 0.f)
+		{
+			continue;
+		}
+		AfterimageAge[i] += DeltaSeconds;
+		const float Left = 1.f - AfterimageAge[i] / FMath::Max(AfterimageLife, 0.01f);
+		if (Left <= 0.f)
+		{
+			Afterimages[i]->SetVisibility(false);
+			AfterimageAge[i] = -1.f;
+			continue;
+		}
+		AfterimageMaterials[i]->SetScalarParameterValue(TEXT("Opacity"), AfterimageOpacity * Left * Left); // fades fast, then lingers
+	}
+}
+
+void APlayerCharacter::HideAfterimages()
+{
+	for (int32 i = 0; i < Afterimages.Num(); ++i)
+	{
+		Afterimages[i]->SetVisibility(false);
+		AfterimageAge[i] = -1.f;
+	}
+	AfterimagesLeft = 0;
+}
+
+int32 APlayerCharacter::GetVisibleAfterimages() const
+{
+	int32 N = 0;
+	for (const float Age : AfterimageAge)
+	{
+		N += Age >= 0.f ? 1 : 0;
+	}
+	return N;
 }
 
 void APlayerCharacter::EndEvadeVisuals(float BlendOut)
@@ -961,6 +1159,8 @@ void APlayerCharacter::OnHitLanded(const FHitOutcome& Outcome, AActor* Victim)
 void APlayerCharacter::ResetPlayer()
 {
 	Attacks->StopAttack(0.1f);
+	SnapLeft = 0.f;
+	HideAfterimages();
 	EndDodgePush();
 	EndEvadeVisuals(0.1f);
 	SetSprinting(false);

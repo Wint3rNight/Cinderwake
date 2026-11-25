@@ -107,7 +107,14 @@ float FPlayerActions::GetHealProgress() const
 
 bool FPlayerActions::IsInvulnerable() const
 {
-	return (State == EPlayerState::Dodging && StateTime < Tuning.DodgeIFrames) || State == EPlayerState::Knockdown;
+	return (State == EPlayerState::Dodging && StateTime < Tuning.DodgeIFrames) || State == EPlayerState::Knockdown || IsRiposting();
+}
+
+bool FPlayerActions::CouldRiposte() const
+{
+	const bool bCanAct = State == EPlayerState::Free || State == EPlayerState::Guard || State == EPlayerState::Dodging
+		|| (State == EPlayerState::Attacking && !bRiposte);
+	return bCanAct && !Stamina.bExhausted;
 }
 
 void FPlayerActions::Enter(EPlayerState NewState)
@@ -126,6 +133,7 @@ void FPlayerActions::Enter(EPlayerState NewState)
 	}
 	State = NewState;
 	StateTime = 0.f;
+	bRiposte = false; // set again by TryStartRiposte, after it enters the attack
 	if (NewState == EPlayerState::Attacking)
 	{
 		// A new attack: presses until its first sample are early ones.
@@ -176,8 +184,34 @@ bool FPlayerActions::TryStartAttack(float Cost, FPlayerCommands& Out)
 	return true;
 }
 
+bool FPlayerActions::TryStartRiposte(const FPlayerFrame& Frame, FPlayerCommands& Out)
+{
+	if (!Frame.bRiposteReady || Stamina.bExhausted)
+	{
+		return false;
+	}
+	StopSprint(Out);
+	DropGuard(Out);
+	if (State == EPlayerState::Dodging)
+	{
+		Out.Add(EPlayerCommand::EndDodge);
+	}
+	Out.Add(EPlayerCommand::StartRiposte);
+	Line = EAttackLine::Riposte;
+	bChainQueued = false;
+	bChargeable = false;
+	Enter(EPlayerState::Attacking);
+	bRiposte = true;
+	return true;
+}
+
 bool FPlayerActions::TryStartBuffered(const FPlayerFrame& Frame, FPlayerCommands& Out)
 {
+	if ((Buffer.Peek() == EPlayerInput::Light || Buffer.Peek() == EPlayerInput::Heavy) && TryStartRiposte(Frame, Out))
+	{
+		Buffer.Consume();
+		return true;
+	}
 	switch (Buffer.Peek())
 	{
 	case EPlayerInput::Dodge:
@@ -743,6 +777,10 @@ bool FPlayerActions::HasPerfectWindow() const
 
 bool FPlayerActions::TryStartChained(EPlayerInput Input, const FPlayerFrame& Frame, FPlayerCommands& Out)
 {
+	if ((Input == EPlayerInput::Light || Input == EPlayerInput::Heavy) && TryStartRiposte(Frame, Out))
+	{
+		return true;
+	}
 	if (Input == EPlayerInput::Heavy)
 	{
 		// Out of heavy 1, the charged heavy or the slam it's heavy 2 (the rising uppercut), out of anything else heavy 1,

@@ -58,6 +58,12 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Light 1 out of the slam's landing crouch: a longer windup so he stands up first (Step 4d)"))
 	TObjectPtr<UAttackDefinition> LightRiseAttack;
 
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "The finishing blow on his slumped stagger: the charged heavy's crash from its crouch, a guaranteed hit (the council's run, 2026-11-24)"))
+	TObjectPtr<UAttackDefinition> RiposteAttack;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Seconds the finishing blow's snap to its spot in front of him takes"))
+	float RiposteSnapTime = 0.15f;
+
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Attacks", meta = (ToolTip = "Seconds a heavy started from another attack's chain point blends in (eased); a fresh attack uses 0.08"))
 	float ChainedHeavyBlend = 0.15f;
 
@@ -111,8 +117,8 @@ public:
 	float GuardWalkSpeed = 270.f;
 
 	// ---- The evade (dodge and backstep) ----
-	// Each plays a segment of its clip, posed from the dodge's own clock (so it pauses in hit-stop),
-	// with a burst where he leaves and trails while he moves.
+	// Each plays a segment of its clip, posed from the dodge's own clock (so it pauses in hit-stop), and leaves fading
+	// afterimages behind him. (The start burst and the trails stay available; since the feel pass they're unset.)
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade")
 	TObjectPtr<UAnimSequenceBase> DodgeClip;
 
@@ -139,6 +145,26 @@ public:
 
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Where the trails sit, relative to his feet"))
 	FVector EvadeTrailOffset = FVector(0.f, 0.f, 100.f);
+
+	// Afterimages (after the Step 4 play: "afterimages, a few fading copies of his pose behind him, light, like Khazan's
+	// quick dodge"): copies of his pose left where he was, fading out. A fixed pool, made once, so a dodge allocates nothing.
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Translucent, used with skeletal meshes, with Opacity and Color parameters (create_afterimage_material.py). None: no afterimages"))
+	TObjectPtr<UMaterialInterface> AfterimageMaterial;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Copies per evade (the pool's size)"))
+	int32 AfterimageCount = 4;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Seconds between copies, from the evade's start (he covers most of the distance in the first 0.25 s)"))
+	float AfterimageInterval = 0.05f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "Seconds each copy takes to fade out"))
+	float AfterimageLife = 0.30f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade", meta = (ToolTip = "A copy's opacity when it appears"))
+	float AfterimageOpacity = 0.35f;
+
+	UPROPERTY(EditDefaultsOnly, Category = "Player|Evade")
+	FLinearColor AfterimageColor = FLinearColor(0.45f, 0.7f, 1.f);
 
 	// ---- Clips (played on MontageSlot) ----
 	UPROPERTY(EditDefaultsOnly, Category = "Player|Clips")
@@ -211,6 +237,7 @@ public:
 	const UCombatantComponent* GetCombatant() const { return Combatant; }
 	bool IsStaminaFlashing() const;   // a press was just refused (the HUD flashes the stamina bar)
 	UAttackComponent* GetAttacks() const { return Attacks; }
+	int32 GetVisibleAfterimages() const;
 	FString DebugLine() const;
 	FString LastEventText() const { return LastEventTime > 0.f ? LastEvent : FString(); }
 
@@ -218,6 +245,7 @@ public:
 	// back at the start.
 	void ResetPlayer();
 	void AddFragmentForTesting();
+	void SetStaminaForTesting(float Value) { Actions.Stamina.Current = Value; }
 
 protected:
 	UPROPERTY(VisibleAnywhere)
@@ -243,8 +271,12 @@ private:
 	void StartAttack(UAttackDefinition* Definition, float MinBlendIn = 0.f, bool bForceEase = false);
 	void StartDodge(bool bBackstep);
 	void EndDodgePush();
-	void TickEvadeVisuals();
+	void TickEvadeVisuals(float DeltaSeconds);
 	void EndEvadeVisuals(float BlendOut);
+	void MakeAfterimagePool();
+	void SpawnAfterimage();
+	void TickAfterimages(float DeltaSeconds);
+	void HideAfterimages();
 	void SetSprinting(bool bOn);
 	void TickGuardVisuals();
 	void PushBack(float Distance, float Duration);
@@ -260,6 +292,9 @@ private:
 	void StopClip(float BlendOut);
 	void FaceForAction();
 	AActor* LungeTarget() const;
+	class ABossCharacter* FindBoss() const;
+	void StartRiposte();
+	void TickRiposteSnap(float DeltaSeconds);
 	FVector InputDirection() const;
 	void CameraKick(float Amplitude, float Duration);
 	void SetEvent(const FString& Text, float Seconds);
@@ -290,6 +325,16 @@ private:
 	UPROPERTY()
 	TArray<TObjectPtr<UParticleSystemComponent>> EvadeTrails;
 
+	UPROPERTY()
+	TArray<TObjectPtr<class UPoseableMeshComponent>> Afterimages;
+
+	UPROPERTY()
+	TArray<TObjectPtr<class UMaterialInstanceDynamic>> AfterimageMaterials;
+
+	TArray<float> AfterimageAge;    // per copy, seconds since it appeared; below 0 when hidden
+	int32 AfterimagesLeft = 0;      // still to appear in this evade
+	float AfterimageClock = 0.f;    // since the last one appeared
+
 	float EvadeClipStart = 0.f;
 	float EvadeClipEnd = 0.f;
 
@@ -306,4 +351,12 @@ private:
 	float KickDuration = 0.f;
 	FString LastEvent;
 	float LastEventTime = 0.f;
+
+	mutable TWeakObjectPtr<class ABossCharacter> CachedBoss;
+	mutable double NextBossSearch = 0.0;
+	FVector SnapFrom = FVector::ZeroVector;
+	FVector SnapTo = FVector::ZeroVector;
+	float SnapFromYaw = 0.f;
+	float SnapToYaw = 0.f;
+	float SnapLeft = 0.f;           // the finishing blow's snap, gameplay seconds left
 };

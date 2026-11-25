@@ -187,4 +187,30 @@ bool FPoiseHeavyBreaksDeferred::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FPoiseStaggerLengthens, "BossTest.Combat.Poise.StaggerLengthens", EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+bool FPoiseStaggerLengthens::RunTest(const FString& Parameters)
+{
+	// The finishing blow makes the running stagger 2.40 s long in all, counted from its start, wherever it's triggered.
+	FPoiseModel P;
+	P.StaggerDuration = 1.8f;
+	P.SetStaggerLength(2.4f);
+	TestFalse(TEXT("no stagger: nothing happens"), P.IsStaggered());
+	P.BeginStagger();
+	P.Tick(1.25f);
+	TestEqual(TEXT("1.25 s in"), P.StaggerElapsed(), 1.25f, 0.001f);
+	P.SetStaggerLength(2.4f);
+	TestEqual(TEXT("1.15 s left"), P.StaggerRemaining(), 1.15f, 0.001f);
+	P.Tick(1.1f);
+	TestTrue(TEXT("still staggered at 2.35 s"), P.IsStaggered());
+	P.Tick(0.1f);
+	TestTrue(TEXT("over by 2.45 s, immunity from there"), !P.IsStaggered() && P.IsImmune());
+	FPoiseModel Q;
+	Q.StaggerDuration = 1.8f;
+	Q.BeginStagger();
+	Q.Tick(1.f);
+	Q.SetStaggerLength(0.5f);
+	TestTrue(TEXT("never shorter than what has passed"), Q.IsStaggered() && Q.StaggerRemaining() < 0.01f);
+	return true;
+}
+
 #endif
