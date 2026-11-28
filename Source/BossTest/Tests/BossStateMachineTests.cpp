@@ -310,4 +310,22 @@ bool FBossStatesMovement::RunTest(const FString& Parameters)
 	return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBossStatesReading, "BossTest.Boss.States.ReadingBeat", BossStateTestFlags)
+bool FBossStatesReading::RunTest(const FString& Parameters)
+{
+	// Step 7's reading beat: a decision, then the counter (a fresh commitment) or a fresh look if it no longer fits. It holds
+	// only decision priority, so a stagger lands in it, and it times out like every other state.
+	FBossStateMachine M = Evaluating();
+	TestTrue(TEXT("a decision starts the beat"), M.Request(S::Reading, P::Decision, TEXT("reading you")));
+	TestFalse(TEXT("it never ends into a pause or a movement"), FBossStateMachine::IsLegal(S::Reading, S::Neutral) || FBossStateMachine::IsLegal(S::Reading, S::Circle));
+	TestTrue(TEXT("the counter follows as a committed attack"), M.Request(S::Attack, P::CommittedAttack, TEXT("the counter")));
+	FBossStateMachine N = Evaluating();
+	N.Request(S::Reading, P::Decision, TEXT("reading you"));
+	TestTrue(TEXT("a stagger interrupts it"), N.Request(S::Stagger, P::Stagger, TEXT("poise")));
+	FBossStateMachine T = Evaluating();
+	T.Request(S::Reading, P::Decision, TEXT("reading you"));
+	TestTrue(TEXT("it times out back to evaluate"), T.Tick(FBossStateMachine::DefaultTimeout(S::Reading) + 0.1f) && T.GetState() == S::Evaluate);
+	return true;
+}
+
 #endif

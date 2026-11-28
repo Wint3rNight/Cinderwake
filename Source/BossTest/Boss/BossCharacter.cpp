@@ -270,6 +270,7 @@ void ABossCharacter::Tick(float DeltaSeconds)
 			}
 		}
 	}
+	ObservePlayer(ClampAttackStep(DeltaSeconds));
 	if (Player() && Actions.Num() > 0 && Now != EBossState::Intro && Now != EBossState::Paused && Now != EBossState::Dead)
 	{
 		const bool bBandChanged = Director.Observe(Perception(), bMoving || Now == EBossState::Neutral || Now == EBossState::Posture, ClampAttackStep(DeltaSeconds));
@@ -324,6 +325,9 @@ void ABossCharacter::Tick(float DeltaSeconds)
 		break;
 	case EBossState::Posture:
 		TickPosture(DeltaSeconds);
+		break;
+	case EBossState::Reading:
+		TickReading(DeltaSeconds);
 		break;
 	default:
 		break;
@@ -624,6 +628,16 @@ void ABossCharacter::Evaluate()
 		switch (D.Move)
 		{
 		case EBossMove::Attack:
+			if (D.bReadingBeat && ReadingClip)
+			{
+				// A real habit drove this pick: he shows he noticed, then plays it (TickReading).
+				ReadAction = D.Action;
+				ReadWhy = D.Why;
+				ReadLength = ReadingLength;
+				States.Request(EBossState::Reading, EBossPriority::Decision, FString::Printf(TEXT("reading you (%s): %s"), HabitName(D.Habit), *D.Why),
+					ReadingLength + 1.f);
+				break;
+			}
 			StartAction(D.Action, D.Why, EBossPriority::CommittedAttack, -1, -1, true);
 			break;
 		case EBossMove::Turn:
@@ -934,6 +948,13 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 	case EBossState::Posture:
 		EndPostureEffects(); // every exit (an ending, a stagger, death, a reset, a timeout) cleans up
 		break;
+	case EBossState::Reading:
+		if (UAnimInstance* Anim = GetMesh()->GetAnimInstance(); Anim && ClipMontage && Anim->Montage_IsActive(ClipMontage))
+		{
+			Anim->Montage_Stop(0.15f, ClipMontage); // the counter's own blend takes over from the pose
+		}
+		ClipMontage = nullptr;
+		break;
 	case EBossState::Intro:
 		Combatant->State.bImmune = false;
 		FightStartTime = GetWorld()->GetTimeSeconds();
@@ -1068,6 +1089,11 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 		}
 		break;
 	}
+	case EBossState::Reading:
+		StopGlide();
+		PlayClipEased(ReadingClip, ReadingRate, 0.15f, 0.2f);
+		++ReadingsPlayed;
+		break;
 	case EBossState::Paused:
 	case EBossState::Neutral:
 	case EBossState::Turn:
@@ -1089,6 +1115,7 @@ void ABossCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacker)
 		const double Now = GetWorld()->GetTimeSeconds();
 		PlayerHitTimes.RemoveAll([this, Now](double T) { return Now - T > PunishWindow; });
 		PlayerHitTimes.Add(Now); // Punishment Sweep's stand-in trigger (not a perfect guard's poise)
+		bPlayerLandedHit = true; // the analyzer's hit and run
 		// A hit ends his pause (never below its 0.25 s floor) or any movement (the punish windows and QA, Step 6).
 		const EBossState S = States.GetState();
 		if (Actions.Num() > 0 && !Outcome.bKilled && Outcome.Poise == EPoiseOutcome::None)
@@ -1108,6 +1135,10 @@ void ABossCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacker)
 			{
 				Director.NoteBeatBroken();
 				States.Complete(EBossState::Evaluate, TEXT("hit ends the movement"));
+			}
+			else if (S == EBossState::Reading)
+			{
+				ReadLength = FMath::Min(ReadLength, States.GetStateTime()); // hit while reading you: he answers at once
 			}
 		}
 	}
@@ -1151,6 +1182,7 @@ void ABossCharacter::InitDirector()
 		O.Weights = { A.Weights.Close, A.Weights.Medium, A.Weights.Far, A.Weights.Extreme };
 		O.Cooldown = A.Cooldown;
 		O.bNeedsPunishTrigger = A.bNeedsPunishTrigger;
+		O.Habits = A.Counters.Mask();
 	}
 	auto IndexOf = [this](FName Name) { return Actions.IndexOfByPredicate([Name](const FBossAction& A) { return A.Name == Name; }); };
 	TArray<FBossComboOption> ComboOptions;
@@ -1166,6 +1198,7 @@ void ABossCharacter::InitDirector()
 		C.bNeedsFreshBeat = Combo.bNeedsFreshBeat;
 		C.bNeedsSeen = Combo.bNeedsSeen;
 		C.Majors = Combo.Majors;
+		C.Habits = Combo.Counters.Mask();
 		bool bResolved = C.Opener != INDEX_NONE;
 		for (const FBossComboLink& Link : Combo.FollowUps)
 		{
@@ -1188,6 +1221,7 @@ void ABossCharacter::InitDirector()
 	Tuning.Breather = Breather;
 	Tuning.StopShare = ComboStopShare;
 	Director.Init(MoveTemp(Options), MoveTemp(ComboOptions), Tuning);
+	Analyzer.Init(FAnalyzerTuning());
 }
 
 FBossPerception ABossCharacter::Perception() const
@@ -1196,7 +1230,9 @@ FBossPerception ABossCharacter::Perception() const
 	P.EdgeCm = EdgeDistanceToPlayer();
 	P.AngleDeg = AngleToPlayer();
 	P.bPlayerDown = PlayerDown();
-	P.bPunishTrigger = PunishTriggered();
+	P.bPunishTrigger = PunishReady();
+	P.bAnswerHeal = Analyzer.IsHealingSeen();
+	P.Habits = bHabitOverride ? HabitOverride : Analyzer.GetSnapshot();
 	return P;
 }
 
@@ -1231,6 +1267,68 @@ bool ABossCharacter::PunishTriggered() const
 		Recent += Now - T <= PunishWindow ? 1 : 0;
 	}
 	return Recent >= PunishHits;
+}
+
+bool ABossCharacter::PunishReady() const
+{
+	return PunishTriggered() || Analyzer.GetSnapshot().Get(EBossHabit::Attacking) >= PunishHabit;
+}
+
+void ABossCharacter::ObservePlayer(float Dt)
+{
+	// What he can see of you, each frame. The analyzer applies it a quarter second late; it never sees a button.
+	const APlayerCharacter* P = Cast<APlayerCharacter>(Player());
+	if (!P)
+	{
+		return;
+	}
+	const EPlayerState PS = P->GetActions().GetState();
+	const float StateTime = P->GetActions().GetStateTime();
+	const bool bRestarted = static_cast<uint8>(PS) != LastSeenState || StateTime < LastPlayerStateTime; // a chained dodge or hit
+	const EBossState S = States.GetState();
+	FPlayerObservation Obs;
+	Obs.Dt = Dt;
+	Obs.EdgeCm = EdgeDistanceToPlayer();
+	const FVector To = P->GetActorLocation() - GetActorLocation();
+	const FVector V = P->GetVelocity();
+	Obs.ToPlayer = FVector2D(To.X, To.Y);
+	Obs.PlayerVelocity = FVector2D(V.X, V.Y);
+	Obs.bBossNeutral = S == EBossState::Evaluate || S == EBossState::Neutral || S == EBossState::Approach || S == EBossState::Circle
+		|| S == EBossState::Reposition || S == EBossState::Turn || S == EBossState::Posture || S == EBossState::Reading;
+	Obs.bDodgeStarted = PS == EPlayerState::Dodging && bRestarted;
+	Obs.bAttackStarted = PS == EPlayerState::Attacking && bRestarted;
+	Obs.bHealing = PS == EPlayerState::Healing;
+	Obs.bLandedHit = bPlayerLandedHit;
+	bPlayerLandedHit = false;
+	LastSeenState = static_cast<uint8>(PS);
+	LastPlayerStateTime = StateTime;
+	Analyzer.Observe(Obs);
+
+	// The heal response (section 11): the moment he sees a heal, a movement ends and the next decision answers it. His pause
+	// and his attacks run on: healing in a real opening stays safe.
+	const bool bHealSeen = Analyzer.IsHealingSeen();
+	if (bHealSeen && !bHealWasSeen && bAIEnabled && Actions.Num() > 0
+		&& (S == EBossState::Approach || S == EBossState::Circle || S == EBossState::Reposition || S == EBossState::Turn))
+	{
+		States.Complete(EBossState::Evaluate, TEXT("a heal seen: he answers it"));
+	}
+	bHealWasSeen = bHealSeen;
+}
+
+void ABossCharacter::TickReading(float DeltaSeconds)
+{
+	FaceTarget(DeltaSeconds);
+	if (States.GetStateTime() < ReadLength)
+	{
+		return;
+	}
+	// The counter, if it still fits; otherwise a fresh look (you moved while he was reading you).
+	if (!PlayerDown() && Director.IsValidNow(ReadAction, Perception(), false)
+		&& StartAction(ReadAction, TEXT("after reading you: ") + ReadWhy, EBossPriority::CommittedAttack, -1, -1, true))
+	{
+		return;
+	}
+	States.Complete(EBossState::Evaluate, TEXT("the read no longer fits"));
 }
 
 void ABossCharacter::OnOwnSweep(const FHitOutcome& Outcome, AActor* Victim, uint32 InstanceId)
@@ -1268,16 +1366,18 @@ bool ABossCharacter::StartAction(int32 Index, const FString& Reason, EBossPriori
 	auto AddAction = [this, &NewPlan](int32 ActionIndex, float ChainIntoRecovery, int32 Forced, UAttackDefinition* Own = nullptr) -> int32
 	{
 		const FBossAction& A = Actions[ActionIndex];
+		// A branch that answers one of your habits is likelier (Double Execution's delayed branch against a dodger).
+		auto Chance = [this](const FBossActionVariant& V) { return FMath::Max(0.f, V.Chance) * HabitScale(V.Counters.Mask(), Analyzer.GetSnapshot(), FHabitCaps()); };
 		float Total = 0.f;
 		for (const FBossActionVariant& V : A.Variants)
 		{
-			Total += FMath::Max(0.f, V.Chance);
+			Total += Chance(V);
 		}
 		float Roll = Rng.FRand() * Total;
 		int32 Pick = A.Variants.Num() - 1;
 		for (int32 i = 0; i < A.Variants.Num(); ++i)
 		{
-			Roll -= FMath::Max(0.f, A.Variants[i].Chance);
+			Roll -= Chance(A.Variants[i]);
 			if (Roll <= 0.f)
 			{
 				Pick = i;
@@ -1500,8 +1600,12 @@ TArray<FString> ABossCharacter::DebugLines() const
 			ComboNames.IsValidIndex(CurrentCombo) ? *FString::Printf(TEXT(" (combo %s)"), *ComboNames[CurrentCombo].ToString()) : TEXT(""),
 			Bands[static_cast<int32>(Director.GetBand())], Angles[static_cast<int32>(Director.GetAngleBand())],
 			Director.PursuitActive() ? TEXT(", PURSUING") : TEXT(""), *GetSelectedActionName().ToString(),
-			PunishTriggered() ? TEXT("  [punish ready]") : TEXT("")));
+			PunishReady() ? TEXT("  [punish ready]") : TEXT("")));
 		Lines.Add(FString::Printf(TEXT("  last decision: %s"), *LastWhy.Left(110)));
+		const FHabitSnapshot& H = Analyzer.GetSnapshot();
+		Lines.Add(FString::Printf(TEXT("  habits: dodging %.2f  attacking %.2f  keeping away %.2f  circling %.2f  healing far %.2f  hit and run %.2f%s"),
+			H.Get(EBossHabit::Dodging), H.Get(EBossHabit::Attacking), H.Get(EBossHabit::Disengaged), H.Get(EBossHabit::Circling),
+			H.Get(EBossHabit::HealingAtRange), H.Get(EBossHabit::HitAndRun), Analyzer.IsHealingSeen() ? TEXT("  [heal seen]") : TEXT("")));
 	}
 
 	if (const UAttackDefinition* Def = Attacks->GetCurrent())
@@ -1624,6 +1728,12 @@ void ABossCharacter::ResetBoss()
 	LastAction = -1;
 	CurrentMove = EBossMove::Wait;
 	Director.Reset(); // bands, cooldowns, history: a retry starts clean
+	Analyzer.Reset(); // and he forgets your habits
+	bPlayerLandedHit = false;
+	bHealWasSeen = false;
+	LastSeenState = 0;
+	LastPlayerStateTime = 0.f;
+	ReadAction = -1;
 	LastStaggerTime = -1.0;
 	bKeepCircle = false;
 	bFinisherTaken = false;

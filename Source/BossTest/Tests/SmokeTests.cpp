@@ -2617,4 +2617,144 @@ bool FSmokePosture::RunTest(const FString& Parameters)
 	return true;
 }
 
+// ---- Step 7, played live: he reads your habits ----
+
+struct FHabitWatch
+{
+	double Start = 0.0;
+	double PhaseStart = 0.0;
+	double NextPress = 0.0;
+	int32 Phase = 0;            // 0 real dodges, 1 a heal while he moves, 2 his answer, 3 a forced habit and the beat
+	int32 Timeouts = 0;
+	int32 ReadingsAtStart = 0;
+	float MaxDodging = 0.f;
+	bool bKeyDown = false;
+	bool bAnswered = false;
+	bool bSawReading = false;
+	bool bCountered = false;
+	EBossState Last = EBossState::Intro;
+};
+
+// Real dodges build the dodging habit (chained re-dodges included); a heal he sees while he's moving ends the movement and
+// gets an answer; with a keeping-away habit and you far in front of him, he plays the reading beat, then his gap closer.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FHabitsAreRead, FAutomationTestBase*, Test, TSharedRef<FHabitWatch>, Watch);
+bool FHabitsAreRead::Update()
+{
+	FHabitWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = W.PhaseStart = Now;
+		W.Timeouts = Boss->GetStates().GetTimeoutCount();
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+	}
+	Player->SetStaminaForTesting(150.f);
+	auto Key = [PC](const FKey& K, bool bDown) { PC->InputKey(FInputKeyEventArgs::CreateSimulated(K, bDown ? IE_Pressed : IE_Released, bDown ? 1.f : 0.f)); };
+	const EBossState S = Boss->GetStates().GetState();
+	auto Next = [&W, Now](int32 Phase) { W.Phase = Phase; W.PhaseStart = Now; W.NextPress = 0.0; };
+	switch (W.Phase)
+	{
+	case 0: // a dodge every half second, 2.5 m in front of him
+		if (W.bKeyDown)
+		{
+			Key(EKeys::SpaceBar, false);
+			W.bKeyDown = false;
+		}
+		else if (Now >= W.NextPress)
+		{
+			PlaceSmokePlayer(Player, Boss, 250.f, 0.f);
+			Key(EKeys::SpaceBar, true);
+			W.bKeyDown = true;
+			W.NextPress = Now + 0.5;
+		}
+		W.MaxDodging = FMath::Max(W.MaxDodging, Boss->GetAnalyzer().GetSnapshot().Get(EBossHabit::Dodging));
+		if (Now - W.PhaseStart > 6.0)
+		{
+			Next(1);
+		}
+		break;
+	case 1: // at Medium, wait for a movement, then heal
+		if (Now >= W.NextPress && S != EBossState::Attack)
+		{
+			PlaceSmokePlayer(Player, Boss, 450.f, 0.f);
+			W.NextPress = Now + 3.0;
+		}
+		if (Player->GetActions().GetState() == EPlayerState::Free && Player->GetActions().GetHealCharges() > 0
+			&& (S == EBossState::Approach || S == EBossState::Circle || S == EBossState::Reposition))
+		{
+			Key(EKeys::E, true);
+			W.bKeyDown = true;
+			Next(2);
+		}
+		else if (Now - W.PhaseStart > 30.0)
+		{
+			Test->AddError(TEXT("he never moved while a heal was possible"));
+			return true;
+		}
+		break;
+	case 2: // the answer: the movement cut short, or his next decision answering the heal
+		if (W.bKeyDown)
+		{
+			Key(EKeys::E, false);
+			W.bKeyDown = false;
+		}
+		for (const FBossRequestRecord& R : Boss->GetStates().GetHistory())
+		{
+			W.bAnswered |= R.Reason.Contains(TEXT("a heal seen")) || R.Reason.Contains(TEXT("answering a heal"));
+		}
+		if (W.bAnswered || Now - W.PhaseStart > 1.5)
+		{
+			FHabitSnapshot Away;
+			Away.Set(EBossHabit::Disengaged, 1.f);
+			Boss->OverrideHabitsForTesting(Away);
+			W.ReadingsAtStart = Boss->GetReadingsPlayed();
+			Next(3);
+		}
+		break;
+	default: // you far in front, keeping away as a habit
+		if (!W.bSawReading && Now >= W.NextPress && S != EBossState::Attack)
+		{
+			PlaceSmokePlayer(Player, Boss, 800.f, 0.f);
+			W.NextPress = Now + 3.0;
+		}
+		W.bSawReading |= S == EBossState::Reading;
+		if (W.Last == EBossState::Reading && S != EBossState::Reading)
+		{
+			W.bCountered |= S == EBossState::Attack;
+		}
+		W.Last = S;
+		if (!W.bCountered && Now - W.PhaseStart < 20.0)
+		{
+			return false;
+		}
+		Test->TestTrue(FString::Printf(TEXT("real dodges built the habit (%.2f)"), W.MaxDodging), W.MaxDodging >= 0.6f);
+		Test->TestTrue(TEXT("a heal he saw while moving got an answer"), W.bAnswered);
+		Test->TestTrue(TEXT("keeping away: a reading beat"), W.bSawReading && Boss->GetReadingsPlayed() > W.ReadingsAtStart);
+		Test->TestTrue(TEXT("then the counter"), W.bCountered);
+		Test->TestEqual(TEXT("no state timed out"), Boss->GetStates().GetTimeoutCount(), W.Timeouts);
+		return true;
+	}
+	return false;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeHabitsAreRead, "BossTest.Smoke.HabitsAreRead", SmokeTestFlags)
+bool FSmokeHabitsAreRead::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FHabitsAreRead(this, MakeShared<FHabitWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
 #endif

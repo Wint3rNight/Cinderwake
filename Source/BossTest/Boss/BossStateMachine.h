@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 
-enum class EBossState : uint8 { Intro, Evaluate, Approach, Turn, Neutral, Attack, Stagger, Paused, Dead, CastBroken, Circle, Reposition, Posture };
+enum class EBossState : uint8 { Intro, Evaluate, Approach, Turn, Neutral, Attack, Stagger, Paused, Dead, CastBroken, Circle, Reposition, Posture, Reading };
 
 // Higher wins. A request needs at least the priority his current state holds.
 enum class EBossPriority : uint8 { Decision, Recovery, CommittedAttack, Stagger, Scripted, Transformation, Death };

@@ -438,7 +438,7 @@ bool FDirectorFallbacks::RunTest(const FString& Parameters)
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorPursuit, "BossTest.Boss.Director.PursuitAfterFour", DirectorTestFlags)
 bool FDirectorPursuit::RunTest(const FString& Parameters)
 {
-	// Until the analyzer (Step 7), pursuit glide starts after 4 s continuously in Far or Extreme.
+	// Pursuit glide starts after 4 s continuously in Far or Extreme (a keeping-away habit starts it sooner: HabitStartsPursuit).
 	FBossDirector D = Make();
 	D.Observe(See(900.f), true, 3.9f);
 	TestFalse(TEXT("3.9 s far: not yet"), D.PursuitActive());
@@ -715,6 +715,163 @@ bool FDirectorPostureRule::RunTest(const FString& Parameters)
 	TestFalse(TEXT("at most once a minute"), ShouldPosture(X, R));
 	X = In; X.Roll = 0.6f;
 	TestFalse(TEXT("only half the time"), ShouldPosture(X, R));
+	return true;
+}
+
+// ---- Step 7: habits ----
+
+namespace
+{
+	// The real data's tags (setup_boss.py): delayed attacks answer dodging and hit and run, Punishment Sweep attacking,
+	// Reverse Sweep circling, the gap closers keeping away and heals at range, Soul Mark keeping away.
+	TArray<FBossOption> TaggedPhaseOne()
+	{
+		TArray<FBossOption> O = PhaseOne();
+		O[Delayed].Habits = HabitBit(EBossHabit::Dodging) | HabitBit(EBossHabit::HitAndRun);
+		O[Punish].Habits = HabitBit(EBossHabit::Attacking);
+		O[Reverse].Habits = HabitBit(EBossHabit::Circling);
+		O[Judgment].Habits = HabitBit(EBossHabit::Disengaged) | HabitBit(EBossHabit::HealingAtRange);
+		O[SoulMark].Habits = HabitBit(EBossHabit::Disengaged);
+		O[Advance].Habits = HabitBit(EBossHabit::Disengaged) | HabitBit(EBossHabit::HealingAtRange);
+		return O;
+	}
+
+	FBossPerception SeeWith(float Edge, EBossHabit H, float Score, float Angle = 0.f)
+	{
+		FBossPerception P = See(Edge, Angle);
+		P.Habits.Set(H, Score);
+		return P;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorHabitCounter, "BossTest.Boss.Director.HabitRaisesItsCounter", DirectorTestFlags)
+bool FDirectorHabitCounter::RunTest(const FString& Parameters)
+{
+	// Section 10: Score = W(band) x M(habit) x M(repetition). A full dodging habit takes Delayed Execution from 0.5 to 0.8 at
+	// Close, so it comes out more, but it never becomes certain.
+	FBossDirector D;
+	D.Init(TaggedPhaseOne(), {}, FBossDirectorTuning());
+	D.Observe(See(150.f), true, 0.1f);
+	const float Plain = Picks(D, See(150.f), 6000).FindRef(Delayed) / 6000.f;
+	const FBossPerception Dodger = SeeWith(150.f, EBossHabit::Dodging, 1.f);
+	D.Observe(Dodger, true, 0.1f);
+	const float Raised = Picks(D, Dodger, 6000).FindRef(Delayed) / 6000.f;
+	TestTrue(FString::Printf(TEXT("no habit: about 0.5/5.25 (%.3f)"), Plain), FMath::Abs(Plain - 0.5f / 5.25f) < 0.015f);
+	TestTrue(FString::Printf(TEXT("a dodger: about 0.8/5.55 (%.3f)"), Raised), FMath::Abs(Raised - 0.8f / 5.55f) < 0.015f);
+	const FBossPerception Circler = SeeWith(150.f, EBossHabit::Circling, 1.f);
+	const float Swept = Picks(D, Circler, 6000).FindRef(Reverse) / 6000.f;
+	TestTrue(FString::Printf(TEXT("a circler: Reverse Sweep about 1.12/5.57 (%.3f)"), Swept), FMath::Abs(Swept - 1.12f / 5.57f) < 0.015f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorReadingBeat, "BossTest.Boss.Director.ReadingBeatOnARealHabit", DirectorTestFlags)
+bool FDirectorReadingBeat::RunTest(const FString& Parameters)
+{
+	// The beat comes when a habit at 0.6 or more drove the pick, at most once per habit every 20 s; never for a heal answer
+	// or a pinned action. Only Delayed Execution scores here, so every decision picks it.
+	TArray<FBossOption> Only = { TaggedPhaseOne()[Delayed] };
+	FBossDirectorTuning T;
+	T.CircleWeights = {};
+	T.RepositionWeights = {};
+	FRandomStream Rng(3);
+	FBossDirector D;
+	D.Init(Only, {}, T);
+	const FBossPerception Dodger = SeeWith(150.f, EBossHabit::Dodging, 0.8f);
+	D.Observe(Dodger, true, 0.1f);
+	const FBossDecision First = D.Decide(Dodger, Rng);
+	TestTrue(TEXT("a dodger, Delayed Execution: he reads it first"), First.Move == EBossMove::Attack && First.Action == Delayed && First.bReadingBeat);
+	TestEqual(TEXT("and dodging drove it"), First.Habit, static_cast<int32>(EBossHabit::Dodging));
+	TestFalse(TEXT("right after: he counters without announcing it"), D.Decide(Dodger, Rng).bReadingBeat);
+	D.Observe(Dodger, true, 19.f);
+	TestFalse(TEXT("19 s later: still not"), D.Decide(Dodger, Rng).bReadingBeat);
+	D.Observe(Dodger, true, 1.1f);
+	TestTrue(TEXT("20 s later: again"), D.Decide(Dodger, Rng).bReadingBeat);
+
+	FBossDirector Mild;
+	Mild.Init(Only, {}, T);
+	const FBossPerception Some = SeeWith(150.f, EBossHabit::Dodging, 0.5f);
+	Mild.Observe(Some, true, 0.1f);
+	const FBossDecision M = Mild.Decide(Some, Rng);
+	TestTrue(TEXT("a dodging score of 0.5 raises the counter (x1.3)..."), FMath::IsNearlyEqual(M.HabitModifier, 1.3f, 0.001f));
+	TestFalse(TEXT("...but isn't a habit worth a beat"), M.bReadingBeat);
+
+	FBossDirector Heal;
+	Heal.Init(Only, {}, T);
+	FBossPerception Healing = Dodger;
+	Healing.bAnswerHeal = true;
+	Heal.Observe(Healing, true, 0.1f);
+	TestFalse(TEXT("answering a heal: no beat"), Heal.Decide(Healing, Rng).bReadingBeat);
+
+	FBossDirector Pinned;
+	Pinned.Init(Only, {}, T);
+	Pinned.PinAction(Delayed);
+	Pinned.Observe(Dodger, true, 0.1f);
+	TestFalse(TEXT("a pinned action: no beat"), Pinned.Decide(Dodger, Rng).bReadingBeat);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorHabitCombos, "BossTest.Boss.Director.HabitRaisesItsCombo", DirectorTestFlags)
+bool FDirectorHabitCombos::RunTest(const FString& Parameters)
+{
+	// A combo whose purpose matches a habit gets its modifier (B, swing into Delayed Execution, is for panic dodging);
+	// stopping still weighs the base weights, so the habit doesn't shrink it.
+	TArray<FBossComboOption> Combos = CombosAF();
+	Combos[1].Habits = HabitBit(EBossHabit::Dodging);
+	FBossDirector D;
+	D.Init(TaggedPhaseOne(), MoveTemp(Combos), FBossDirectorTuning());
+	D.Observe(SeeWith(150.f, EBossHabit::Dodging, 1.f), true, 0.1f);
+	FRandomStream Rng(11);
+	TMap<int32, int32> R;
+	for (int32 i = 0; i < 6000; ++i)
+	{
+		R.FindOrAdd(D.RollCombo(Swing, Rng))++;
+	}
+	const float B = R.FindRef(1) / 6000.f;
+	const float Stop = R.FindRef(-1) / 6000.f;
+	TestTrue(FString::Printf(TEXT("B about 1.6/5.1 (%.3f)"), B), FMath::Abs(B - 1.6f / 5.1f) < 0.02f);
+	TestTrue(FString::Printf(TEXT("stopping about 1.5/5.1 (%.3f)"), Stop), FMath::Abs(Stop - 1.5f / 5.1f) < 0.02f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorHabitPursuit, "BossTest.Boss.Director.HabitStartsPursuit", DirectorTestFlags)
+bool FDirectorHabitPursuit::RunTest(const FString& Parameters)
+{
+	// Keeping away at 0.6 or more starts the chase the moment you're in Far or Extreme, without the 4 s wait.
+	FBossDirector D = Make();
+	D.Observe(SeeWith(900.f, EBossHabit::Disengaged, 0.5f), true, 0.1f);
+	TestFalse(TEXT("keeping away at 0.5: not yet"), D.PursuitActive());
+	D.Observe(SeeWith(900.f, EBossHabit::Disengaged, 0.7f), true, 0.1f);
+	TestTrue(TEXT("at 0.7, far away: at once"), D.PursuitActive());
+	D.Observe(SeeWith(500.f, EBossHabit::Disengaged, 0.7f), true, 0.1f);
+	TestFalse(TEXT("back in medium: over"), D.PursuitActive());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FDirectorHealAnswer, "BossTest.Boss.Director.HealGetsAnAnswer", DirectorTestFlags)
+bool FDirectorHealAnswer::RunTest(const FString& Parameters)
+{
+	// Section 11: a heal he can see gets an attack (close and medium), and from beyond 8 m an attack or a chase. Never a
+	// circle, a step back or a wait.
+	auto Healing = [](float Edge)
+	{
+		FBossPerception P = See(Edge);
+		P.bAnswerHeal = true;
+		return P;
+	};
+	FBossDirector Close = Make();
+	Close.Observe(Healing(150.f), true, 0.1f);
+	const TMap<int32, int32> C = Picks(Close, Healing(150.f), 2000);
+	TestFalse(TEXT("close: no circle, step back or approach"), C.Contains(CircleKey) || C.Contains(RepositionKey) || C.Contains(ApproachKey));
+	FBossDirector Medium = Make();
+	Medium.Observe(Healing(500.f), true, 0.1f);
+	const TMap<int32, int32> M = Picks(Medium, Healing(500.f), 2000);
+	TestFalse(TEXT("5 m: attacks only"), M.Contains(CircleKey) || M.Contains(ApproachKey));
+	TestTrue(TEXT("including the gap closers"), M.Contains(Advance) && M.Contains(Judgment));
+	FBossDirector Far = Make();
+	Far.Observe(Healing(900.f), true, 0.1f);
+	const TMap<int32, int32> F = Picks(Far, Healing(900.f), 2000);
+	TestTrue(TEXT("9 m: the Advance, Soul Mark or a chase"), F.Contains(Advance) && F.Contains(SoulMark) && F.Contains(ApproachKey));
+	TestFalse(TEXT("never a circle"), F.Contains(CircleKey));
 	return true;
 }
 

@@ -27,6 +27,39 @@ enum class EBossActionAngle : uint8
 	Any
 };
 
+// Which of the player's habits something answers (Step 7, spec section 10's habit table). The analyzer's score for each
+// raises its weight, up to the habit's cap; only the largest counts.
+USTRUCT()
+struct FBossHabitCounters
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, Category = "Habits", meta = (ToolTip = "Frequent dodging (x1.6)"))
+	bool bDodging = false;
+
+	UPROPERTY(EditAnywhere, Category = "Habits", meta = (ToolTip = "Attacking into his neutral (x1.5)"))
+	bool bAttacking = false;
+
+	UPROPERTY(EditAnywhere, Category = "Habits", meta = (ToolTip = "Keeping away: Far or beyond and running (x1.5)"))
+	bool bKeepingAway = false;
+
+	UPROPERTY(EditAnywhere, Category = "Habits", meta = (ToolTip = "Circling him (x1.4)"))
+	bool bCircling = false;
+
+	UPROPERTY(EditAnywhere, Category = "Habits", meta = (ToolTip = "Healing at range (x1.3)"))
+	bool bHealingAtRange = false;
+
+	UPROPERTY(EditAnywhere, Category = "Habits", meta = (ToolTip = "Hit and run (x1.3: mild, it's a legitimate style)"))
+	bool bHitAndRun = false;
+
+	uint8 Mask() const
+	{
+		return (bDodging ? HabitBit(EBossHabit::Dodging) : 0) | (bAttacking ? HabitBit(EBossHabit::Attacking) : 0)
+			| (bKeepingAway ? HabitBit(EBossHabit::Disengaged) : 0) | (bCircling ? HabitBit(EBossHabit::Circling) : 0)
+			| (bHealingAtRange ? HabitBit(EBossHabit::HealingAtRange) : 0) | (bHitAndRun ? HabitBit(EBossHabit::HitAndRun) : 0);
+	}
+};
+
 // One way an action can play: a single attack or a sequence (Double Execution's hits, the Advance's dash and swing).
 USTRUCT()
 struct FBossActionVariant
@@ -47,6 +80,9 @@ struct FBossActionVariant
 
 	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "A branch that ends the action (Double Execution's stop): no combo follows it"))
 	bool bEndsAlone = false;
+
+	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Habits this branch answers: its chance takes their modifier (Double Execution's fast branch: attacking; delayed: dodging, hit and run)"))
+	FBossHabitCounters Counters;
 };
 
 // Section 10's weight table row for one action (Step 6).
@@ -113,6 +149,9 @@ struct FBossCombo
 
 	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "How many majors it counts as for the breather"))
 	int32 Majors = 1;
+
+	UPROPERTY(EditAnywhere, Category = "Combo", meta = (ToolTip = "The habit its purpose answers: its weight takes the modifier at commit"))
+	FBossHabitCounters Counters;
 };
 
 // One of his actions as the director sees it (Step 5, weights by band since Step 6).
@@ -145,8 +184,11 @@ struct FBossAction
 	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Seconds before it can be picked again"))
 	float Cooldown = 0.f;
 
-	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Only while the player keeps landing hits on him (Punishment Sweep)"))
+	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Only while the player keeps landing hits on him, or attacks into his neutral as a habit (Punishment Sweep)"))
 	bool bNeedsPunishTrigger = false;
+
+	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "Habits it answers: its weight takes their modifier (Step 7)"))
+	FBossHabitCounters Counters;
 
 	UPROPERTY(EditAnywhere, Category = "Action", meta = (ToolTip = "A cast: poise damage during the first step's windup that breaks it (Soul Mark 70). 0 = not a cast"))
 	float CastBreakThreshold = 0.f;
@@ -230,6 +272,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Boss|Attacks", meta = (ToolTip = "... within this many seconds"))
 	float PunishWindow = 4.f;
 
+	UPROPERTY(EditAnywhere, Category = "Boss|Attacks", meta = (ToolTip = "Punishment Sweep is also ready while attacking into his neutral scores this much (the analyzer, Step 7)"))
+	float PunishHabit = 0.5f;
+
 	UPROPERTY(EditAnywhere, Category = "Boss|Attacks", meta = (ToolTip = "A broken cast's recoil (spec section 9)"))
 	float CastBrokenTime = 0.8f;
 
@@ -298,6 +343,15 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Boss|Aura", meta = (ToolTip = "Seconds of rouse when it ends: it is the commitment pause, not extra"))
 	float PostureRouse = 0.30f;
 
+	// ---- The reading beat (Step 7): a habit drove his pick, so he shows he noticed, then counters ----
+	UPROPERTY(EditDefaultsOnly, Category = "Boss|Reading", meta = (ToolTip = "Ultimate_Targeting: he sizes you up, a pose none of his attacks starts from"))
+	TObjectPtr<UAnimSequenceBase> ReadingClip;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Reading", meta = (ToolTip = "Seconds of the beat (section 10: 0.6-1.0). A hit cuts it short: he answers at once"))
+	float ReadingLength = 0.7f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Reading", meta = (ToolTip = "The clip's play rate (Ultimate_Targeting's 0.87 s at 1.25 ends with the beat)"))
+	float ReadingRate = 1.25f;
 
 	// ---- Clips (played on MontageSlot) ----
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips")
@@ -387,6 +441,10 @@ public:
 	bool ForceAction(int32 Index, int32 Variant = -1);
 	void PinAction(int32 Index);  // tests: that action whenever it fits, no combos (-1 = none)
 	const FBossDirector& GetDirector() const { return Director; }
+	const FBehaviourAnalyzer& GetAnalyzer() const { return Analyzer; }
+	int32 GetReadingsPlayed() const { return ReadingsPlayed; }
+	// Tests: his decisions see these habits instead of the analyzer's (the analyzer itself keeps watching).
+	void OverrideHabitsForTesting(const FHabitSnapshot& Habits) { HabitOverride = Habits; bHabitOverride = true; }
 	bool ForceCombo(int32 ComboIndex);                  // tests and debugging: its opener, then its follow-ups
 	int32 GetCurrentCombo() const { return CurrentCombo; }
 	float GetPauseLength() const { return PauseLength; }
@@ -442,6 +500,9 @@ private:
 	void InitDirector();
 	FBossPerception Perception() const;
 	bool PunishTriggered() const;
+	bool PunishReady() const;     // the stand-in trigger, or the attacking habit
+	void ObservePlayer(float Dt); // feeds the analyzer what he can see; answers a heal he just saw
+	void TickReading(float DeltaSeconds);
 	bool CanContinuePlan() const;
 	void TickMovement(float DeltaSeconds);
 	void SteerAndGlide(const FVector& Dir, float Speed, float DeltaSeconds);
@@ -481,6 +542,7 @@ private:
 	int32 StepIndex = 0;
 	int32 CurrentCombo = -1;
 	FBossDirector Director;
+	FBehaviourAnalyzer Analyzer;
 	TArray<FName> ComboNames;
 	float PauseLength = 0.25f;
 	EBossMove CurrentMove = EBossMove::Wait;
@@ -532,6 +594,17 @@ private:
 	bool bPlayerWasHealing = false;
 	bool bPlayerHitBound = false;
 	float PostureLength = 2.f;
+	// The analyzer's inputs and the reading beat (Step 7).
+	uint8 LastSeenState = 0;         // the player's state last frame (EPlayerState)
+	float LastPlayerStateTime = 0.f; // a chained dodge or attack restarts the player's state clock
+	bool bPlayerLandedHit = false;   // set by a hit of yours, read by the next observation
+	bool bHealWasSeen = false;
+	int32 ReadAction = -1;
+	FString ReadWhy;
+	float ReadLength = 0.f;
+	int32 ReadingsPlayed = 0;
+	FHabitSnapshot HabitOverride;
+	bool bHabitOverride = false;
 
 	// The per-swing log (the gap study, 2026-11-25): one line per swept step, so a play tells his misses from your spacing.
 	struct FSwingRecord

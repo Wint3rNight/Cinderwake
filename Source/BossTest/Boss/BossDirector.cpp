@@ -32,6 +32,11 @@ void FBossDirector::Reset()
 	bLastChangeCloser = false;
 	bJustHit = false;
 	ExcludeOnce = EBossMove::Wait;
+	Habits = FHabitSnapshot();
+	for (float& Left : ReadingLeft)
+	{
+		Left = 0.f;
+	}
 }
 
 const FBossOption* FBossDirector::Find(int32 Action) const
@@ -86,6 +91,11 @@ bool FBossDirector::Observe(const FBossPerception& InP, bool bNeutral, float Dt)
 	{
 		C.Value = FMath::Max(0.f, C.Value - Dt);
 	}
+	for (float& Left : ReadingLeft)
+	{
+		Left = FMath::Max(0.f, Left - Dt);
+	}
+	Habits = P.Habits;
 	if (bNeutral)
 	{
 		NeutralTime += Dt;
@@ -107,6 +117,13 @@ bool FBossDirector::Observe(const FBossPerception& InP, bool bNeutral, float Dt)
 float FBossDirector::GetCooldownLeft(int32 Action) const
 {
 	return Cooldowns.FindRef(Action);
+}
+
+bool FBossDirector::PursuitActive() const
+{
+	// The 4 s timer still starts a chase; a keeping-away habit starts it the moment you're far again.
+	const bool bFar = Band == EBossBand::Far || Band == EBossBand::Extreme;
+	return FarTime >= Tuning.PursuitAfter || (bFar && Habits.Get(EBossHabit::Disengaged) >= Tuning.PursuitHabit);
 }
 
 bool FBossDirector::AngleFits(const FBossOption& O) const
@@ -215,7 +232,7 @@ int32 FBossDirector::RollCombo(int32 Opener, FRandomStream& Rng) const
 	{
 		if (C.Opener == Opener && ComboValid(C))
 		{
-			const float W = ComboWeight(C.Id);
+			const float W = ComboWeight(C.Id) * HabitScale(C.Habits, Habits, Tuning.HabitCaps);
 			Choices.Add({ C.Id, W });
 			Base += FMath::Max(0.f, C.Weight);
 			Total += W;
@@ -257,7 +274,7 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 	}
 
 	// Score every valid attack, then the movement rows of the table.
-	struct FScored { EBossMove Move; int32 Action; float Weight; };
+	struct FScored { EBossMove Move; int32 Action; float Weight; float Habit = 1.f; int32 Driver = -1; };
 	TArray<FScored, TInlineAllocator<16>> Scored;
 	bool bAngleOnly = false;
 	for (const FBossOption& O : Options)
@@ -277,25 +294,30 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 			bAngleOnly = true;
 			continue;
 		}
-		const float W = (Pinned >= 0 ? 1.f : O.Weights.Get(Band)) * AngleScale(O) * RepetitionScale(ActionKey(O.Id));
+		// Score = W(band) x M(habit) x M(repetition), times the angle's scale.
+		int32 Driver = -1;
+		const float Habit = Pinned >= 0 ? 1.f : HabitScale(O.Habits, P.Habits, Tuning.HabitCaps, &Driver);
+		const float W = (Pinned >= 0 ? 1.f : O.Weights.Get(Band)) * AngleScale(O) * RepetitionScale(ActionKey(O.Id)) * Habit;
 		if (W > 0.f)
 		{
-			Scored.Add({ EBossMove::Attack, O.Id, W });
+			Scored.Add({ EBossMove::Attack, O.Id, W, Habit, Driver });
 		}
 	}
 	if (Pinned < 0 && AngleBand != EBossAngleBand::Behind)
 	{
 		// Section 10 caps any stretch without an attack at 3 s: past 2.5 s of neutral a movement never beats an attack that
 		// scores (QA, 2026-11-25: the cap leaked, as he could keep picking approach in 0.4 s pieces).
+		// A heal he can see gets an answer (section 11): an attack if one fits, or from beyond 8 m a chase.
 		const bool bAttackScored = Scored.ContainsByPredicate([](const FScored& S) { return S.Move == EBossMove::Attack; });
-		const bool bMustAttack = bAttackScored && NeutralTime >= Tuning.MustAttackAfter;
-		const float Approach = bMustAttack || ExcludeOnce == EBossMove::Approach ? 0.f : Tuning.ApproachWeights.Get(Band);
+		const bool bMustAttack = bAttackScored && (NeutralTime >= Tuning.MustAttackAfter || P.bAnswerHeal);
+		const bool bHealChase = P.bAnswerHeal && P.EdgeCm > Tuning.HealChaseFrom;
+		const float Approach = (bMustAttack && !bHealChase) || ExcludeOnce == EBossMove::Approach ? 0.f : Tuning.ApproachWeights.Get(Band);
 		// No circling right after a hit ended his beat, while he's chasing, or after a circle got nowhere.
 		// Nor past 1.8 s of neutral.
-		const bool bNoCircle = bMustAttack || bJustHit || PursuitActive() || ExcludeOnce == EBossMove::Circle || NeutralTime >= 1.8f;
+		const bool bNoCircle = bMustAttack || P.bAnswerHeal || bJustHit || PursuitActive() || ExcludeOnce == EBossMove::Circle || NeutralTime >= 1.8f;
 		const float Circle = bNoCircle ? 0.f : Tuning.CircleWeights.Get(Band);
 		// Backing off on purpose (close only); never right after a hit, which must get an answer.
-		const bool bNoReposition = bMustAttack || bJustHit || ExcludeOnce == EBossMove::Reposition;
+		const bool bNoReposition = bMustAttack || P.bAnswerHeal || bJustHit || ExcludeOnce == EBossMove::Reposition;
 		const float Reposition = bNoReposition ? 0.f : Tuning.RepositionWeights.Get(Band);
 		if (Approach > 0.f)
 		{
@@ -363,6 +385,16 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 	}
 	D.Move = Pick->Move;
 	D.Action = Pick->Action;
+	D.HabitModifier = Pick->Habit;
+	D.Habit = Pick->Driver;
+	// The reading beat (section 10): when a real habit drove the pick he shows he noticed, at most once per habit every 20 s.
+	// Never while answering a heal (that answer can't wait) or for a pinned test action.
+	if (D.Move == EBossMove::Attack && D.Habit >= 0 && Pinned < 0 && !P.bAnswerHeal
+		&& P.Habits.Scores[D.Habit] >= Tuning.ReadingScore && ReadingLeft[D.Habit] <= 0.f)
+	{
+		D.bReadingBeat = true;
+		ReadingLeft[D.Habit] = Tuning.ReadingCooldown;
+	}
 	if (D.Move == EBossMove::Approach)
 	{
 		D.Duration = Tuning.ApproachMax;
@@ -380,7 +412,9 @@ FBossDecision FBossDirector::Decide(const FBossPerception& InP, FRandomStream& R
 	{
 		D.Duration = FMath::Min(D.Duration, FMath::Max(0.4f, 3.f - NeutralTime)); // the 3 s cap
 	}
-	D.Why = FString::Printf(TEXT("picked from %s"), *D.Why.TrimEnd());
+	D.Why = FString::Printf(TEXT("picked from %s%s%s"), *D.Why.TrimEnd(),
+		D.Habit >= 0 ? *FString::Printf(TEXT(" (x%.2f for %s %.2f)"), D.HabitModifier, HabitName(D.Habit), P.Habits.Scores[D.Habit]) : TEXT(""),
+		P.bAnswerHeal ? TEXT(" [answering a heal]") : TEXT(""));
 	return D;
 }
 

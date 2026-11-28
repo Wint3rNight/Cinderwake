@@ -1,11 +1,12 @@
 // His phase-one director (Step 6, spec section 10): owns every decision rule and timer, as plain C++ so it's unit tested.
-// The character perceives (distance, angle), executes what it's told and reports back (an action committed, a step
-// started, his beat broken by a hit). The behaviour analyzer, the reading beat and the perception delay are Step 7:
-// until then every habit modifier is 1.
+// The character perceives (distance, angle, the analyzer's habits), executes what it's told and reports back (an action
+// committed, a step started, his beat broken by a hit). Step 7: an action's weight carries the modifier of the habit it
+// counters, and when a real habit drove the pick he plays a reading beat first.
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Math/RandomStream.h"
+#include "Boss/BehaviourAnalyzer.h"
 
 enum class EBossBand : uint8 { Close, Medium, Far, Extreme };
 enum class EBossAngleBand : uint8 { Front, Side, RearQuarter, Behind };
@@ -44,6 +45,7 @@ struct FBossOption
 	FBossBandWeights Weights;
 	float Cooldown = 0.f;
 	bool bNeedsPunishTrigger = false;   // Punishment Sweep, as an opener only
+	uint8 Habits = 0;                   // the habits it counters (HabitBit), Step 7
 };
 
 // A combo (section 5): its opener and the follow-ups, by action id. Chain points are the character's data.
@@ -57,6 +59,7 @@ struct FBossComboOption
 	bool bNeedsFreshBeat = false;       // only with no major since his last breather (QA: never five swings with one break)
 	bool bNeedsSeen = false;            // only once its opener and every follow-up have played this attempt
 	int32 Majors = 1;                   // how many majors it counts as for the breather (Combo G: 2)
+	uint8 Habits = 0;                   // the habit its purpose answers (A: attacking, B: dodging, C: circling, F: keeping away)
 };
 
 struct FBossPerception
@@ -64,7 +67,9 @@ struct FBossPerception
 	float EdgeCm = 0.f;                 // edge to edge
 	float AngleDeg = 0.f;               // 0 = straight ahead of him, 180 = behind
 	bool bPlayerDown = false;
-	bool bPunishTrigger = false;        // the player keeps landing hits (Step 7's analyzer replaces this)
+	bool bPunishTrigger = false;        // the player keeps landing hits, or attacks into his neutral as a habit
+	bool bAnswerHeal = false;           // he can see you healing: no movement but a chase from beyond 8 m (section 11)
+	FHabitSnapshot Habits;              // the analyzer's scores, a quarter second old
 };
 
 struct FBossDecision
@@ -73,6 +78,9 @@ struct FBossDecision
 	int32 Action = -1;                  // when Move == Attack
 	float Duration = 0.f;               // movements: how long at most
 	int32 CircleSign = 1;               // Circle: which way round
+	bool bReadingBeat = false;          // a real habit drove this attack: he shows he noticed before he plays it
+	int32 Habit = -1;                   // the habit behind the pick's modifier (-1: none)
+	float HabitModifier = 1.f;
 	FString Why;                        // the scored options, for the log
 };
 
@@ -104,6 +112,12 @@ struct FBossDirectorTuning
 	float PursuitAfter = 4.0f;          // seconds in Far or Extreme (leaking at twice the rate outside them)
 	float RedecideAfter = 0.4f;         // a movement re-decides on a band change only after this long in it
 	int32 RepetitionWindow = 5;         // his last five offensive entries
+	FHabitCaps HabitCaps;               // section 10's maximum modifier per habit
+	float ReadingScore = 0.6f;          // the reading beat needs the habit itself this high, not just its modifier at 1.2
+	                                    // (at 1.2 two quick dodges would trigger it: 2026-11-28)
+	float ReadingCooldown = 20.f;       // seconds before the same habit gets another beat: he always counters, he rarely announces
+	float PursuitHabit = 0.6f;          // keeping away this much starts the chase at once in Far or Extreme (section 10)
+	float HealChaseFrom = 800.f;        // answering a heal from beyond 8 m he may chase instead of attacking (section 11)
 };
 
 // The aura circle (the user, 2026-11-25: "he's been beating my shi off and maybe once he just circles us like this is who you
@@ -153,8 +167,9 @@ public:
 	float PauseEndAfterHit(float PauseStart, float PauseLength, float Now) const; // a hit cuts the pause, never below the floor
 	bool ShouldRedecide(EBossMove Move, float TimeInMove) const; // after a band change, during a movement
 	void NoteNoProgress(EBossMove Move) { ExcludeOnce = Move; }  // that movement sits out the next roll
-	bool PursuitActive() const { return FarTime >= Tuning.PursuitAfter; }
-	void PinAction(int32 Action) { Pinned = Action; } // tests: that action whenever it fits, no combos (-1 = none)
+	bool PursuitActive() const;   // 4 s in Far or Extreme, or there now while keeping away is a habit
+	void PinAction(int32 Action) { Pinned = Action; } // tests: that action whenever it fits, no combos or beats (-1 = none)
+	float GetReadingCooldownLeft(int32 Habit) const { return Habit >= 0 && Habit < BossHabitCount ? ReadingLeft[Habit] : 0.f; }
 
 	EBossBand GetBand() const { return Band; }
 	EBossAngleBand GetAngleBand() const { return AngleBand; }
@@ -190,4 +205,6 @@ private:
 	bool bJustHit = false;
 	EBossMove ExcludeOnce = EBossMove::Wait; // Wait = nothing excluded
 	int32 Pinned = -1;
+	FHabitSnapshot Habits;            // from the last Observe: combos and pursuit read it
+	float ReadingLeft[BossHabitCount] = {};
 };

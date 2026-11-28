@@ -23,6 +23,7 @@ const TCHAR* FBossStateMachine::StateName(EBossState S)
 	case EBossState::Circle: return TEXT("circle");
 	case EBossState::Reposition: return TEXT("reposition");
 	case EBossState::Posture: return TEXT("aura");
+	case EBossState::Reading: return TEXT("reading");
 	}
 	return TEXT("?");
 }
@@ -66,7 +67,7 @@ bool FBossStateMachine::IsLegal(EBossState From, EBossState To)
 		return To == EBossState::Evaluate || To == EBossState::Paused;
 	case EBossState::Evaluate:
 		return To == EBossState::Approach || To == EBossState::Turn || To == EBossState::Neutral || To == EBossState::Attack || To == EBossState::Paused
-			|| To == EBossState::Circle || To == EBossState::Reposition;
+			|| To == EBossState::Circle || To == EBossState::Reposition || To == EBossState::Reading;
 	case EBossState::Approach:
 	case EBossState::Turn:
 	case EBossState::Circle:
@@ -80,6 +81,8 @@ bool FBossStateMachine::IsLegal(EBossState From, EBossState To)
 		return To == EBossState::Evaluate || To == EBossState::Attack || To == EBossState::Posture; // Posture: tests and debugging
 	case EBossState::Posture:
 		return To == EBossState::Neutral || To == EBossState::Evaluate || To == EBossState::Paused; // never straight into an attack
+	case EBossState::Reading:
+		return To == EBossState::Attack || To == EBossState::Evaluate || To == EBossState::Paused; // the counter, or a fresh look if it no longer fits
 	case EBossState::Stagger:
 		return To == EBossState::Evaluate || To == EBossState::Neutral; // the commitment pause first (the council's run)
 	case EBossState::CastBroken:
@@ -104,6 +107,7 @@ float FBossStateMachine::DefaultTimeout(EBossState S)
 	case EBossState::Circle: return 3.6f;      // at most 2.6 s plus 1 s (callers pass the rolled length plus 1 s)
 	case EBossState::Reposition: return 2.3f;  // at most 1.3 s plus 1 s
 	case EBossState::Posture: return 3.8f;     // at most 2.5 s plus 1.3 s (callers pass the rolled length plus 1.3 s)
+	case EBossState::Reading: return 1.7f;     // the 0.7 s beat plus 1 s
 	default: return -1.f;                      // paused (a debug state) and dead never time out
 	}
 }
