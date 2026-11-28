@@ -101,6 +101,9 @@ public:
 	bool IsLunging() const;
 	FVector GetLungeTarget() const { return LungeTarget; }
 
+	// Step 6b: an intercepting dash aims no further out than Radius from Centre (the arena's wall less the owner's capsule).
+	void SetArena(const FVector& Centre, float Radius) { ArenaCentre = Centre; ArenaRadius = Radius; }
+
 private:
 	void Pose(const FAttackSample& Sample);
 	UAnimSequenceBase* SpanClip(EAttackSpan Span) const;
@@ -164,6 +167,8 @@ private:
 	UPROPERTY()
 	TObjectPtr<UParticleSystemComponent> TrailComponent; // one, reused: Cascade's anim trails need it attached to the mesh
 	FVector LungeTarget = FVector::ZeroVector;
+	FVector ArenaCentre = FVector::ZeroVector;
+	float ArenaRadius = 0.f; // 0: no arena
 
 	UPROPERTY()
 	TObjectPtr<UCurveFloat> EaseCurve; // smoothstep progress for eased lunges

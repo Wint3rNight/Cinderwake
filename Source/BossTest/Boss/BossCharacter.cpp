@@ -12,6 +12,7 @@
 #include "Combat/Lunge.h"
 #include "Boss/BossBrain.h"
 #include "Boss/BossMovement.h"
+#include "Arena/ArenaBounds.h"
 #include "Combat/Tracking.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/PointLightComponent.h"
@@ -135,9 +136,19 @@ void ABossCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 	HomeTransform = GetActorTransform();
+	// Step 6b: the arena's centre and radius come from the level's ArenaBounds; without one, his spawn point and 13 m.
+	ArenaCentre = HomeTransform.GetLocation();
+	float WallRadius = ArenaRadius + 100.f;
+	if (const AArenaBounds* Arena = AArenaBounds::Find(GetWorld()))
+	{
+		ArenaCentre = Arena->GetCentre();
+		ArenaRadius = Arena->AIRadius;
+		WallRadius = Arena->WallRadius;
+	}
 	IgnoreCamera(); // again at play, in case the Blueprint carries an older collision setting
 	ApplyScale();
 	Attacks->MontageSlot = MontageSlot;
+	Attacks->SetArena(ArenaCentre, WallRadius - GetCapsuleComponent()->GetScaledCapsuleRadius()); // the Advance's dash stops short of the wall
 
 	// Tick order, as for the player: combatant (ends hit-stop, runs the stagger clock) -> attacks
 	// (advance the swing, track, lunge) -> this character (state and requests) -> movement -> mesh.
@@ -479,7 +490,7 @@ void ABossCharacter::TickPosture(float DeltaSeconds)
 	if (!End)
 	{
 		// A slow circle round you, watching rather than tracking; at the arena's edge he turns back once, a second time ends it.
-		const FVector Centre = HomeTransform.GetLocation();
+		const FVector Centre = GetArenaCentre();
 		FVector Dir = CircleDirection(GetActorLocation(), P->GetActorLocation(), PostureSign);
 		if (LeavesArena(GetActorLocation(), Dir, PostureSpeed, 0.5f, Centre, ArenaRadius))
 		{
@@ -695,7 +706,7 @@ void ABossCharacter::TickApproach(float DeltaSeconds)
 	}
 	// Toward where you'll be (section 11: 0.45 s ahead, at most 3 m), never past the arena's edge; no lead while you
 	// dodge, so a dodge can't drag him (the player reports what may be led).
-	const FVector Centre = HomeTransform.GetLocation();
+	const FVector Centre = GetArenaCentre();
 	FVector Aim = ClampToArena(InterceptPoint(P->GetActorLocation(), UCombatantComponent::LeadVelocityOf(P), 0.45f, 300.f), Centre, ArenaRadius);
 	const FVector Dir = (Aim - GetActorLocation()).GetSafeNormal2D();
 	FaceTarget(DeltaSeconds);
@@ -718,7 +729,7 @@ void ABossCharacter::TickMovement(float DeltaSeconds)
 		States.Complete(EBossState::Evaluate, TEXT("movement over"));
 		return;
 	}
-	const FVector Centre = HomeTransform.GetLocation();
+	const FVector Centre = GetArenaCentre();
 	const FVector Self = GetActorLocation();
 	FaceTarget(DeltaSeconds);
 	if (States.GetState() == EBossState::Circle)

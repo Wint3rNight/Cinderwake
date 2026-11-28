@@ -6,6 +6,7 @@
 #if WITH_DEV_AUTOMATION_TESTS && WITH_EDITOR
 
 #include "Boss/BossCharacter.h"
+#include "Arena/ArenaBounds.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "PhysicsEngine/PhysicsAsset.h"
@@ -2383,6 +2384,125 @@ bool FSmokeStrafeWarp::RunTest(const FString& Parameters)
 	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
 	return true;
 }
+
+struct FArenaWatch
+{
+	double Start = 0.0;
+	double Mark = 0.0;
+	int32 Phase = 0;
+	int32 Dodges = 0;
+	float MaxOut = 0.f;      // the player's furthest distance from the centre, cm
+	int32 Blocked = 0;       // spots inside the circle where a standing capsule hits something
+	int32 Spots = 0;
+};
+
+// Step 6b, the arena: his centre comes from the level's ArenaBounds, a sprint and dodges straight at the wall stop at it, and no
+// decoration blocks a standing fighter anywhere inside it (they have no collision; only the floor and the wall do).
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FArenaRun, FAutomationTestBase*, Test, TSharedRef<FArenaWatch>, Watch);
+bool FArenaRun::Update()
+{
+	FArenaWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	const AArenaBounds* Arena = AArenaBounds::Find(World);
+	if (!Player || !Boss || !PC || !Arena)
+	{
+		Test->AddError(TEXT("no player, boss, controller or ArenaBounds in BossArena (run Docs/tools/build_arena.py)"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 25.0)
+	{
+		PressKeys(PC, { EKeys::W, EKeys::LeftShift }, false);
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const FVector Centre = Arena->GetCentre();
+	if (W.Phase >= 2)
+	{
+		W.MaxOut = FMath::Max(W.MaxOut, static_cast<float>(FVector::Dist2D(Player->GetActorLocation(), Centre)));
+	}
+	switch (W.Phase)
+	{
+	case 0:
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		Test->TestTrue(TEXT("his arena centre is the ArenaBounds'"), FVector::Dist2D(Boss->GetArenaCentre(), Centre) < 1.f);
+		// No decoration in the way: a standing capsule on a 1.5 m grid inside 13.5 m touches nothing that blocks (the fighters aside).
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(ArenaClear), false);
+		Params.AddIgnoredActor(Player);
+		Params.AddIgnoredActor(Boss);
+		for (float X = -1350.f; X <= 1350.f; X += 150.f)
+		{
+			for (float Y = -1350.f; Y <= 1350.f; Y += 150.f)
+			{
+				if (X * X + Y * Y > 1350.f * 1350.f)
+				{
+					continue;
+				}
+				++W.Spots;
+				W.Blocked += World->OverlapBlockingTestByChannel(Centre + FVector(X, Y, 100.f), FQuat::Identity, ECC_Pawn,
+					FCollisionShape::MakeCapsule(40.f, 85.f), Params) ? 1 : 0;
+			}
+		}
+		Boss->ToggleAI(); // he stands still while Feng Mao runs at the wall
+		Player->TeleportTo(Centre + FVector(0.f, -700.f, 100.f), FRotator(0.f, -90.f, 0.f));
+		PC->SetControlRotation(FRotator(0.f, -90.f, 0.f)); // facing out, toward the wall at -Y
+		W.Mark = Now;
+		W.Phase = 1;
+		return false;
+	}
+	case 1:
+		if (Now - W.Mark < 0.3)
+		{
+			return false;
+		}
+		PressKeys(PC, { EKeys::W, EKeys::LeftShift }, true);
+		W.Mark = Now;
+		W.Phase = 2;
+		return false;
+	case 2:
+		// Sprint into the wall, then dodge into it three times, still holding forward.
+		if (Now - W.Mark > 2.5 && W.Dodges < 3 && Now - W.Mark > 2.5 + W.Dodges * 0.9)
+		{
+			PressKeys(PC, { EKeys::SpaceBar }, true);
+			PressKeys(PC, { EKeys::SpaceBar }, false);
+			++W.Dodges;
+		}
+		if (Now - W.Mark < 5.5)
+		{
+			return false;
+		}
+		PressKeys(PC, { EKeys::W, EKeys::LeftShift }, false);
+		break;
+	}
+	const float Limit = Arena->WallRadius - Player->GetCapsuleComponent()->GetScaledCapsuleRadius() + 4.f; // + the polygon's 3 cm at a join
+	Test->TestTrue(FString::Printf(TEXT("checked %d spots inside the circle: %d blocked"), W.Spots, W.Blocked), W.Spots > 200 && W.Blocked == 0);
+	Test->TestTrue(FString::Printf(TEXT("the wall stopped him (furthest %.0f cm from the centre, limit %.0f)"), W.MaxOut, Limit), W.MaxOut <= Limit);
+	Test->TestTrue(FString::Printf(TEXT("and he reached it (%.0f cm)"), W.MaxOut), W.MaxOut >= Limit - 30.f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeArenaWall, "BossTest.Smoke.ArenaWall", SmokeTestFlags)
+bool FSmokeArenaWall::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FArenaRun(this, MakeShared<FArenaWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
 
 struct FPostureWatch
 {

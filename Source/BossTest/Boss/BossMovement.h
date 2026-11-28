@@ -3,18 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-
-// A point pulled onto the disc's edge if it's outside (its height kept).
-inline FVector ClampToArena(const FVector& Point, const FVector& Centre, float Radius)
-{
-	const FVector Flat(Point.X - Centre.X, Point.Y - Centre.Y, 0.f);
-	if (Flat.SizeSquared() <= FMath::Square(Radius))
-	{
-		return Point;
-	}
-	const FVector OnEdge = Flat.GetSafeNormal() * Radius;
-	return FVector(Centre.X + OnEdge.X, Centre.Y + OnEdge.Y, Point.Z);
-}
+#include "Combat/Lunge.h" // ClampToArena (the attack component clamps the Advance's dash with it too)
 
 // The direction that circles the target: across the line to it, Sign picking the side.
 inline FVector CircleDirection(const FVector& Self, const FVector& Target, int32 Sign)

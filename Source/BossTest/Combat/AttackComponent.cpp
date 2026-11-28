@@ -807,6 +807,10 @@ void UAttackComponent::ApplyLunge(float Duration)
 			// Running and sprinting are led; a dodge (even its steered tail), a lunge or a reaction never (it would fling him 2 m
 			// with it): the target reports what may be led.
 			Aim = InterceptPoint(Aim, UCombatantComponent::LeadVelocityOf(TargetActor), Duration, CurrentDefinition->InterceptLeadMax);
+			if (ArenaRadius > 0.f)
+			{
+				Aim = ClampToArena(Aim, ArenaCentre, ArenaRadius); // a lead past the wall would drive him into it (6b)
+			}
 			const FVector ToAim = (Aim - Character->GetActorLocation()).GetSafeNormal2D();
 			if (!ToAim.IsNearlyZero())
 			{

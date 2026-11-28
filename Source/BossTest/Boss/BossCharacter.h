@@ -197,7 +197,7 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Attacks")
 	TArray<FBossCombo> Combos;
 
-	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm from his spawn point: his movement stays inside (section 14: 13 m; 6b's arena sets it)"))
+	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm from the arena's centre: his movement stays inside (section 14: 13 m). An ArenaBounds in the level overrides it at play"))
 	float ArenaRadius = 1300.f;
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Director", meta = (ToolTip = "cm/s"))
@@ -390,7 +390,7 @@ public:
 	bool ForceCombo(int32 ComboIndex);                  // tests and debugging: its opener, then its follow-ups
 	int32 GetCurrentCombo() const { return CurrentCombo; }
 	float GetPauseLength() const { return PauseLength; }
-	FVector GetArenaCentre() const { return HomeTransform.GetLocation(); }
+	FVector GetArenaCentre() const { return ArenaCentre; } // the ArenaBounds' centre, or his spawn point without one
 	int32 GetActionCount() const { return Actions.Num(); }
 	FName GetSelectedActionName() const;
 	const UDeliveryComponent* GetDelivery() const { return Delivery; }
@@ -510,6 +510,7 @@ private:
 	TObjectPtr<UAnimSequenceBase> GlideClip; // the glide clip on the slot, if one is playing
 
 	FTransform HomeTransform;
+	FVector ArenaCentre = FVector::ZeroVector;
 	float IntroLength = 0.f;
 	bool bRecoveringSent = false;
 
