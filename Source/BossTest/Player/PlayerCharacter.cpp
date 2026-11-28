@@ -87,6 +87,7 @@ APlayerCharacter::APlayerCharacter(const FObjectInitializer& ObjectInitializer)
 	Combatant = CreateDefaultSubobject<UCombatantComponent>(TEXT("Combatant"));
 	Combatant->MaxHealth = 300.f;
 	LockOn = CreateDefaultSubobject<ULockOnComponent>(TEXT("LockOn"));
+	Voice = CreateDefaultSubobject<UFighterVoiceComponent>(TEXT("Voice"));
 }
 
 void APlayerCharacter::BeginPlay()
@@ -96,6 +97,7 @@ void APlayerCharacter::BeginPlay()
 	StartLocation = GetActorLocation();
 	StartRotation = GetActorRotation();
 	BaseSocketOffset = Arm->SocketOffset;
+	Voice->SetVoices(Voices);
 	MakeAfterimagePool();
 	GetCharacterMovement()->MaxWalkSpeed = RunSpeed;
 	Attacks->MontageSlot = MontageSlot;
@@ -1396,6 +1398,7 @@ void APlayerCharacter::OnHitLanded(const FHitOutcome& Outcome, AActor* Victim)
 void APlayerCharacter::ResetPlayer()
 {
 	Attacks->StopAttack(0.1f);
+	Voice->ResetVoice();
 	SnapLeft = 0.f;
 	HideAfterimages();
 	EndDodgePush();

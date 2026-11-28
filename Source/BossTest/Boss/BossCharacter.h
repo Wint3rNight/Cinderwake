@@ -7,6 +7,7 @@
 #include "GameFramework/Character.h"
 #include "Boss/BossDirector.h"
 #include "Boss/BossStateMachine.h"
+#include "Combat/FighterVoice.h"
 #include "BossCharacter.generated.h"
 
 class UAnimMontage;
@@ -353,6 +354,37 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Boss|Reading", meta = (ToolTip = "The clip's play rate (Ultimate_Targeting's 0.87 s at 1.25 ends with the beat)"))
 	float ReadingRate = 1.25f;
 
+	// ---- Feel (2026-11-29: "landing hits on him feels like hitting air") ----
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel", meta = (ToolTip = "Degrees his chest tilts away from your hit: Flinch Base + damage x Flinch Per Damage, clamped (a light about 6, a heavy 10)"))
+	float FlinchBase = 3.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel")
+	float FlinchPerDamage = 0.07f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel")
+	float FlinchMin = 5.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel")
+	float FlinchMax = 14.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel", meta = (ToolTip = "Seconds to the full tilt (it runs through the hit-stop, so the frozen frame already shows it)"))
+	float FlinchRise = 0.05f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel", meta = (ToolTip = "Seconds back to rest"))
+	float FlinchFall = 0.3f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel", meta = (ToolTip = "Degrees he leans back while holding a swing up, so a long hold reads as loading the blow, not a freeze"))
+	float HoldLean = 3.f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel", meta = (ToolTip = "Seconds the lean takes to build"))
+	float HoldLeanTime = 0.6f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Feel", meta = (ToolTip = "Degrees of strain tremble on top of the lean"))
+	float HoldTremble = 0.8f;
+
+	UPROPERTY(EditAnywhere, Category = "Boss|Voice", meta = (ToolTip = "Sevarog's own effort, pain, death and laugh lines"))
+	FFighterVoices Voices;
+
 	// ---- Clips (played on MontageSlot) ----
 	UPROPERTY(EditDefaultsOnly, Category = "Boss|Clips")
 	TObjectPtr<UAnimSequenceBase> IntroClip;
@@ -422,8 +454,8 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Boss|Encounter")
 	FText DisplayName = FText::FromString(TEXT("Sevarog, the Soul Harvester"));
 
-	UPROPERTY(EditAnywhere, Category = "Boss|Encounter", meta = (ToolTip = "Health where the transformation will start (Step 8); marked on his bar"))
-	float PhaseTransitionHealth = 3300.f;
+	UPROPERTY(EditAnywhere, Category = "Boss|Encounter", meta = (ToolTip = "Health where the transformation will start (Step 8), 60% of his health; marked on his bar"))
+	float PhaseTransitionHealth = 2700.f;
 
 	UPROPERTY(EditAnywhere, Category = "Boss|Encounter")
 	bool bAIEnabled = true;
@@ -442,6 +474,9 @@ public:
 	void PinAction(int32 Index);  // tests: that action whenever it fits, no combos (-1 = none)
 	const FBossDirector& GetDirector() const { return Director; }
 	const FBehaviourAnalyzer& GetAnalyzer() const { return Analyzer; }
+	float GetFlinchAngle() const { return FlinchAngleNow; }
+	float GetStrainAngle() const { return StrainAngleNow; }
+	const UFighterVoiceComponent* GetVoice() const { return Voice; }
 	int32 GetReadingsPlayed() const { return ReadingsPlayed; }
 	// Tests: his decisions see these habits instead of the analyzer's (the analyzer itself keeps watching).
 	void OverrideHabitsForTesting(const FHabitSnapshot& Habits) { HabitOverride = Habits; bHabitOverride = true; }
@@ -476,6 +511,9 @@ protected:
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UDeliveryComponent> Delivery;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UFighterVoiceComponent> Voice;
 
 private:
 	void ApplyScale();
@@ -605,6 +643,13 @@ private:
 	int32 ReadingsPlayed = 0;
 	FHabitSnapshot HabitOverride;
 	bool bHabitOverride = false;
+	// The flinch (HitFlinch.h): started on your hit, driven on world time so it runs through his hit-stop.
+	double FlinchStart = -100.0;
+	float FlinchAmplitude = 0.f;
+	FVector FlinchAxis = FVector::ZeroVector;
+	float FlinchAngleNow = 0.f;
+	double HoldStart = -1.0;         // world seconds his current swing's hold began (-1: not holding)
+	float StrainAngleNow = 0.f;
 
 	// The per-swing log (the gap study, 2026-11-25): one line per swept step, so a play tells his misses from your spacing.
 	struct FSwingRecord

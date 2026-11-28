@@ -7,6 +7,7 @@
 #include "GameFramework/Character.h"
 #include "Player/DodgeProfile.h"
 #include "Player/PlayerActions.h"
+#include "Combat/FighterVoice.h"
 #include "PlayerCharacter.generated.h"
 
 class UAnimMontage;
@@ -271,6 +272,9 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Player|Movement", meta = (ToolTip = "cm/s"))
 	float SprintSpeed = 650.f;
 
+	UPROPERTY(EditAnywhere, Category = "Player|Voice", meta = (ToolTip = "Feng Mao's own effort, pain and death lines (the feel pass, 2026-11-29)"))
+	FFighterVoices Voices;
+
 	UPROPERTY(EditAnywhere, Category = "Player|Movement", meta = (ToolTip = "cm over the whole dodge"))
 	float DodgeDistance = 350.f;
 
@@ -300,6 +304,7 @@ public:
 	float GetWarpAngle() const { return WarpAngle; } // degrees the skeleton is turned now (+ right)
 	float GetWarpTarget() const { return WarpTarget; }
 	bool IsLockedOn() const;
+	const UFighterVoiceComponent* GetVoice() const { return Voice; }
 	FString DebugLine() const;
 	FString LastEventText() const { return LastEventTime > 0.f ? LastEvent : FString(); }
 
@@ -321,6 +326,9 @@ protected:
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UCombatantComponent> Combatant;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UFighterVoiceComponent> Voice;
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<ULockOnComponent> LockOn;

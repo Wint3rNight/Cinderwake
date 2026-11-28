@@ -116,7 +116,8 @@ private:
 	void SweepWeapon();
 	// Every victim of this frame's strike through the resolver, with its hit-stop, effect and events (a sweep's, or the
 	// target of an attack that strikes it directly).
-	void ResolveVictims(const TArray<class UCombatantComponent*>& Victims);
+	// Contacts: where the sweep first touched each victim (same order); empty for a scripted strike, which uses the blade's tip.
+	void ResolveVictims(const TArray<class UCombatantComponent*>& Victims, const TArray<FVector>& Contacts = TArray<FVector>());
 	void ApplyLunge(float Duration);
 	void TrackTarget(float Step);
 	void SetOwnerArmor(EArmor Armor);

@@ -12,6 +12,8 @@
 #include "Combat/Lunge.h"
 #include "Boss/BossBrain.h"
 #include "Boss/BossMovement.h"
+#include "Boss/BossAnimInstance.h"
+#include "Boss/HitFlinch.h"
 #include "Arena/ArenaBounds.h"
 #include "Combat/Tracking.h"
 #include "Components/CapsuleComponent.h"
@@ -82,12 +84,13 @@ ABossCharacter::ABossCharacter(const FObjectInitializer& ObjectInitializer)
 	AIControllerClass = AAIController::StaticClass();
 
 	Combatant = CreateDefaultSubobject<UCombatantComponent>(TEXT("Combatant")); // the arena saves data under this name
-	Combatant->MaxHealth = 5500.f;
+	Combatant->MaxHealth = 4500.f; // 5,500 until the Step 7 play (2026-11-29: "hard", too long to wear down)
 	Combatant->StaggerDuration = 1.8f; // 2026-11-23 council: so the charged heavy has a window (was 1.25 s)
 	Combatant->PoiseThreshold = 1100.f; // 2026-11-24 council: a stagger every 60-90 s at 20 DPS (650 gave ~40 s); a starting value
 	Attacks = CreateDefaultSubobject<UAttackComponent>(TEXT("Attacks"));
 	Attacks->MontageSlot = MontageSlot;
 	Delivery = CreateDefaultSubobject<UDeliveryComponent>(TEXT("Delivery"));
+	Voice = CreateDefaultSubobject<UFighterVoiceComponent>(TEXT("Voice"));
 	// The finishing blow's in-range cue: a soft light just in front of his slumped chest, placed every tick (a light at
 	// the bone would sit inside his body and light nothing you can see).
 	FinisherGlow = CreateDefaultSubobject<UPointLightComponent>(TEXT("FinisherGlow"));
@@ -136,6 +139,7 @@ void ABossCharacter::BeginPlay()
 {
 	Super::BeginPlay();
 	HomeTransform = GetActorTransform();
+	Voice->SetVoices(Voices);
 	// Step 6b: the arena's centre and radius come from the level's ArenaBounds; without one, his spawn point and 13 m.
 	ArenaCentre = HomeTransform.GetLocation();
 	float WallRadius = ArenaRadius + 100.f;
@@ -359,6 +363,36 @@ void ABossCharacter::Tick(float DeltaSeconds)
 		FinisherGlow->SetWorldLocation(GetMesh()->GetBoneLocation(TEXT("spine_03")) + GetActorForwardVector() * 45.f);
 	}
 
+	// The flinch, on world time (his own clock nearly stops in a hit-stop, and the frozen frame should already show it).
+	FlinchAngleNow = HitFlinch::Envelope(static_cast<float>(GetWorld()->GetTimeSeconds() - FlinchStart), FlinchAmplitude, FlinchRise, FlinchFall);
+	// The strain while he holds a swing up: a lean back away from you and a small tremble, so a long hold reads as loading
+	// the blow. It fades out fast at the release; the downswing's own motion covers it.
+	const bool bHolding = Attacks->IsAttacking() && Attacks->GetSample().Phase == EAttackPhase::Hold;
+	const double WorldNow = GetWorld()->GetTimeSeconds();
+	if (bHolding && HoldStart < 0.0)
+	{
+		HoldStart = WorldNow;
+	}
+	else if (!bHolding)
+	{
+		HoldStart = -1.0;
+	}
+	StrainAngleNow = bHolding ? HitFlinch::HoldStrain(static_cast<float>(WorldNow - HoldStart), HoldLean, HoldLeanTime, HoldTremble)
+		: FMath::FInterpTo(StrainAngleNow, 0.f, GetWorld()->GetDeltaSeconds(), 20.f);
+	FVector StrainAxis = FVector::ZeroVector;
+	if (const ACharacter* Target = Player(); Target && FMath::Abs(StrainAngleNow) > 0.01f)
+	{
+		const FVector Away = (GetActorLocation() - Target->GetActorLocation()).GetSafeNormal2D();
+		StrainAxis = HitFlinch::AxisFor(GetMesh()->GetComponentTransform().InverseTransformVectorNoScale(Away));
+	}
+	if (UBossAnimInstance* Anim = Cast<UBossAnimInstance>(GetMesh()->GetAnimInstance()))
+	{
+		Anim->FlinchAxis = FlinchAxis;
+		Anim->FlinchAngle = FlinchAngleNow;
+		Anim->StrainAxis = StrainAxis;
+		Anim->StrainAngle = StrainAngleNow;
+	}
+
 	DrawDebugShapes();
 }
 
@@ -528,6 +562,7 @@ void ABossCharacter::TickPosture(float DeltaSeconds)
 
 void ABossCharacter::EndPostureEffects()
 {
+	Voice->FadeOut(EVoiceEvent::Laugh, 0.4f); // his laugh is longer than the circle
 	for (UParticleSystemComponent* FX : PostureFX)
 	{
 		if (FX)
@@ -1075,6 +1110,7 @@ void ABossCharacter::OnStateChanged(EBossState From, EBossState To)
 		StopGlide();
 		PostureStartTime = GetWorld()->GetTimeSeconds();
 		LastPostureTime = PostureStartTime;
+		Voice->Play(EVoiceEvent::Laugh); // "this is who you're messing with"
 		bPostureFlipped = false;
 		PlayClipEased(PostureClip, 1.f, 0.5f, 0.3f, 1000);
 		if (PostureSmoke)
@@ -1116,6 +1152,17 @@ void ABossCharacter::OnHitResolved(const FHitOutcome& Outcome, AActor* Attacker)
 		PlayerHitTimes.RemoveAll([this, Now](double T) { return Now - T > PunishWindow; });
 		PlayerHitTimes.Add(Now); // Punishment Sweep's stand-in trigger (not a perfect guard's poise)
 		bPlayerLandedHit = true; // the analyzer's hit and run
+		const EBossState Was = States.GetState();
+		if (Was != EBossState::Stagger && Was != EBossState::Dead && !Outcome.bKilled)
+		{
+			// The flinch: his chest tilts away from you, more for a bigger hit, carrying on from any flinch still running.
+			const FVector Away = (GetActorLocation() - Attacker->GetActorLocation()).GetSafeNormal2D();
+			const float Amplitude = FMath::Clamp(FlinchBase + Outcome.DamageDealt * FlinchPerDamage, FlinchMin, FlinchMax);
+			const float Current = HitFlinch::Envelope(static_cast<float>(Now - FlinchStart), FlinchAmplitude, FlinchRise, FlinchFall);
+			FlinchAmplitude = FMath::Max(Amplitude, Current);
+			FlinchStart = Now - HitFlinch::RiseTimeFor(Current, FlinchAmplitude, FlinchRise);
+			FlinchAxis = HitFlinch::AxisFor(GetMesh()->GetComponentTransform().InverseTransformVectorNoScale(Away));
+		}
 		// A hit ends his pause (never below its 0.25 s floor) or any movement (the punish windows and QA, Step 6).
 		const EBossState S = States.GetState();
 		if (Actions.Num() > 0 && !Outcome.bKilled && Outcome.Poise == EPoiseOutcome::None)
@@ -1729,6 +1776,9 @@ void ABossCharacter::ResetBoss()
 	CurrentMove = EBossMove::Wait;
 	Director.Reset(); // bands, cooldowns, history: a retry starts clean
 	Analyzer.Reset(); // and he forgets your habits
+	Voice->ResetVoice();
+	FlinchStart = -100.0;
+	FlinchAmplitude = 0.f;
 	bPlayerLandedHit = false;
 	bHealWasSeen = false;
 	LastSeenState = 0;

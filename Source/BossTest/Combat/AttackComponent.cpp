@@ -894,6 +894,7 @@ void UAttackComponent::SweepWeapon()
 	FCollisionQueryParams Params(SCENE_QUERY_STAT(AttackSweep), false, GetOwner());
 	const FCollisionShape Sphere = FCollisionShape::MakeSphere(Radius);
 	TArray<UCombatantComponent*> Victims;
+	TArray<FVector> Contacts; // where the blade first touched each victim, for the hit effect
 	for (int32 Step = 1; Step <= Substeps; ++Step)
 	{
 		const float From = static_cast<float>(Step - 1) / Substeps;
@@ -909,9 +910,11 @@ void UAttackComponent::SweepWeapon()
 				AActor* HitActor = Hit.GetActor();
 				if (HitActor && HitActor != GetOwner())
 				{
-					if (UCombatantComponent* Victim = HitActor->FindComponentByClass<UCombatantComponent>())
+					if (UCombatantComponent* Victim = HitActor->FindComponentByClass<UCombatantComponent>(); Victim && !Victims.Contains(Victim))
 					{
-						Victims.AddUnique(Victim);
+						Victims.Add(Victim);
+						// Starting inside the capsule gives no impact point; the sphere's centre is close enough then.
+						Contacts.Add(Hit.bStartPenetrating ? FVector(Hit.Location) : FVector(Hit.ImpactPoint));
 					}
 				}
 			}
@@ -922,10 +925,10 @@ void UAttackComponent::SweepWeapon()
 		}
 	}
 	PrevPoints = Points;
-	ResolveVictims(Victims);
+	ResolveVictims(Victims, Contacts);
 }
 
-void UAttackComponent::ResolveVictims(const TArray<UCombatantComponent*>& Victims)
+void UAttackComponent::ResolveVictims(const TArray<UCombatantComponent*>& Victims, const TArray<FVector>& Contacts)
 {
 	USkeletalMeshComponent* Mesh = GetOwnerMesh();
 	const UAttackDefinition* Def = CurrentDefinition;
@@ -933,8 +936,9 @@ void UAttackComponent::ResolveVictims(const TArray<UCombatantComponent*>& Victim
 	{
 		return;
 	}
-	for (UCombatantComponent* Victim : Victims)
+	for (int32 v = 0; v < Victims.Num(); ++v)
 	{
+		UCombatantComponent* Victim = Victims[v];
 		FCombatHitContext Hit;
 		Hit.AttackInstanceId = InstanceId;
 		Hit.Damage = Def->Damage;
@@ -1015,8 +1019,9 @@ void UAttackComponent::ResolveVictims(const TArray<UCombatantComponent*>& Victim
 			OnHitLanded.Broadcast(Outcome, Victim->GetOwner());
 			if (Def->HitEffect)
 			{
-				UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), Def->HitEffect, Mesh->GetSocketLocation(Def->SocketEnd), FRotator::ZeroRotator,
-					FVector(Def->HitEffectScale), true);
+				// Where the blade met the body, so the sparks sit on him and not in the air past his side.
+				const FVector At = Contacts.IsValidIndex(v) ? Contacts[v] : Mesh->GetSocketLocation(Def->SocketEnd);
+				UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), Def->HitEffect, At, FRotator::ZeroRotator, FVector(Def->HitEffectScale), true);
 			}
 			Victim->StartHitStop(Def->HitStop);
 			if (UCombatantComponent* Self = GetOwner()->FindComponentByClass<UCombatantComponent>())

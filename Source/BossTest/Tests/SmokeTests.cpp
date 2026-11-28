@@ -2757,4 +2757,184 @@ bool FSmokeHabitsAreRead::RunTest(const FString& Parameters)
 	return true;
 }
 
+// ---- The feel pass after Step 7, played live: your hits land with weight ----
+
+struct FWeightWatch
+{
+	double Start = 0.0;
+	double HitAt = 0.0;
+	int32 Phase = 0;
+	float HealthBefore = 0.f;
+	float MaxFlinch = 0.f;
+};
+
+// A real heavy from Feng Mao: it lands, his chest flinches away (by at least the minimum), he grunts in pain (a heavy is a big
+// enough hit), and Feng Mao's heavy effort plays.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FHitsLandWithWeight, FAutomationTestBase*, Test, TSharedRef<FWeightWatch>, Watch);
+bool FHitsLandWithWeight::Update()
+{
+	FWeightWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (!Player || !Boss || !PC)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 20.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	const float Health = Boss->FindComponentByClass<UCombatantComponent>()->State.Health.Current;
+	switch (W.Phase)
+	{
+	case 0:
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		PlaceSmokePlayer(Player, Boss, 120.f, 0.f);
+		Player->SetActorRotation((Boss->GetActorLocation() - Player->GetActorLocation()).GetSafeNormal2D().Rotation());
+		PC->SetControlRotation(Player->GetActorRotation());
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::Tab, IE_Pressed, 1.f));
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::Tab, IE_Released, 0.f));
+		W.Phase = 1;
+		return false;
+	case 1: // a tap of heavy: released before the charge is decided
+		if (!Player->IsLockedOn())
+		{
+			return false;
+		}
+		W.HealthBefore = Health;
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::RightMouseButton, IE_Pressed, 1.f));
+		W.Phase = 2;
+		return false;
+	case 2:
+		PC->InputKey(FInputKeyEventArgs::CreateSimulated(EKeys::RightMouseButton, IE_Released, 0.f));
+		W.Phase = 3;
+		return false;
+	case 3:
+		if (Health < W.HealthBefore)
+		{
+			W.HitAt = Now;
+			W.Phase = 4;
+		}
+		return false;
+	default:
+		W.MaxFlinch = FMath::Max(W.MaxFlinch, Boss->GetFlinchAngle());
+		if (Now - W.HitAt < 0.4)
+		{
+			return false;
+		}
+		Test->TestTrue(FString::Printf(TEXT("the heavy landed (%.0f damage)"), W.HealthBefore - Health), W.HealthBefore - Health >= 100.f);
+		Test->TestTrue(FString::Printf(TEXT("his chest flinched away (%.1f deg at most)"), W.MaxFlinch), W.MaxFlinch >= Boss->FlinchMin - 0.01f);
+		Test->TestTrue(TEXT("and settled back"), Boss->GetFlinchAngle() < 0.01f);
+		Test->TestTrue(TEXT("he grunted in pain"), Boss->GetVoice()->GetPlayedCount(EVoiceEvent::Pain) + Boss->GetVoice()->GetPlayedCount(EVoiceEvent::HeavyPain) >= 1);
+		Test->TestTrue(TEXT("Feng Mao put his weight into it"), Player->GetVoice()->GetPlayedCount(EVoiceEvent::HeavyEffort) >= 1);
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeHitsLandWithWeight, "BossTest.Smoke.HitsLandWithWeight", SmokeTestFlags)
+bool FSmokeHitsLandWithWeight::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FHitsLandWithWeight(this, MakeShared<FWeightWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
+struct FStrainWatch
+{
+	double Start = 0.0;
+	int32 Phase = 0;
+	bool bHeld = false;
+	float MostStrain = 0.f;
+	float StrainInHold = 0.f;
+};
+
+// Delayed Execution's long hold: he leans back and trembles while the hammer is up (no frozen pose), and it all settles
+// once the swing is over.
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(FHeldSwingStrains, FAutomationTestBase*, Test, TSharedRef<FStrainWatch>, Watch);
+bool FHeldSwingStrains::Update()
+{
+	FStrainWatch& W = Watch.Get();
+	UWorld* World = PlayWorld();
+	APlayerCharacter* Player = SmokePlayer(World);
+	ABossCharacter* Boss = SmokeBoss(World);
+	if (!Player || !Boss)
+	{
+		Test->AddError(TEXT("no player or boss"));
+		return true;
+	}
+	const double Now = FPlatformTime::Seconds();
+	if (W.Start <= 0.0)
+	{
+		W.Start = Now;
+	}
+	if (Now - W.Start > 20.0)
+	{
+		Test->AddError(FString::Printf(TEXT("ran out of time in phase %d"), W.Phase));
+		return true;
+	}
+	if (W.Phase == 0)
+	{
+		if (!SmokeBossReady(Boss))
+		{
+			return false;
+		}
+		Player->FindComponentByClass<UCombatantComponent>()->State.bImmune = true;
+		PlaceSmokePlayer(Player, Boss, 250.f, 0.f);
+		W.Phase = Boss->ForceAction(1) ? 1 : 0; // Delayed Execution
+		return false;
+	}
+	const UAttackComponent* Attacks = Boss->GetAttacks();
+	const bool bHolding = Attacks->IsAttacking() && Attacks->GetSample().Phase == EAttackPhase::Hold;
+	W.bHeld |= bHolding;
+	W.MostStrain = FMath::Max(W.MostStrain, FMath::Abs(Boss->GetStrainAngle()));
+	if (bHolding)
+	{
+		W.StrainInHold = FMath::Max(W.StrainInHold, FMath::Abs(Boss->GetStrainAngle()));
+	}
+	if (W.Phase == 1)
+	{
+		if (W.bHeld && !Attacks->IsAttacking())
+		{
+			W.Phase = 2;
+			W.Start = Now - 19.0; // a second to settle
+		}
+		return false;
+	}
+	if (Now - W.Start < 19.5)
+	{
+		return false;
+	}
+	Test->TestTrue(TEXT("he held the swing"), W.bHeld);
+	Test->TestTrue(FString::Printf(TEXT("he strained while holding it (%.1f deg)"), W.StrainInHold), W.StrainInHold >= 2.f);
+	Test->TestTrue(FString::Printf(TEXT("never more than the lean plus the tremble (%.1f)"), W.MostStrain), W.MostStrain <= Boss->HoldLean + Boss->HoldTremble + 0.01f);
+	Test->TestTrue(TEXT("and settled once the swing was over"), FMath::Abs(Boss->GetStrainAngle()) < 0.05f);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSmokeHeldSwingStrains, "BossTest.Smoke.HeldSwingStrains", SmokeTestFlags)
+bool FSmokeHeldSwingStrains::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FEditorLoadMap(TEXT("/Game/BossTest/BossArena")));
+	ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
+	ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(2.f));
+	ADD_LATENT_AUTOMATION_COMMAND(FHeldSwingStrains(this, MakeShared<FStrainWatch>()));
+	ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());
+	return true;
+}
+
 #endif
