@@ -64,6 +64,7 @@ void ABossTestPlayerController::HandleDebugKeys()
 	if (WasInputKeyJustPressed(EKeys::Three)) B->ForceSwing();
 	if (WasInputKeyJustPressed(EKeys::Four)) B->SelectNextAction();
 	if (WasInputKeyJustPressed(EKeys::Nine)) B->ForceStagger();
+	if (WasInputKeyJustPressed(EKeys::Eight)) B->ForcePosture(); // the aura circle, skipping its earned-and-rare gate (after the 6d play)
 }
 
 void ABossTestPlayerController::DrawDebugText() const
@@ -81,7 +82,7 @@ void ABossTestPlayerController::DrawDebugText() const
 	if (bShowHelp)
 	{
 		Line(TEXT("H hide help | WASD move, mouse look, Shift sprint (LMB = sprint attack) | LMB light, RMB or F heavy (hold to charge) | Space dodge (LMB / RMB after: dodge attacks) | Q or mouse back button: guard | E heal | Tab lock-on"), FColor::Silver);
-		Line(TEXT("1 boss AI on/off | 2 hitboxes | 3 force his selected action, 4 select the next (shown in his debug lines) | 9 force a stagger | 7 take a soul fragment | R reset"), FColor::Silver);
+		Line(TEXT("1 boss AI on/off | 2 hitboxes | 3 force his selected action, 4 select the next (shown in his debug lines) | 8 force his aura circle (stand at mid range) | 9 force a stagger | 7 take a soul fragment | R reset"), FColor::Silver);
 	}
 	if (const ABossCharacter* B = Boss())
 	{
